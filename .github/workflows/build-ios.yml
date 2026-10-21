@@ -1,4 +1,4 @@
-name: build-ios-dylib
+﻿name: build-ios-dylib
 
 # 在没有 Mac 的情况下，用 GitHub 的 macOS runner 产出一个可直接注入的
 # SawitMod.dylib。用法：
@@ -14,7 +14,8 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'ios/**'
+      - 'SawitMod/**'
+      - 'scripts/**'
       - '.github/workflows/build-ios.yml'
 
 jobs:
@@ -44,13 +45,12 @@ jobs:
           git clone --depth=1 --recursive https://github.com/jmpews/Dobby.git /tmp/Dobby
           cd /tmp/Dobby
           python3 scripts/platform_builder.py --platform=iphoneos --arch=all
-          mkdir -p "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby"
-          cp build/iphoneos/universal/libdobby.a "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby/libdobby.a"
-          file "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby/libdobby.a"
-          lipo -info "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby/libdobby.a"
+          mkdir -p "$GITHUB_WORKSPACE/SawitMod/ThirdParty/Dobby"
+          cp build/iphoneos/universal/libdobby.a "$GITHUB_WORKSPACE/SawitMod/ThirdParty/Dobby/libdobby.a"
+          file "$GITHUB_WORKSPACE/SawitMod/ThirdParty/Dobby/libdobby.a"
+          lipo -info "$GITHUB_WORKSPACE/SawitMod/ThirdParty/Dobby/libdobby.a"
 
       - name: 编译 SawitMod.dylib
-        working-directory: ios
         run: |
           make clean || true
           make -j"$(sysctl -n hw.ncpu)"
@@ -58,7 +58,7 @@ jobs:
       - name: 收集产物
         run: |
           mkdir -p out
-          find ios/.theos -name 'SawitMod.dylib' -o -name 'libSawitMod.dylib' | while read -r f; do
+          find .theos -name 'SawitMod.dylib' -o -name 'libSawitMod.dylib' | while read -r f; do
             echo "found: $f"
             cp "$f" out/
           done
@@ -76,5 +76,5 @@ jobs:
         with:
           name: SawitMod-inject-tools
           path: |
-            ios/scripts/inject_ipa.sh
-            ios/docs/构建与注入.md
+            scripts/inject_ipa.sh
+            docs/构建与注入.md

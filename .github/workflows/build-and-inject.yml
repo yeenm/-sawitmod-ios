@@ -1,4 +1,4 @@
-name: build-and-inject
+﻿name: build-and-inject
 
 # 一条龙：编 Dobby + 编 dylib + 把 dylib 注入你提供的 IPA，直接产出可安装的
 # SawitMod-injected.ipa（ad-hoc 签名；Sideloadly/AltStore 会再签一次，
@@ -70,22 +70,21 @@ jobs:
           git clone --depth=1 --recursive https://github.com/jmpews/Dobby.git /tmp/Dobby
           cd /tmp/Dobby
           python3 scripts/platform_builder.py --platform=iphoneos --arch=all
-          mkdir -p "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby"
+          mkdir -p "$GITHUB_WORKSPACE/SawitMod/ThirdParty/Dobby"
           cp build/iphoneos/universal/libdobby.a \
-             "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby/libdobby.a"
-          lipo -info "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby/libdobby.a"
+             "$GITHUB_WORKSPACE/SawitMod/ThirdParty/Dobby/libdobby.a"
+          lipo -info "$GITHUB_WORKSPACE/SawitMod/ThirdParty/Dobby/libdobby.a"
 
       - name: 编译 SawitMod.dylib
-        working-directory: ios
         run: |
           make clean || true
           make -j"$(sysctl -n hw.ncpu)"
-          mkdir -p ../out
+          mkdir -p out
           DYLIB="$(find .theos -name 'SawitMod.dylib' | head -1)"
           [ -n "$DYLIB" ] || { echo "没找到 SawitMod.dylib"; exit 1; }
-          cp "$DYLIB" ../out/SawitMod.dylib
-          file ../out/SawitMod.dylib
-          lipo -info ../out/SawitMod.dylib || true
+          cp "$DYLIB" out/SawitMod.dylib
+          file out/SawitMod.dylib
+          lipo -info out/SawitMod.dylib || true
 
       - name: 取回待注入的 IPA
         run: |
