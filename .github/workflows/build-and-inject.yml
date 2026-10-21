@@ -69,16 +69,34 @@ jobs:
         run: |
           git clone --depth=1 --recursive https://github.com/jmpews/Dobby.git /tmp/Dobby
           cd /tmp/Dobby
+          # runner 的 python3 可能是 3.13：pipes 模块已被移除，而 platform_builder 只 import 未使用
+          sed -i '' 's/^import pipes$/import shlex as pipes/' scripts/platform_builder.py || true
+          set +e
           python3 scripts/platform_builder.py --platform=iphoneos --arch=all
-          mkdir -p "$GITHUB_WORKSPACE/SawitMod/ThirdParty/Dobby"
-          cp build/iphoneos/universal/libdobby.a \
-             "$GITHUB_WORKSPACE/SawitMod/ThirdParty/Dobby/libdobby.a"
-          lipo -info "$GITHUB_WORKSPACE/SawitMod/ThirdParty/Dobby/libdobby.a"
-
+          RC=$?
+          set -e
+          DEST="$GITHUB_WORKSPACE/SawitMod/ThirdParty/Dobby"
+          mkdir -p "$DEST"
+          if [ $RC -eq 0 ] && [ -f build/iphoneos/universal/libdobby.a ]; then
+            cp build/iphoneos/universal/libdobby.a "$DEST/libdobby.a"
+            echo "MAKE_ARCHS=" >> "$GITHUB_ENV"
+          else
+            echo "platform_builder 失败（rc=$RC），回退：只编 arm64"
+            SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+            cmake -S . -B build-arm64 \
+              -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+              -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT="$SDK" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_BUILD_TYPE=Release \
+              -DDOBBY_GENERATE_SHARED=OFF -DDOBBY_BUILD_EXAMPLE=OFF -DDOBBY_BUILD_TEST=OFF
+            cmake --build build-arm64 --target dobby -j4
+            cp build-arm64/libdobby.a "$DEST/libdobby.a"
+            echo "MAKE_ARCHS=ARCHS=arm64" >> "$GITHUB_ENV"
+          fi
+          lipo -info "$DEST/libdobby.a"
       - name: 编译 SawitMod.dylib
         run: |
           make clean || true
-          make -j"$(sysctl -n hw.ncpu)"
+          make -j"$(sysctl -n hw.ncpu)" ${MAKE_ARCHS}
           mkdir -p out
           DYLIB="$(find .theos -name 'SawitMod.dylib' | head -1)"
           [ -n "$DYLIB" ] || { echo "没找到 SawitMod.dylib"; exit 1; }
