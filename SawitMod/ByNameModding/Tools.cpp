@@ -10,6 +10,7 @@
 #include <mach/mach.h>
 #include <random>
 
+#include "Includes/OSCache.h"
 #include "Includes/Utils.h"
 
 #if !defined(__clang__) && !defined(__GNUC__)
@@ -74,7 +75,7 @@ bool Write(void *addr, void *buffer, size_t length) {
     memcpy(addr, buffer, length);
     // 代码页要同步指令缓存，否则 arm64 上可能执行到旧指令。
     if (prot & VM_PROT_EXECUTE) {
-        __builtin___clear_cache((char *)addr, (char *)addr + length);
+        sys_icache_invalidate(addr, length);
     }
     SetProt((uintptr_t)addr, length, prot);
     return true;

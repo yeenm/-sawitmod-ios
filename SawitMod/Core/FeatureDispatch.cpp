@@ -30,6 +30,7 @@
 #include "Global.h"
 #include "Includes/Dobby/dobby.h"
 #include "Includes/Logger.h"
+#include "Includes/OSCache.h"
 #include "Includes/obfuscate.h"
 #include "MonoString.h"
 #include "VirboxTargets.h"
@@ -70,7 +71,7 @@ bool PatchMethodReturnInt(const char *asmName, const char *ns, const char *clsNa
     uint32_t payload[2] = { (uint32_t)(0x52800000u | (returnValue << 5)), 0xD65F03C0u };
     if (!VirtualProtect(nativeAddress, sizeof(payload))) { LOGE("[PATCH] mprotect gagal"); return false; }
     memcpy(nativeAddress, payload, sizeof(payload));
-    __builtin___clear_cache((char*)nativeAddress, (char*)nativeAddress + sizeof(payload));
+    sys_icache_invalidate(nativeAddress, sizeof(payload));
     LOGI("[PATCH][OK] %s.%s -> %d", clsName, methodName, returnValue);
     return true;
 }
@@ -137,8 +138,7 @@ bool PatchMethodReturnNop(const char *asmName, const char *ns, const char *clsNa
     }
 
     memcpy(nativeAddress, &payload, payloadSize);
-    __builtin___clear_cache((char *) nativeAddress,
-                            (char *) nativeAddress + payloadSize);
+    sys_icache_invalidate(nativeAddress, payloadSize);
 //    LOGI("[PatchReturnNop] Berhasil: %s | %s.%s::%s/%d @ %p",
 //         asmName, ns, clsName, methodName, paramCount, nativeAddress);
     return true;
@@ -211,8 +211,7 @@ bool PatchMethodReturnTrue(const char *asmName, const char *ns, const char *clsN
         payload[1] = 0xD65F03C0;
         if (VirtualProtect(nativeAddress, sizeof(payload))) {
             memcpy(nativeAddress, payload, sizeof(payload));
-            __builtin___clear_cache((char *) nativeAddress,
-                                    (char *) nativeAddress + sizeof(payload));
+            sys_icache_invalidate(nativeAddress, sizeof(payload));
             LOGI(OBFUSCATE("<color=lime>[OK]</color> %s.%s -> Force TRUE!"), clsName, methodName);
             return true;
         }
@@ -255,8 +254,7 @@ bool PatchMethodReturnFalse(const char *asmName, const char *ns, const char *cls
 
         if (VirtualProtect(nativeAddress, sizeof(payload))) {
             memcpy(nativeAddress, payload, sizeof(payload));
-            __builtin___clear_cache((char *) nativeAddress,
-                                    (char *) nativeAddress + sizeof(payload));
+            sys_icache_invalidate(nativeAddress, sizeof(payload));
             LOGI(OBFUSCATE("<color=lime>[OK]</color> %s.%s -> Force FALSE!"), clsName, methodName);
             return true;
         }

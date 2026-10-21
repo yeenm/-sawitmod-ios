@@ -12,6 +12,8 @@
 #include <mach-o/loader.h>
 #include <mach/mach.h>
 
+#include "Includes/OSCache.h"
+
 namespace KittyMemory {
 
 namespace {
@@ -98,7 +100,7 @@ Memory_Status memWrite(void *addr, const void *buffer, size_t len) {
 
     memcpy(addr, buffer, len);
     if (oldProt & VM_PROT_EXECUTE) {
-        __builtin___clear_cache((char *)addr, (char *)addr + len);
+        sys_icache_invalidate(addr, len);
     }
 
     ProtectAddr(addr, len, oldProt);
