@@ -1,0 +1,80 @@
+name: build-ios-dylib
+
+# 在没有 Mac 的情况下，用 GitHub 的 macOS runner 产出一个可直接注入的
+# SawitMod.dylib。用法：
+#   1. 把这个仓库推到 GitHub（私有仓库也行）
+#   2. Actions -> build-ios-dylib -> Run workflow
+#   3. 跑完在 Artifacts 里下载 SawitMod-dylib
+#   4. Windows 上用 Sideloadly 的 "Advanced Options -> +dylib/deb" 注入安装
+#
+# 说明：iOS SDK 来自 runner 自带的 Xcode；Dobby 用官方 platform_builder.py
+# 编 iphoneos universal；Theos 只用来驱动 Makefile，不需要打包成 deb。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios/**'
+      - '.github/workflows/build-ios.yml'
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 环境检查
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          cmake --version | head -1
+          python3 --version
+
+      - name: 安装 Theos
+        run: |
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+          brew install ldid || true
+
+      - name: 编译 Dobby（iphoneos universal）
+        run: |
+          git clone --depth=1 --recursive https://github.com/jmpews/Dobby.git /tmp/Dobby
+          cd /tmp/Dobby
+          python3 scripts/platform_builder.py --platform=iphoneos --arch=all
+          mkdir -p "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby"
+          cp build/iphoneos/universal/libdobby.a "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby/libdobby.a"
+          file "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby/libdobby.a"
+          lipo -info "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby/libdobby.a"
+
+      - name: 编译 SawitMod.dylib
+        working-directory: ios
+        run: |
+          make clean || true
+          make -j"$(sysctl -n hw.ncpu)"
+
+      - name: 收集产物
+        run: |
+          mkdir -p out
+          find ios/.theos -name 'SawitMod.dylib' -o -name 'libSawitMod.dylib' | while read -r f; do
+            echo "found: $f"
+            cp "$f" out/
+          done
+          ls -la out/ || true
+
+      - name: 上传 dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: SawitMod-dylib
+          path: out/*.dylib
+          if-no-files-found: error
+
+      - name: 上传注入脚本与文档
+        uses: actions/upload-artifact@v4
+        with:
+          name: SawitMod-inject-tools
+          path: |
+            ios/scripts/inject_ipa.sh
+            ios/docs/构建与注入.md

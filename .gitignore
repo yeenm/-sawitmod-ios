@@ -1,0 +1,11 @@
+# ???? / ??????
+.theos/
+tests/build/
+dist/*.zip
+*.ipa
+*.dylib
+*.pdb
+*.obj
+__pycache__/
+*.pyc
+.DS_Store

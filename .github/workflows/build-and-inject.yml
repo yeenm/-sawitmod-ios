@@ -1,0 +1,162 @@
+name: build-and-inject
+
+# 一条龙：编 Dobby + 编 dylib + 把 dylib 注入你提供的 IPA，直接产出可安装的
+# SawitMod-injected.ipa（ad-hoc 签名；Sideloadly/AltStore 会再签一次，
+# TrollStore 可直接装）。
+#
+# 用法（Actions -> build-and-inject -> Run workflow）：
+#   A. 先把游戏 IPA 传到本仓库的 Release（支持大文件），然后填：
+#        ipa_release_tag = 该 Release 的 tag
+#        ipa_asset_name  = 里面对应的文件名
+#   B. 或填一个直链：ipa_url = https://.../game.ipa
+#   C. 或把 IPA 放进仓库（<100MB 才行）：ipa_repo_path = input/game.ipa
+#
+# 产出的 IPA 仍是 **未用你的证书签名** 的：用 Sideloadly 打开它并 Start 即可
+# （Sideloadly 负责签名/安装），TrollStore 也可以直接装。
+#
+# ⚠️ 输入的 IPA 必须是已解密的（App Store 原包注入后跑不起来）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: 'IPA 直链（可选，优先使用）'
+        required: false
+        default: ''
+      ipa_release_tag:
+        description: '本仓库 Release 的 tag（可选）'
+        required: false
+        default: ''
+      ipa_asset_name:
+        description: 'Release 里的 IPA 文件名'
+        required: false
+        default: 'game.ipa'
+      ipa_repo_path:
+        description: '仓库内 IPA 路径（可选）'
+        required: false
+        default: ''
+      output_name:
+        description: '输出 IPA 文件名'
+        required: false
+        default: 'SawitMod-injected.ipa'
+
+jobs:
+  build-and-inject:
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 环境检查
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          cmake --version | head -1
+          python3 --version
+          gh --version | head -1
+
+      - name: 安装 Theos
+        run: |
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+          brew install ldid || true
+
+      - name: 编译 Dobby（iphoneos universal）
+        run: |
+          git clone --depth=1 --recursive https://github.com/jmpews/Dobby.git /tmp/Dobby
+          cd /tmp/Dobby
+          python3 scripts/platform_builder.py --platform=iphoneos --arch=all
+          mkdir -p "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby"
+          cp build/iphoneos/universal/libdobby.a \
+             "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby/libdobby.a"
+          lipo -info "$GITHUB_WORKSPACE/ios/SawitMod/ThirdParty/Dobby/libdobby.a"
+
+      - name: 编译 SawitMod.dylib
+        working-directory: ios
+        run: |
+          make clean || true
+          make -j"$(sysctl -n hw.ncpu)"
+          mkdir -p ../out
+          DYLIB="$(find .theos -name 'SawitMod.dylib' | head -1)"
+          [ -n "$DYLIB" ] || { echo "没找到 SawitMod.dylib"; exit 1; }
+          cp "$DYLIB" ../out/SawitMod.dylib
+          file ../out/SawitMod.dylib
+          lipo -info ../out/SawitMod.dylib || true
+
+      - name: 取回待注入的 IPA
+        run: |
+          mkdir -p input
+          if [ -n "${{ inputs.ipa_url }}" ]; then
+            echo "来源：url"
+            curl -L --fail --retry 3 -o input/game.ipa "${{ inputs.ipa_url }}"
+          elif [ -n "${{ inputs.ipa_release_tag }}" ]; then
+            echo "来源：release ${{ inputs.ipa_release_tag }}"
+            gh release download "${{ inputs.ipa_release_tag }}" \
+               --pattern "${{ inputs.ipa_asset_name }}" --output input/game.ipa
+          elif [ -n "${{ inputs.ipa_repo_path }}" ]; then
+            echo "来源：repo path ${{ inputs.ipa_repo_path }}"
+            cp "${{ inputs.ipa_repo_path }}" input/game.ipa
+          else
+            echo "没有提供 IPA 来源：请填 ipa_url / ipa_release_tag / ipa_repo_path 之一"
+            exit 1
+          fi
+          ls -lh input/game.ipa
+
+      - name: 安装 insert_dylib
+        run: |
+          if ! command -v insert_dylib >/dev/null; then
+            brew install insert_dylib || true
+          fi
+          if ! command -v insert_dylib >/dev/null; then
+            echo "brew 没有 insert_dylib，改从源码编译"
+            git clone --depth=1 https://github.com/Tyilo/insert_dylib.git /tmp/insert_dylib
+            xcodebuild -project /tmp/insert_dylib/insert_dylib.xcodeproj \
+              -configuration Release -derivedDataPath /tmp/insert_dylib/build >/dev/null
+            BIN="$(find /tmp/insert_dylib/build -type f -name insert_dylib | head -1)"
+            [ -n "$BIN" ] || { echo "insert_dylib 编译失败"; exit 1; }
+            mkdir -p "$HOME/bin" && cp "$BIN" "$HOME/bin/"
+            echo "$HOME/bin" >> "$GITHUB_PATH"
+          fi
+          insert_dylib 2>&1 | head -3 || true
+
+      - name: 注入 dylib 并打包
+        run: |
+          rm -rf work && mkdir -p work
+          unzip -q input/game.ipa -d work
+          APP="$(find work/Payload -maxdepth 1 -name '*.app' | head -1)"
+          [ -n "$APP" ] || { echo "IPA 里没有 Payload/*.app"; exit 1; }
+          NAME="$(basename "$APP" .app)"
+          BIN="$APP/$NAME"
+          [ -f "$BIN" ] || { echo "找不到主二进制：$BIN"; exit 1; }
+
+          cp out/SawitMod.dylib "$APP/SawitMod.dylib"
+          insert_dylib --strip-codesig --all-yes --inplace \
+            "@executable_path/SawitMod.dylib" "$BIN" | tee insert.log
+
+          # ad-hoc 重签：TrollStore 直接可装；Sideloadly/AltStore 会按你的证书再签
+          find work/Payload -name '*.dylib' -exec codesign -f -s - {} \; || true
+          codesign -f -s - "$BIN" || true
+          codesign -f -s - "$APP" || true
+
+          ( cd work && zip -qry "../${{ inputs.output_name }}" Payload )
+          rm -rf work
+          ls -lh "${{ inputs.output_name }}" out/SawitMod.dylib
+
+      - name: 上传已注入 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: injected-ipa
+          path: ${{ inputs.output_name }}
+          if-no-files-found: error
+
+      - name: 上传 dylib 与注入日志
+        uses: actions/upload-artifact@v4
+        with:
+          name: dylib-and-log
+          path: |
+            out/SawitMod.dylib
+            insert.log

@@ -1,0 +1,9 @@
+Package: com.sawit.modmenu.ios
+Name: SawitMod (iOS)
+Version: 1.1
+Architecture: iphoneos-arm64
+Description: 心动小镇 (com.xd.xdt) 悬浮菜单的 iOS 移植版：ImGui 悬浮窗、卡密/授权、云下发功能目录、il2cpp 反射与 hook。
+Maintainer: SawitMod
+Author: SawitMod
+Section: Tweaks
+Depends: firmware (>= 13.0)
