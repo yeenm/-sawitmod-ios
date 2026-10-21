@@ -82,6 +82,9 @@ void WriteHeader(int sig) {
     WriteRaw(line);
     snprintf(line, sizeof(line), "Signal             : %s (%d)\n", SignalName(sig), sig);
     WriteRaw(line);
+    snprintf(line, sizeof(line), "Last Step          : %s\n",
+             SMPlatform::BreadcrumbCStr());
+    WriteRaw(line);
     WriteRaw("************* Crash Head ****************\n\n");
 }
 

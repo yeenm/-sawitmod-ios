@@ -299,6 +299,7 @@ std::string ac_m_invoke;
 std::string ac_cl_sel;
 std::string ac_m_int;
 std::string ac_p_true;
+std::string g_prevBreadcrumb;
 
 // ============================================================================
 //  State_manual.inc — State.cpp 的手写尾部（生成器原样拼接）
@@ -401,3 +402,4 @@ void SaveUiScale(float value) {
 
 // g_unityTasks 的声明带模板参数，生成器（gen_state.py）会跳过，手工定义。
 std::vector<std::function<void()>> g_unityTasks;
+

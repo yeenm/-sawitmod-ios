@@ -40,6 +40,9 @@ void Toast(const std::string &) {}
 std::string Clipboard() { return std::string(); }
 void SetClipboard(const std::string &) {}
 void RunWithAutoreleasePool(const std::function<void()> &body) { if (body) body(); }
+void SetBreadcrumb(const std::string &) {}
+std::string TakeBreadcrumb() { return std::string(); }
+const char *BreadcrumbCStr() { return ""; }
 bool IsDebuggerAttached() { return false; }
 std::string ProcessName() { return "stub"; }
 }  // namespace SMPlatform

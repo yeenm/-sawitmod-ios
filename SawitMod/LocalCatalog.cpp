@@ -10,6 +10,7 @@
 #include "App/Platform.h"
 #include "Includes/Logger.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -26,6 +27,12 @@
 #define LC_ERR(...) LOGE(__VA_ARGS__)
 
 namespace {
+
+// 只装一次：重复 InstallEmbedded 会重建 featureList/shop 表，
+// 而渲染线程正在读同一批全局容器，会踩内存直接崩。
+std::atomic<bool> g_embeddedInstalled{false};
+std::mutex g_installMtx;
+
 
 // kEmbeddedPayloads 按 catalog 顺序排过，同一个 wire 的条目是连续的一段。
 struct WireSpan {
@@ -188,8 +195,13 @@ bool LocalCatalog::InstallCatalog(const std::string& catalogJson, const char* so
 
 bool LocalCatalog::InstallEmbedded() {
 #if SAWIT_LOCAL_FEATURES
+    if (g_embeddedInstalled.load(std::memory_order_acquire)) return true;
+    std::lock_guard<std::mutex> lk(g_installMtx);
+    if (g_embeddedInstalled.load(std::memory_order_acquire)) return true;
     const std::string json(kEmbeddedCatalogJson, kEmbeddedCatalogJsonLen);
-    return InstallCatalog(json, "embedded");
+    const bool ok = InstallCatalog(json, "embedded");
+    if (ok) g_embeddedInstalled.store(true, std::memory_order_release);
+    return ok;
 #else
     return false;
 #endif

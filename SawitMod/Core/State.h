@@ -726,3 +726,6 @@ extern std::string ac_p_true;
 extern int g_selectedImageIdx;     // Auto Draw：当前选中的图片下标
 
 extern std::string g_drawStatus;   // 自动绘画状态文本（定义在 FeatureDispatch.cpp）
+
+// 上次闪退前执行到的步骤（启动时从 NSUserDefaults 读出，显示在卡密页）
+extern std::string g_prevBreadcrumb;

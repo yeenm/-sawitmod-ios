@@ -45,6 +45,11 @@ std::string Clipboard();
 
 // 后台线程里调 Foundation（Keychain/UIDevice/路径）时包一层 autorelease pool。
 void RunWithAutoreleasePool(const std::function<void()> &body);
+
+// 崩溃现场定位：把“最后一步”写进 NSUserDefaults，闪退后下次启动可读回。
+void SetBreadcrumb(const std::string &step);
+std::string TakeBreadcrumb();
+const char *BreadcrumbCStr();
 void SetClipboard(const std::string &text);
 
 // ---- 诊断 ----

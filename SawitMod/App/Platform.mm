@@ -14,6 +14,7 @@
 #import <unistd.h>
 
 #include <mach-o/dyld.h>
+#include <mutex>
 #include <cstring>
 
 namespace {
@@ -173,6 +174,32 @@ std::string Clipboard() {
     NSString *s = [UIPasteboard generalPasteboard].string;
     return UTF8(s);
 }
+
+
+// ---- 崩溃现场面包屑 ----
+static std::mutex g_bcMutex;
+static char g_bcBuf[128] = {0};
+
+void SetBreadcrumb(const std::string &step) {
+    {
+        std::lock_guard<std::mutex> lk(g_bcMutex);
+        snprintf(g_bcBuf, sizeof(g_bcBuf), "%s", step.c_str());
+    }
+    NSString *key = @"sm_breadcrumb";
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setObject:[NSString stringWithUTF8String:step.c_str()] forKey:key];
+    [d synchronize];
+}
+
+std::string TakeBreadcrumb() {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    NSString *v = [d stringForKey:@"sm_breadcrumb"];
+    [d removeObjectForKey:@"sm_breadcrumb"];
+    [d synchronize];
+    return v ? UTF8(v) : std::string();
+}
+
+const char *BreadcrumbCStr() { return g_bcBuf; }
 
 void RunWithAutoreleasePool(const std::function<void()> &body) {
     @autoreleasepool {

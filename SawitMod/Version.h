@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 // =====================================================================
 //  BUILD FLAGS
@@ -53,6 +53,9 @@
 // 抓包时的 version（见 SAWIT_DUMP_BIND_VERSION 与 LocalCatalogData.h），
 // 改这个显示版本不会让离线回放失效。
 #define SAWIT_VERSION "v1.1"
+
+// 悬浮窗标题栏显示的版本（只影响界面，不参与 payload 绑定/服务端校验）
+#define SAWIT_UI_VERSION "v1.2 iOS"
 
 // ---------------------------------------------------------------------
 // 界面字体（加粗 / 加大）

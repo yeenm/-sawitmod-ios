@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 //  Menu.cpp — 菜单界面（从 Android 版 Main.cpp 的 DrawMenu 原样移植）
 // ----------------------------------------------------------------------------
 //  这段代码是原工程 Main.cpp 第 2451~5296 行，一行未改地搬过来：
@@ -97,9 +97,9 @@ void DrawMenu() {
     const bool cardVerified = Weiyan::IsVerified();
     ActiveUI::features_unlocked = cardVerified;
 
-    // 标题栏右侧显示版本号（Version.h 的 SAWIT_VERSION）。
+    // 标题栏右侧显示版本号（Version.h 的 SAWIT_UI_VERSION，仅界面用）。
     ActiveUI::FrameInfo frame = ActiveUI::BeginChrome(
-            ANDROID_BRAND_NAME, SAWIT_VERSION, &request_min, &is_english, CyloneOpenUrl);
+            ANDROID_BRAND_NAME, SAWIT_UI_VERSION, &request_min, &is_english, CyloneOpenUrl);
     if (request_min)
         g_MenuMinimized = true;
     {
@@ -279,12 +279,12 @@ void DrawMenu() {
         // 版本号 + 云下发状态
         //   本次启动已收到过 / 未登录过 -> 不重复告知
         if (cloudDone) {
-            ImGui::TextDisabled("%s   %s", SAWIT_VERSION, u8"云下发已就绪");
+            ImGui::TextDisabled("%s   %s", SAWIT_UI_VERSION, u8"云下发已就绪");
         } else if (!cardVerified) {
-            ImGui::TextDisabled("%s   %s", SAWIT_VERSION, u8"请登录接收服务器云下发");
+            ImGui::TextDisabled("%s   %s", SAWIT_UI_VERSION, u8"请登录接收服务器云下发");
         } else {
             const int dots = 1 + (int)(ImGui::GetTime() * 2.0) % 3;
-            ImGui::TextDisabled("%s   %s%.*s  %d%%", SAWIT_VERSION,
+            ImGui::TextDisabled("%s   %s%.*s  %d%%", SAWIT_UI_VERSION,
                                 u8"接收云下发文件中", dots, "...",
                                 (int)(cloudProgress * 100.0f));
         }
@@ -384,12 +384,17 @@ void DrawMenu() {
                                 strncpy(license_input, use.c_str(), sizeof(license_input) - 1);
                                 license_input[sizeof(license_input) - 1] = 0;
                             }
+                            SMPlatform::SetBreadcrumb("verify:start");
                             try {
                                 Weiyan::Result r = Weiyan::VerifyCard(use);
+                                SMPlatform::SetBreadcrumb(r.ok ? "verify:ok" : "verify:fail");
                                 if (r.ok) {
                                     // 卡密通过后把内部会话也装好，功能才能走本地 payload 回放
+                                    SMPlatform::SetBreadcrumb("offline:start");
                                     LoginOfflineSession(false);
+                                    SMPlatform::SetBreadcrumb("offline:done");
                                     SaveLicenseLocally(use);
+                                    SMPlatform::SetBreadcrumb("done");
                                 }
                             } catch (...) {
                                 Weiyan::SetStatus(u8"验证异常，请重试");
@@ -413,6 +418,10 @@ void DrawMenu() {
                                                  : ActiveUI::kErr,
                                "%s", verifyBusy.load() ? u8"正在验证卡密…"
                                                        : Weiyan::StatusMessage().c_str());
+            if (!g_prevBreadcrumb.empty() && g_prevBreadcrumb != "done" &&
+                g_prevBreadcrumb != "verify:fail" && g_prevBreadcrumb != "boot") {
+                ImGui::TextColored(ActiveUI::kWarn, u8"上次停住: %s", g_prevBreadcrumb.c_str());
+            }
         }
         ImGui::Spacing();
         ImGui::Separator();

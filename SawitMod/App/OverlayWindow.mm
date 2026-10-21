@@ -370,44 +370,62 @@ void SMOverlayShowToast(const std::string &text) {
 //    * 两者一致            -> 不旋转
 //  旋转后 bounds 变化会触发 layoutSubviews -> 重建横屏 framebuffer，
 //  ImGui 的 DisplaySize 与触摸坐标也随之变成横屏。
+// 递归找一个视图（或其子视图）的旋转角：Unity 横屏时通常旋转自己的视图。
+static CGFloat SMRotationOfView(UIView *view, int depth) {
+    if (!view || depth > 3) return 0.0;
+    const CGFloat a = atan2(view.transform.b, view.transform.a);
+    if (fabs(a) > 0.01) return a;
+    for (UIView *sub in view.subviews) {
+        const CGFloat b = SMRotationOfView(sub, depth + 1);
+        if (fabs(b) > 0.01) return b;
+    }
+    return 0.0;
+}
+
+static CGFloat SMRotationFromGameView(void) {
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w == g_window) continue;
+        const CGFloat a = SMRotationOfView(w.rootViewController.view, 0);
+        if (fabs(a) > 0.01) return a;
+    }
+    return 0.0;
+}
+
 static void SMUpdateOrientation(void) {
     if (!g_window || !g_glView) return;
 
     const CGSize screen = g_window.bounds.size;
-    const BOOL windowLandscape = screen.width > screen.height;
 
-    const UIDeviceOrientation dev = [UIDevice currentDevice].orientation;
-    BOOL deviceLandscape = NO;
-    switch (dev) {
-        case UIDeviceOrientationLandscapeLeft:
-        case UIDeviceOrientationLandscapeRight:
-            deviceLandscape = YES;
-            break;
-        case UIDeviceOrientationPortrait:
-        case UIDeviceOrientationPortraitUpsideDown:
-            deviceLandscape = NO;
-            break;
-        default:
-            // 平放/未知：保持现状，等下一次方向通知
-            return;
+    // 1) 优先“镜像”游戏视图的旋转：游戏横屏怎么转，菜单就怎么转。
+    //    这样玩到一半设备方向变了也不会突然跳成竖屏。
+    CGFloat angle = SMRotationFromGameView();
+
+    // 2) 游戏视图没旋转时，退回设备/界面方向（真正横屏的 App 走这里）。
+    if (fabs(angle) < 0.01) {
+        const UIDeviceOrientation dev = [UIDevice currentDevice].orientation;
+        if (dev == UIDeviceOrientationLandscapeLeft) {
+            angle = (CGFloat)-M_PI_2;
+        } else if (dev == UIDeviceOrientationLandscapeRight) {
+            angle = (CGFloat)M_PI_2;
+        } else if (@available(iOS 13.0, *)) {
+            const UIInterfaceOrientation io = g_window.windowScene.interfaceOrientation;
+            if (io == UIInterfaceOrientationLandscapeLeft) angle = (CGFloat)-M_PI_2;
+            else if (io == UIInterfaceOrientationLandscapeRight) angle = (CGFloat)M_PI_2;
+        }
     }
 
-    if (deviceLandscape == windowLandscape) {
-        g_glView.transform = CGAffineTransformIdentity;
-        g_glView.bounds = CGRectMake(0, 0, screen.width, screen.height);
-    } else {
-        // 方向映射：实机验证过一次——竖屏窗口里接横屏游戏时，
-        // LandscapeLeft 必须是 -90°，LandscapeRight 是 +90°。
-        // 上一版写反了，菜单整体差 180°（文字倒着）。
-        const CGFloat angle =
-            (dev == UIDeviceOrientationLandscapeLeft) ? (CGFloat)-M_PI_2 : (CGFloat)M_PI_2;
+    if (fabs(angle) > 0.01) {
         g_glView.transform = CGAffineTransformMakeRotation(angle);
         g_glView.bounds = CGRectMake(0, 0, screen.height, screen.width);
+    } else {
+        g_glView.transform = CGAffineTransformIdentity;
+        g_glView.bounds = CGRectMake(0, 0, screen.width, screen.height);
     }
     g_glView.center = CGPointMake(screen.width * 0.5, screen.height * 0.5);
     [g_glView setNeedsLayout];
-    NSLog(@"[SawitMod] orientation: dev=%ld windowLandscape=%d -> bounds %.0fx%.0f",
-          (long)dev, windowLandscape, g_glView.bounds.size.width, g_glView.bounds.size.height);
+
+    NSLog(@"[SawitMod] orientation angle=%.0fdeg bounds=%.0fx%.0f", angle * 180.0 / M_PI,
+          g_glView.bounds.size.width, g_glView.bounds.size.height);
 }
 
 // ---------------------------------------------------------------------------

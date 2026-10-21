@@ -145,6 +145,10 @@ void Start() {
     // iOS 上等价于"闪退"。全局忽略，配合 Weiyan 里的 SO_NOSIGPIPE。
     signal(SIGPIPE, SIG_IGN);
 
+    // 上次闪退停在哪一步（没有则为空）
+    g_prevBreadcrumb = SMPlatform::TakeBreadcrumb();
+    SMPlatform::SetBreadcrumb("boot");
+
     SMCrash::Install();
 
     std::thread([]() {
