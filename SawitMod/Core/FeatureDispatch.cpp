@@ -1313,6 +1313,5 @@ void SwitchMapNative(int roomId, std::string dllName, std::string nameSpace, std
 
 using GameAppUpdateFn = void (*)(void* instance);
 static GameAppUpdateFn old_GameApp_Update = nullptr;
-static std::atomic<bool> g_unityFramePumpReady{false};
 
 // Android kembali memakai GameApp_Update sebagai frame pump.
