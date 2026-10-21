@@ -45,6 +45,8 @@ static UIWindow *g_window = nil;
 static UIView *g_glView = nil;
 static CADisplayLink *g_link = nil;
 static id g_lifecycleObservers[2] = {nil, nil};
+static id g_orientationObserver = nil;
+static BOOL g_orientationStarted = NO;
 
 // ---------------------------------------------------------------------------
 //  触摸队列：UIKit 回调在主线程，渲染也在主线程；仍然先入队再在帧内统一喂
@@ -283,8 +285,12 @@ static void SMRenderFrame(void) {
 @implementation SMOverlayWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
-    if (hit == self || hit == self.rootViewController.view) {
-        // 根视图没被 GLView 接管 => 点在菜单外 => 不拦这一下，交给下面的游戏窗口。
+    // 注意：本窗口的 rootViewController.view 就是 SMGLView 本身。
+    // 菜单内的触摸会让 super 返回 GLView —— 那正是我们要的结果，不能再把它当成
+    // "没命中"丢掉（之前这里把 rootViewController.view 一起 return nil，导致菜单
+    // 看得见但点不动）。菜单外时 GLView 的 pointInside 返回 NO，super 会返回
+    // window 自己，下面这条就能把触摸放行给游戏窗口。
+    if (hit == self) {
         return nil;
     }
     return hit;
@@ -328,6 +334,8 @@ void SMOverlayShowToast(const std::string &text) {
         label.layer.cornerRadius = 10.0;
         label.layer.masksToBounds = YES;
         label.userInteractionEnabled = NO;
+        // GLView 可能为了适配横屏游戏做了 90° 旋转；提示文字要反向抵消，否则是躺着的。
+        if (g_glView) label.transform = CGAffineTransformInvert(g_glView.transform);
 
         const CGFloat maxWidth = host.bounds.size.width - 48.0;
         CGSize size = [msg boundingRectWithSize:CGSizeMake(maxWidth, CGFLOAT_MAX)
@@ -350,6 +358,53 @@ void SMOverlayShowToast(const std::string &text) {
                                          completion:^(BOOL done) { [label removeFromSuperview]; }];
                          }];
     });
+}
+
+// ---------------------------------------------------------------------------
+//  屏幕方向
+// ---------------------------------------------------------------------------
+//  Unity 横屏游戏常常把 App 的 UIKit 方向留在竖屏，只旋转自己的 GL 视图。
+//  如果我们的窗口按竖屏铺满，菜单就会相对游戏"躺着"。按设备方向判断：
+//    * 设备横屏、窗口竖屏  -> 把 GLView 旋转 90°，bounds 换成横屏
+//    * 设备竖屏、窗口横屏  -> 反向旋转
+//    * 两者一致            -> 不旋转
+//  旋转后 bounds 变化会触发 layoutSubviews -> 重建横屏 framebuffer，
+//  ImGui 的 DisplaySize 与触摸坐标也随之变成横屏。
+static void SMUpdateOrientation(void) {
+    if (!g_window || !g_glView) return;
+
+    const CGSize screen = g_window.bounds.size;
+    const BOOL windowLandscape = screen.width > screen.height;
+
+    const UIDeviceOrientation dev = [UIDevice currentDevice].orientation;
+    BOOL deviceLandscape = NO;
+    switch (dev) {
+        case UIDeviceOrientationLandscapeLeft:
+        case UIDeviceOrientationLandscapeRight:
+            deviceLandscape = YES;
+            break;
+        case UIDeviceOrientationPortrait:
+        case UIDeviceOrientationPortraitUpsideDown:
+            deviceLandscape = NO;
+            break;
+        default:
+            // 平放/未知：保持现状，等下一次方向通知
+            return;
+    }
+
+    if (deviceLandscape == windowLandscape) {
+        g_glView.transform = CGAffineTransformIdentity;
+        g_glView.bounds = CGRectMake(0, 0, screen.width, screen.height);
+    } else {
+        const CGFloat angle =
+            (dev == UIDeviceOrientationLandscapeLeft) ? (CGFloat)M_PI_2 : (CGFloat)-M_PI_2;
+        g_glView.transform = CGAffineTransformMakeRotation(angle);
+        g_glView.bounds = CGRectMake(0, 0, screen.height, screen.width);
+    }
+    g_glView.center = CGPointMake(screen.width * 0.5, screen.height * 0.5);
+    [g_glView setNeedsLayout];
+    NSLog(@"[SawitMod] orientation: dev=%ld windowLandscape=%d -> bounds %.0fx%.0f",
+          (long)dev, windowLandscape, g_glView.bounds.size.width, g_glView.bounds.size.height);
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +445,22 @@ bool Start() {
 
     // 让 GLView 拿到 bounds 之后建 framebuffer
     [window.rootViewController.view layoutIfNeeded];
+
+    // 横屏游戏常见做法：App 的 UIKit 方向仍是竖屏，Unity 只旋转自己的 GL 视图。
+    // 我们的窗口如果按竖屏铺满，菜单就会"躺着"。这里按设备方向把 GL 视图整体
+    // 旋转 90° 并把 bounds 换成横屏尺寸，渲染尺寸和触摸坐标会自动跟着变。
+    [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
+    g_orientationStarted = YES;
+    SMUpdateOrientation();
+    g_orientationObserver = [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIDeviceOrientationDidChangeNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) {
+        (void)note;
+        SMUpdateOrientation();
+    }];
+
     if (g_glView) SMCreateFramebuffer(g_glView);
 
     g_linkTarget = [[SMDisplayLinkTarget alloc] init];
@@ -436,6 +507,14 @@ void Stop() {
                 [[NSNotificationCenter defaultCenter] removeObserver:g_lifecycleObservers[i]];
                 g_lifecycleObservers[i] = nil;
             }
+        }
+        if (g_orientationObserver) {
+            [[NSNotificationCenter defaultCenter] removeObserver:g_orientationObserver];
+            g_orientationObserver = nil;
+        }
+        if (g_orientationStarted) {
+            [[UIDevice currentDevice] endGeneratingDeviceOrientationNotifications];
+            g_orientationStarted = NO;
         }
         if (g_imguiReady) {
             ImGui_ImplOpenGL3_Shutdown();
