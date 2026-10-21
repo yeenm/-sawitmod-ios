@@ -174,6 +174,12 @@ std::string Clipboard() {
     return UTF8(s);
 }
 
+void RunWithAutoreleasePool(const std::function<void()> &body) {
+    @autoreleasepool {
+        if (body) body();
+    }
+}
+
 void SetClipboard(const std::string &text) {
     NSString *s = NSStringFromStd(text);
     dispatch_async(dispatch_get_main_queue(), ^{

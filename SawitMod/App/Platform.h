@@ -13,6 +13,7 @@
 // ============================================================================
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace SMPlatform {
@@ -41,6 +42,9 @@ void OpenURL(const std::string &url);
 void Quit();                       // exit(0)
 void Toast(const std::string &text);  // 屏幕顶部轻提示（不阻塞）
 std::string Clipboard();
+
+// 后台线程里调 Foundation（Keychain/UIDevice/路径）时包一层 autorelease pool。
+void RunWithAutoreleasePool(const std::function<void()> &body);
 void SetClipboard(const std::string &text);
 
 // ---- 诊断 ----

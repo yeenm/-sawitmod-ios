@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 //  platform_stubs.cpp — 链接自检用的平台符号桩
 // ----------------------------------------------------------------------------
 //  只给 scripts/check_link.ps1 用：在 Windows 上把 C++ 侧全部目标文件链接成
@@ -39,6 +39,7 @@ void Quit() {}
 void Toast(const std::string &) {}
 std::string Clipboard() { return std::string(); }
 void SetClipboard(const std::string &) {}
+void RunWithAutoreleasePool(const std::function<void()> &body) { if (body) body(); }
 bool IsDebuggerAttached() { return false; }
 std::string ProcessName() { return "stub"; }
 }  // namespace SMPlatform

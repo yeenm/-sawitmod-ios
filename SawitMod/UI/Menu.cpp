@@ -370,26 +370,32 @@ void DrawMenu() {
                                      sign_min, ImVec2(half, ActiveUI::S(38)))) {
                 if (!verifyBusy.exchange(true)) {
                     std::string key = license_input;
-                    std::thread([key]() {
-                        // 卡密为空时先试上次保存的卡密，和原版输入 y 的行为一致
-                        std::string use = key;
-                        if (use.empty()) use = Weiyan::LoadSavedCard();
-                        if (use.empty()) {
-                            Weiyan::SetStatus(u8"请输入卡密");
+                                        std::thread([key]() {
+                        SMPlatform::RunWithAutoreleasePool([key]() {
+                            // 卡密为空时先试上次保存的卡密，和原版输入 y 的行为一致
+                            std::string use = key;
+                            if (use.empty()) use = Weiyan::LoadSavedCard();
+                            if (use.empty()) {
+                                Weiyan::SetStatus(u8"请输入卡密");
+                                verifyBusy.store(false);
+                                return;
+                            }
+                            if (use != key) {
+                                strncpy(license_input, use.c_str(), sizeof(license_input) - 1);
+                                license_input[sizeof(license_input) - 1] = 0;
+                            }
+                            try {
+                                Weiyan::Result r = Weiyan::VerifyCard(use);
+                                if (r.ok) {
+                                    // 卡密通过后把内部会话也装好，功能才能走本地 payload 回放
+                                    LoginOfflineSession(false);
+                                    SaveLicenseLocally(use);
+                                }
+                            } catch (...) {
+                                Weiyan::SetStatus(u8"验证异常，请重试");
+                            }
                             verifyBusy.store(false);
-                            return;
-                        }
-                        if (use != key) {
-                            strncpy(license_input, use.c_str(), sizeof(license_input) - 1);
-                            license_input[sizeof(license_input) - 1] = 0;
-                        }
-                        Weiyan::Result r = Weiyan::VerifyCard(use);
-                        if (r.ok) {
-                            // 卡密通过后把内部会话也装好，功能才能走本地 payload 回放
-                            LoginOfflineSession(false);
-                            SaveLicenseLocally(use);
-                        }
-                        verifyBusy.store(false);
+                        });
                     }).detach();
                 }
             }

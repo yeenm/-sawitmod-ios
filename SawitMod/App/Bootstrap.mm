@@ -19,6 +19,7 @@
 #import <UIKit/UIKit.h>
 
 #include <atomic>
+#include <csignal>
 #include <chrono>
 #include <cstring>
 #include <string>
@@ -139,6 +140,10 @@ namespace SMBootstrap {
 void Start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
+
+    // 裸 socket 遇到对端关闭会发 SIGPIPE，默认动作是杀进程；
+    // iOS 上等价于"闪退"。全局忽略，配合 Weiyan 里的 SO_NOSIGPIPE。
+    signal(SIGPIPE, SIG_IGN);
 
     SMCrash::Install();
 

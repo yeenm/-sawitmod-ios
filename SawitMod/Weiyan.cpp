@@ -29,6 +29,18 @@
 
 namespace {
 
+// iOS/macOS 没有 MSG_NOSIGNAL：向已关闭的 socket 写数据会触发 SIGPIPE，
+// 默认动作是直接终止进程 —— 表现为"点验证卡密/拉公告时闪退"。
+// 建立 socket 后必须置位 SO_NOSIGPIPE（Bootstrap 里另外全局忽略了 SIGPIPE）。
+void SetNoSigPipe(int fd) {
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#else
+    (void)fd;
+#endif
+}
+
 // =====================================================================
 //  常量（与原实现同一组，勿改）
 // =====================================================================
@@ -403,6 +415,7 @@ bool ReadFully(int fd, char* buf, int len) {
 // 阿里 DNS(223.5.5.5) over TCP 的 A 记录查询；getaddrinfo 失败时兜底
 std::string ResolveViaAliyun(const std::string& domain) {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    SetNoSigPipe(fd);
     if (fd < 0) return "";
     sockaddr_in dns{};
     dns.sin_family = AF_INET;
@@ -562,6 +575,7 @@ std::string HttpRequest(const std::string& host, const std::string& target,
         return "";
     }
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    SetNoSigPipe(fd);
     if (fd < 0) return "";
 
     timeval tv{};
@@ -938,6 +952,9 @@ bool InterpretLoginResponse(const std::string& json, const std::string& sign,
 // =====================================================================
 //  对外接口
 // =====================================================================
+
+
+
 namespace Weiyan {
 
 std::string LoginId() {
@@ -1145,7 +1162,7 @@ void Logout() {
     g_status = u8"已退出，请重新输入卡密";
 }
 
-Result VerifyCard(const std::string& cardKey) {
+static Result VerifyCardImpl(const std::string& cardKey) {
     Result r;
     std::string key = cardKey;
     while (!key.empty() && (key.back() == '\n' || key.back() == '\r' || key.back() == ' ')) key.pop_back();
@@ -1221,6 +1238,20 @@ Result VerifyCard(const std::string& cardKey) {
     LOGI("card verified: ktype=%s remaining=%d expire=%lld",
            r.ktype.c_str(), r.remaining, r.expiresAt);
     return r;
+}
+
+Result VerifyCard(const std::string& cardKey) {
+    try {
+        return VerifyCardImpl(cardKey);
+    } catch (const std::exception& e) {
+        Result r;
+        r.message = std::string(u8"验证异常：") + e.what();
+        return r;
+    } catch (...) {
+        Result r;
+        r.message = u8"验证异常（未知错误）";
+        return r;
+    }
 }
 
 std::string FetchNotice() {
