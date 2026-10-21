@@ -396,8 +396,11 @@ static void SMUpdateOrientation(void) {
         g_glView.transform = CGAffineTransformIdentity;
         g_glView.bounds = CGRectMake(0, 0, screen.width, screen.height);
     } else {
+        // 方向映射：实机验证过一次——竖屏窗口里接横屏游戏时，
+        // LandscapeLeft 必须是 -90°，LandscapeRight 是 +90°。
+        // 上一版写反了，菜单整体差 180°（文字倒着）。
         const CGFloat angle =
-            (dev == UIDeviceOrientationLandscapeLeft) ? (CGFloat)M_PI_2 : (CGFloat)-M_PI_2;
+            (dev == UIDeviceOrientationLandscapeLeft) ? (CGFloat)-M_PI_2 : (CGFloat)M_PI_2;
         g_glView.transform = CGAffineTransformMakeRotation(angle);
         g_glView.bounds = CGRectMake(0, 0, screen.height, screen.width);
     }
