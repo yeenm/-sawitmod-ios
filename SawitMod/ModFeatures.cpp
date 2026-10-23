@@ -566,8 +566,37 @@ void ScanPotsNative() {
     SMPlatform::SetBreadcrumbLight("scan:inflated");
 
     SMPlatform::SetBreadcrumbLight("scan:compsys");
+    // mono 下如果 GetComponentSystem 是实例方法，传 nullptr 会直接 SIGSEGV；
+    // 先读签名/静态标志，实例方法就去拿 EntityWorld 单例，拿不到就跳过。
+    bool needWorldInstance = false;
+    if (SMMonoHot::IsMonoMethod(closed)) {
+        const uint32_t cmf = SMMonoHot::MethodGetFlags(closed, nullptr);
+        needWorldInstance = (cmf & 0x10u) == 0;
+    }
+    SMPlatform::SetBreadcrumbLight(std::string("scan:csig:") + CompactMethodSig(closed) +
+                                   (needWorldInstance ? ":i" : ":s"));
+    void *worldInst = nullptr;
+    if (needWorldInstance) {
+        static const char *kInstAccessors[] = {
+            "get_Instance", "get_instance", "get_Current", "get_CurrentWorld",
+            "get_Default", "get_Main", "GetInstance", "GetWorld"
+        };
+        for (const char *acc : kInstAccessors) {
+            void *m = worldKlass ? FindMethodInHierarchy(worldKlass, acc, 0) : nullptr;
+            if (!m) continue;
+            void *aexc = nullptr;
+            worldInst = _monoRuntimeInvoke(m, nullptr, nullptr, &aexc);
+            if (worldInst && !aexc) break;
+            worldInst = nullptr;
+        }
+        if (!worldInst) {
+            SMPlatform::SetBreadcrumbLight("scan:no-inst");
+            return;
+        }
+    }
+    SMPlatform::SetBreadcrumbLight("scan:compsys");
     void *exc = nullptr;
-    void *sysObj = _monoRuntimeInvoke(closed, nullptr, nullptr, &exc);
+    void *sysObj = _monoRuntimeInvoke(closed, worldInst, nullptr, &exc);
     if (exc || !sysObj) return;
 
     void *sysKlass = _monoObjectGetClass(sysObj);

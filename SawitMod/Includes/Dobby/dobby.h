@@ -41,3 +41,22 @@ int DobbyDestroy(void *address);
 #ifdef __cplusplus
 }
 #endif
+
+// ============================================================================
+//  ⚠️ 侧载（非越狱）iOS 全局禁用 inline hook
+// ----------------------------------------------------------------------------
+//  Dobby 需要 mmap(PROT_EXEC) 分配 trampoline；侧载 App 没有 JIT 权限，
+//  代码页又受签名保护。调用 DobbyHook 轻则失败，重则把 mono 解释器入口
+//  写坏 → 之后一执行就 SIGSEGV（实测：自动沙雕 / 建房 / 表情功能）。
+//  这里直接降级为“永远失败”，所有调用点按 hook 未安装继续跑。
+//  越狱或允许 JIT 的构建可 -DSM_ALLOW_DOBBY_HOOK=1 恢复真实 hook。
+// ============================================================================
+#if defined(__APPLE__) && !defined(SM_ALLOW_DOBBY_HOOK)
+static inline int SMDisabledDobbyHook(void *address, void *replace_func, void **origin_func) {
+    (void) address;
+    (void) replace_func;
+    if (origin_func) *origin_func = 0;
+    return RS_FAILED;
+}
+#define DobbyHook(a, b, c) SMDisabledDobbyHook((void *) (a), (void *) (b), (void **) (c))
+#endif
