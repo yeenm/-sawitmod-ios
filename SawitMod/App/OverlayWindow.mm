@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 //  OverlayWindow.mm — 悬浮菜单窗口 + 独立 GL 渲染循环 + 触摸转发
 // ----------------------------------------------------------------------------
 //  与 Android 版的对应关系：
@@ -24,6 +24,7 @@
 
 #include "App/OverlayWindow.h"
 #include "App/Platform.h"
+#include "Core/AntiBan.h"
 #include "Core/State.h"
 #include "UI/MenuGlue.h"
 
@@ -178,6 +179,9 @@ static void SMRenderFrame(void) {
     io.DisplaySize = ImVec2((float)g_width, (float)g_height);
     io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
     io.DeltaTime = (g_link && g_link.duration > 0.0) ? (float)g_link.duration : (1.0f / 60.0f);
+
+    // 防封补丁重试：il2cpp 程序集懒加载，启动时没命中的补丁在后续帧补上。
+    SMAntiBanTick();
 
     FlushTouches();
 

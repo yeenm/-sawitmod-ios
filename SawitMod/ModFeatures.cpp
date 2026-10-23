@@ -6389,7 +6389,17 @@ void ExecuteFastHouseSetupNative() {
         void *protocolKlass = _monoClassFromName(imgData, (const char *) OBFUSCATE(
                 "XDTDataAndProtocol.ProtocolService.Homeland"), (const char *) OBFUSCATE(
                 "HomelandProtocolManager"));
-        if (!protocolKlass) return;
+        if (!protocolKlass) {
+            // iOS：建房协议在加密的热更 Mono 程序集里，桥接未就绪时这里恒 null。
+            // 此时「即时金币农场」只剩开头的 SetGlobalTimeScale(10) 在生效，
+            // 表现就是“变成了全局加速”。连续失败 5 次自动关开关并恢复 1.0 倍速。
+            static std::atomic<int> fastHouseMisses{0};
+            if (++fastHouseMisses >= 5) {
+                g_fastHouseSetupEnabled = false;
+                SetGlobalTimeScale(1.0f);
+            }
+            return;
+        }
 
         // 1. SendChooseInitHouseData
         void *m_SendChoose = FindMethodInHierarchy(protocolKlass, (const char *) OBFUSCATE(

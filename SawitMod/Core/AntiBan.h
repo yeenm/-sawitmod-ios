@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // ============================================================================
 //  AntiBan.h — iOS 端「过检测 / 防封」模块
 // ----------------------------------------------------------------------------
@@ -26,6 +26,9 @@ int SMAntiBanInstall();
 
 // 仅安装 GameApp.Update 帧泵 hook（类名解析版，不需要 RVA）。
 bool SMAntiBanHookFramePump();
+
+// 渲染线程每秒调用：重试启动时因程序集未加载而 miss 的补丁。
+void SMAntiBanTick();
 
 // 运行期状态/统计（菜单展示用）。
 std::string SMAntiBanStatus();

@@ -7,23 +7,28 @@
 //
 //      void  : RET                  (D65F03C0)
 //      false : MOV W0,#0 ; RET      (52800000, D65F03C0)
-//      true  : MOV W0,#1 ; RET
 //      null  : MOV X0,#0 ; RET      (D2800000, D65F03C0)
 //
-//  这样既不碰游戏原生代码段里的固定偏移，也不会因为游戏小版本更新而错挂：
-//  方法找不到就记一个 miss，其他补丁照常上。
+//  ⚠️ 关键点：il2cpp 的程序集是**按需加载**的 —— 刚进游戏时 ThemisSDK/Logan/
+//  XDCore 这些 image 可能还没进 domain，`il2cpp_class_from_name` 会返回 null。
+//  所以补丁不能只在启动时试一次：这里维护一张 pending 表，由渲染线程每秒
+//  重试（SMAntiBanTick），直到全部命中或重试次数耗尽。菜单设置页显示
+//  patched/pending 计数，用户能直接看到拦截是否生效。
 //
-//  拦截清单（全部来自 iOS dump.cs 的类/方法签名核对）：
-//    1. Themis / TapSDK 检测与上报
+//  拦截清单（全部用 dump.cs 的类/方法/参数个数逐一核对过）：
+//    1. Themis / TapSDK 检测与上报（含 TapThemisAgentIOS 的 native 上报桥）
 //    2. Logan 日志上传
 //    3. XD.SDK.Report 举报/证据上传
-//    4. UploadManager / _UploadSystem 通用上传
-//    5. BugReporter.ReportError
+//    4. BugReporter 崩溃上报
+//    5. XDPerf 位置/UID/设备指纹埋点、模拟器检测
+//    6. LogSystem 日志提交/截图开关、CodeCheck Mono 程序集 MD5 校验
 //  另外用类名解析装 GameApp.Update 帧泵（替代 OFF_GAMEAPP_UPDATE）。
 // ============================================================================
 
 #include "Core/AntiBan.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -36,8 +41,8 @@
 #include "IL2CPP/MonoCompat.h"
 #include "Includes/Dobby/dobby.h"
 #include "Includes/Logger.h"
-#include "Includes/obfuscate.h"
 #include "Includes/OSCache.h"
+#include "Includes/obfuscate.h"
 #include "ModUtils.h"
 
 namespace {
@@ -52,20 +57,44 @@ enum PatchMode {
     kPatchNull,       // return null (object/string/task)
 };
 
-struct Target {
+// 补丁类型：单参数个数 / 多参数个数候选（重载）/ 字段写 / 静态方法调用
+enum Kind {
+    kKindPatch = 0,
+    kKindMulti,
+    kKindStaticBool,
+    kKindInstanceBool,
+    kKindInvokeBool,
+};
+
+struct Pending {
+    Kind kind;
     const char *ns;
     const char *cls;
-    const char *method;
+    const char *name;    // 方法名；静态 bool 时为字段名
+    const char *extra;   // 实例 bool：单例 getter 名
     int argc;
+    const int *argcs;
+    int argcCount;
     PatchMode mode;
+    bool bvalue;
+    // 运行时状态
+    bool done;
+    int tries;
 };
 
 // ---- 运行期统计 ----
-std::once_flag g_installOnce;
-int g_patched = 0;
-int g_missed = 0;
+std::mutex g_mtx;
+std::vector<Pending> g_pending;
+bool g_listsReady = false;
+std::once_flag g_initOnce;
+int g_applied = 0;
+int g_pendingLeft = 0;
 bool g_frameHookOk = false;
-std::string g_status = "未安装";
+int g_frameTries = 0;
+std::string g_status = "init";
+
+constexpr int kMaxTries = 80;   // 每秒左右一次 → 约 1 分 20 秒窗口
+constexpr int kFrameMaxTries = 30;
 
 void AttachThread() {
     if (_monoGetRootDomain && _monoThreadAttach) {
@@ -73,11 +102,10 @@ void AttachThread() {
     }
 }
 
-// 跨镜像找类：ns 传 "" 也能找到全局命名空间的类（shim 里会扫全部 image）。
+// 跨镜像找类：ns 传 "" 也能找到全局命名空间的类（shim 会扫全部 image）。
 void *FindClassByName(const char *ns, const char *name) {
     if (!name) return nullptr;
-    void *klass = _monoClassFromName(nullptr, ns ? ns : "", name);
-    return klass;
+    return _monoClassFromName(nullptr, ns ? ns : "", name);
 }
 
 void *FindMethodEx(void *klass, const char *name, int argc) {
@@ -96,12 +124,8 @@ bool WritePatch(void *code, PatchMode mode) {
             words = 1;
             break;
         case kPatchFalse:
-            payload[0] = 0x52800000;  // MOV W0, #0
-            payload[1] = 0xD65F03C0;
-            words = 2;
-            break;
         case kPatchIntZero:
-            payload[0] = 0x52800000;
+            payload[0] = 0x52800000;  // MOV W0, #0
             payload[1] = 0xD65F03C0;
             words = 2;
             break;
@@ -123,193 +147,221 @@ bool WritePatch(void *code, PatchMode mode) {
     return true;
 }
 
-bool PatchOne(const Target &t) {
-    void *klass = FindClassByName(t.ns, t.cls);
-    if (!klass) {
-        LOGI(OBFUSCATE("[AntiBan] miss class %s.%s"), t.ns, t.cls);
-        return false;
-    }
-    void *method = FindMethodEx(klass, t.method, t.argc);
-    if (!method) {
-        LOGI(OBFUSCATE("[AntiBan] miss method %s.%s.%s(%d)"), t.ns, t.cls, t.method, t.argc);
-        return false;
-    }
-    void *code = _monoCompileMethod ? _monoCompileMethod(method) : nullptr;
+bool TryPatchMethod(const char *ns, const char *cls, const char *method, int argc, PatchMode mode) {
+    void *klass = FindClassByName(ns, cls);
+    if (!klass) return false;
+    void *m = FindMethodEx(klass, method, argc);
+    if (!m) return false;
+    void *code = _monoCompileMethod ? _monoCompileMethod(m) : nullptr;
     if (!code) return false;
-    const bool ok = WritePatch(code, t.mode);
-    if (ok) {
-        LOGI(OBFUSCATE("[AntiBan] patched %s.%s.%s(%d) -> mode %d"),
-             t.ns, t.cls, t.method, t.argc, (int)t.mode);
-    }
-    return ok;
-}
-
-// 一个方法可能有多个重载（例如 UploadLogs 有 1/2 个参数两种），逐个 argc 尝试。
-bool PatchOverloads(const char *ns, const char *cls, const char *method,
-                    const std::vector<int> &argcs, PatchMode mode) {
-    for (int argc : argcs) {
-        Target t{ns, cls, method, argc, mode};
-        if (PatchOne(t)) {
-            ++g_patched;
-            return true;
-        }
-    }
-    ++g_missed;
-    return false;
+    return WritePatch(code, mode);
 }
 
 void SetStaticBool(const char *ns, const char *cls, const char *field, bool value) {
     void *klass = FindClassByName(ns, cls);
     if (!klass || !field) return;
     void *f = _monoClassGetFieldFromName(klass, field);
-    if (!f) {
-        LOGI(OBFUSCATE("[AntiBan] miss field %s.%s.%s"), ns, cls, field);
-        return;
-    }
+    if (!f) return;
     const API &a = Get();
     if (!a.field_static_set_value) return;
     bool v = value;
     a.field_static_set_value(f, &v);
-    LOGI(OBFUSCATE("[AntiBan] %s.%s.%s = %d"), ns, cls, field, (int)value);
 }
-
-// 调用一个 static void 方法（只支持 0/1 个 bool/int 参数，够用）。
-bool InvokeStaticVoid(const char *ns, const char *cls, const char *method,
-                      int argc, bool boolArg) {
-    void *klass = FindClassByName(ns, cls);
-    if (!klass) return false;
-    void *m = FindMethodEx(klass, method, argc);
-    if (!m) return false;
-    const API &a = Get();
-    if (!a.runtime_invoke) return false;
-    void *exc = nullptr;
-    if (argc == 0) {
-        a.runtime_invoke(m, nullptr, nullptr, &exc);
-    } else {
-        bool v = boolArg;
-        void *params[1] = {&v};
-        a.runtime_invoke(m, nullptr, params, &exc);
-    }
-    LOGI(OBFUSCATE("[AntiBan] invoke %s.%s.%s(%d) exc=%p"), ns, cls, method, argc, exc);
-    return exc == nullptr;
-}
-
-// ---------------------------------------------------------------------------
-//  补丁清单
-// ---------------------------------------------------------------------------
-void ApplyThemisBypass() {
-    // 1) Themis 托管包装（TapTap.Themis）：检测结果上报 / 玩家信息上报 / 输入特征采集
-    static const Target kThemisTargets[] = {
-        {"TapTap.Themis", "TapThemis", "ReportException", 3, kPatchVoid},
-        {"TapTap.Themis", "TapThemis", "ReportLogError", 3, kPatchVoid},
-        {"TapTap.Themis", "TapThemis", "ReportCustomException", 4, kPatchVoid},
-        {"TapTap.Themis", "TapThemis", "ReportCustomExceptionEx", 6, kPatchVoid},
-        {"TapTap.Themis", "TapThemis", "AddCustomField", 2, kPatchVoid},
-        {"TapTap.Themis", "TapThemis", "TMCR", 2, kPatchVoid},
-        {"TapTap.Themis", "TapThemis", "U3d_ConfigAutoQuitApplication", 1, kPatchVoid},
-        // 检测状态回调：不让游戏/模组层收到"环境不安全"的状态
-        {"TapTap.Themis", "TapThemisAgentIOS", "_onThemisStateCB", 2, kPatchVoid},
-        // TapThemisAgentIOS 的 native 桥（ThemisSDK 真正的上报入口）
-        {"TapTap.Themis", "TapThemisAgentIOS", "_lib_report_exception_with_type", 5, kPatchVoid},
-        {"TapTap.Themis", "TapThemisAgentIOS", "_lib_report_custom_exception_ex", 6, kPatchVoid},
-        {"TapTap.Themis", "TapThemisAgentIOS", "_add_custom_field", 2, kPatchVoid},
-        {"TapTap.Themis", "TapThemisAgentIOS", "_lib_enable_debug_mode", 1, kPatchVoid},
-        {"TapTap.Themis", "TapThemisCallBackImp", "onHandleThemisState", 2, kPatchVoid},
-        // 2) 引擎侧 Themis 管理类（全局命名空间）
-        {"", "ThemisSDKManager", "ReportException", 3, kPatchVoid},
-        {"", "ThemisSDKManager", "ReportLogError", 3, kPatchVoid},
-        {"", "ThemisSDKManager", "ReportCustomException", 4, kPatchVoid},
-        {"", "ThemisSDKManager", "ReportCustomExceptionEx", 6, kPatchVoid},
-        {"", "ThemisSDKManager", "AddCustomPlayer", 2, kPatchVoid},
-        // 3) TapDB 的 Themis 工具类
-        {"TapTap.TapDB.Mobile", "ThemisUtil", "ExceptionReport", 2, kPatchVoid},
-        {"TapTap.TapDB.Mobile", "ThemisUtil", "ReportException", 4, kPatchVoid},
-        {"TapTap.TapDB.Mobile", "ThemisUtil", "U3d_ConfigAutoQuitApplication", 1, kPatchVoid},
-    };
-    for (const Target &t : kThemisTargets) {
-        if (PatchOne(t)) ++g_patched; else ++g_missed;
-    }
-
-    // 4) 关掉 Themis 自己的开关 + 不让它初始化完就自动上传
-    SetStaticBool("TapTap.Themis", "TapThemis", "Open", false);
-    InvokeStaticVoid("", "ThemisSDKManager", "SetSwitch", 1, false);
-    InvokeStaticVoid("TapTap.Themis", "TapThemis", "U3d_ConfigAutoQuitApplication", 1, false);
-    InvokeStaticVoid("TapTap.TapDB.Mobile", "ThemisUtil", "U3d_ConfigAutoQuitApplication", 1, false);
-}
-
-void ApplyReportBlock() {
-    // ---- Logan 日志上传 ----
-    PatchOverloads("", "Logan", "UploadLogs", {1, 2}, kPatchVoid);
-    PatchOverloads("", "LoganBridge", "UploadLogs", {1}, kPatchVoid);
-    PatchOverloads("", "LoganBridge", "UpLoadLogs", {1}, kPatchVoid);
-    PatchOverloads("", "LoganBridge", "uploadLogsByDay", {1}, kPatchVoid);
-    PatchOverloads("", "LoganManager", "UploadLogs", {1, 2, 3}, kPatchVoid);
-
-    // ---- XD.SDK.Report 举报 / 证据上传 ----
-    PatchOverloads("XD.SDK.Report", "XDGReport", "Report", {2}, kPatchVoid);
-    PatchOverloads("XD.SDK.Report", "XDReportImpl", "Report", {2}, kPatchVoid);
-    PatchOverloads("XD.SDK.Report", "XDReportImpl", "ReportAsync", {3}, kPatchVoid);
-    PatchOverloads("XD.SDK.Report", "XDReportImpl", "UploadEvidence", {3}, kPatchVoid);
-    PatchOverloads("XD.SDK.Report", "XDReportImpl", "UploadEvidenceBySignedOssUrl", {4}, kPatchVoid);
-
-    // ---- 崩溃/异常上报 ----
-    PatchOverloads("ScriptsRefactory.BaseService.BugReporter", "BugReporter", "ReportError", {3},
-                   kPatchVoid);
-}
-
 
 // 通过 static get_Instance() 拿到单例，再写它的实例字段。
 void SetInstanceBool(const char *ns, const char *cls, const char *getter, int getterArgc,
                      const char *fieldName, bool value) {
     void *klass = FindClassByName(ns, cls);
-    if (!klass) {
-        LOGI(OBFUSCATE("[AntiBan] miss class %s.%s"), ns, cls);
-        return;
-    }
+    if (!klass) return;
     void *gm = FindMethodEx(klass, getter, getterArgc);
     void *f = _monoClassGetFieldFromName(klass, fieldName);
-    if (!gm || !f || !_monoRuntimeInvoke || !_monoFieldSetValue) {
-        LOGI(OBFUSCATE("[AntiBan] miss %s.%s instance getter/field"), cls, fieldName);
-        return;
-    }
+    if (!gm || !f || !_monoRuntimeInvoke || !_monoFieldSetValue) return;
     void *exc = nullptr;
     void *inst = _monoRuntimeInvoke(gm, nullptr, nullptr, &exc);
-    if (!inst) {
-        LOGI(OBFUSCATE("[AntiBan] %s.get_Instance() null"), cls);
-        return;
-    }
+    if (!inst) return;
     bool v = value;
     _monoFieldSetValue(inst, f, &v);
-    LOGI(OBFUSCATE("[AntiBan] %s.%s = %d (inst=%p)"), cls, fieldName, (int)value, inst);
 }
 
-// 性能/设备埋点（XDKWPerfSDK）：位置、UID、设备指纹、模拟器类型
-void ApplyTelemetryBlock() {
-    static const Target kPerfTargets[] = {
-        {"XDPlugin.XDKWPerf", "XDPerf", "PostPosition", 3, kPatchVoid},
-        {"XDPlugin.XDKWPerf", "XDPerf", "ReportUid", 1, kPatchVoid},
-        {"XDPlugin.XDKWPerf", "XDPerf", "ReportXDPerfInfos", 0, kPatchVoid},
-        {"XDPlugin.XDKWPerf", "XDPerf", "ReportQuality", 2, kPatchVoid},
-        {"XDPlugin.XDKWPerf", "XDPerf", "ReportCustomQuality", 1, kPatchVoid},
-        {"XDPlugin.XDKWPerf", "XDPerf", "ReportTargetFrameRate", 1, kPatchVoid},
-        {"XDPlugin.XDKWPerf", "XDPerf", "PostNetworkLatency", 1, kPatchVoid},
-        {"XDPlugin.XDKWPerf", "XDPerf", "ReportSceneName", 1, kPatchVoid},
-        {"XDPlugin.XDKWPerf", "XDPerf", "ReportChannel", 1, kPatchVoid},
-        {"XDPlugin.XDKWPerf", "XDPerf", "ReportServerId", 1, kPatchVoid},
-        {"XDPlugin.XDKWPerf", "XDPerf", "ReportLanguage", 1, kPatchVoid},
-        {"XDPlugin.XDKWPerf", "XDPerf", "GetEmulatorType", 0, kPatchIntZero},
+bool InvokeStaticVoidBool(const char *ns, const char *cls, const char *method, bool arg) {
+    void *klass = FindClassByName(ns, cls);
+    if (!klass) return false;
+    void *m = FindMethodEx(klass, method, 1);
+    if (!m) return false;
+    const API &a = Get();
+    if (!a.runtime_invoke) return false;
+    bool v = arg;
+    void *params[1] = {&v};
+    void *exc = nullptr;
+    a.runtime_invoke(m, nullptr, params, &exc);
+    return exc == nullptr;
+}
+
+// ---------------------------------------------------------------------------
+//  pending 表
+// ---------------------------------------------------------------------------
+#define P_PATCH(ns, cls, meth, argc, mode) \
+    Pending{kKindPatch, ns, cls, meth, nullptr, argc, nullptr, 0, mode, false, false, 0}
+#define P_MULTI(ns, cls, meth, arr, mode) \
+    Pending{kKindMulti, ns, cls, meth, nullptr, 0, arr, (int)(sizeof(arr) / sizeof(int)), mode, false, false, 0}
+#define P_SBOOL(ns, cls, field, val) \
+    Pending{kKindStaticBool, ns, cls, field, nullptr, 0, nullptr, 0, kPatchVoid, val, false, 0}
+#define P_IBOOL(ns, cls, getter, field, val) \
+    Pending{kKindInstanceBool, ns, cls, field, getter, 0, nullptr, 0, kPatchVoid, val, false, 0}
+#define P_INVOKE(ns, cls, meth, val) \
+    Pending{kKindInvokeBool, ns, cls, meth, nullptr, 1, nullptr, 0, kPatchVoid, val, false, 0}
+
+void BuildPendingList() {
+    static const int aLogan[] = {1, 2};
+    static const int aOne[] = {1};
+    static const int aMgr[] = {1, 2, 3};
+
+    g_pending = {
+        // ===== Themis 托管包装（TapTap.Themis / TapThemis）=====
+        P_PATCH("TapTap.Themis", "TapThemis", "ReportException", 3, kPatchVoid),
+        P_PATCH("TapTap.Themis", "TapThemis", "ReportLogError", 3, kPatchVoid),
+        P_PATCH("TapTap.Themis", "TapThemis", "ReportCustomException", 4, kPatchVoid),
+        P_PATCH("TapTap.Themis", "TapThemis", "ReportCustomExceptionEx", 6, kPatchVoid),
+        P_PATCH("TapTap.Themis", "TapThemis", "AddCustomField", 2, kPatchVoid),
+        P_PATCH("TapTap.Themis", "TapThemis", "TMCR", 2, kPatchVoid),
+        P_PATCH("TapTap.Themis", "TapThemis", "U3d_ConfigAutoQuitApplication", 1, kPatchVoid),
+        // 检测状态回调：不让游戏/模组层收到"环境不安全"的状态
+        P_PATCH("TapTap.Themis", "TapThemisAgentIOS", "_onThemisStateCB", 2, kPatchVoid),
+        // TapThemisAgentIOS 的 native 上报桥（ThemisSDK 真正的上报入口）
+        P_PATCH("TapTap.Themis", "TapThemisAgentIOS", "_lib_report_exception_with_type", 5, kPatchVoid),
+        P_PATCH("TapTap.Themis", "TapThemisAgentIOS", "_lib_report_custom_exception_ex", 6, kPatchVoid),
+        P_PATCH("TapTap.Themis", "TapThemisAgentIOS", "_add_custom_field", 2, kPatchVoid),
+        P_PATCH("TapTap.Themis", "TapThemisAgentIOS", "_lib_enable_debug_mode", 1, kPatchVoid),
+        P_PATCH("TapTap.Themis", "TapThemisCallBackImp", "onHandleThemisState", 2, kPatchVoid),
+        // ===== 引擎侧 Themis 管理类（全局命名空间）=====
+        P_PATCH("", "ThemisSDKManager", "ReportException", 3, kPatchVoid),
+        P_PATCH("", "ThemisSDKManager", "ReportLogError", 3, kPatchVoid),
+        P_PATCH("", "ThemisSDKManager", "ReportCustomException", 4, kPatchVoid),
+        P_PATCH("", "ThemisSDKManager", "ReportCustomExceptionEx", 6, kPatchVoid),
+        P_PATCH("", "ThemisSDKManager", "AddCustomPlayer", 2, kPatchVoid),
+        // ===== TapDB 的 Themis 工具类 =====
+        P_PATCH("TapTap.TapDB.Mobile", "ThemisUtil", "ExceptionReport", 2, kPatchVoid),
+        P_PATCH("TapTap.TapDB.Mobile", "ThemisUtil", "ReportException", 4, kPatchVoid),
+        P_PATCH("TapTap.TapDB.Mobile", "ThemisUtil", "U3d_ConfigAutoQuitApplication", 1, kPatchVoid),
+        // ===== Logan 日志上传 =====
+        P_MULTI("", "Logan", "UploadLogs", aLogan, kPatchVoid),
+        P_MULTI("", "LoganBridge", "UploadLogs", aOne, kPatchVoid),
+        P_MULTI("", "LoganBridge", "UpLoadLogs", aOne, kPatchVoid),
+        P_MULTI("", "LoganBridge", "uploadLogsByDay", aOne, kPatchVoid),
+        P_MULTI("", "LoganManager", "UploadLogs", aMgr, kPatchVoid),
+        // ===== XD.SDK.Report 举报 / 证据上传 =====
+        P_PATCH("XD.SDK.Report", "XDGReport", "Report", 2, kPatchVoid),
+        P_PATCH("XD.SDK.Report", "XDReportImpl", "Report", 2, kPatchVoid),
+        P_PATCH("XD.SDK.Report", "XDReportImpl", "ReportAsync", 3, kPatchVoid),
+        P_PATCH("XD.SDK.Report", "XDReportImpl", "UploadEvidence", 3, kPatchVoid),
+        P_PATCH("XD.SDK.Report", "XDReportImpl", "UploadEvidenceBySignedOssUrl", 4, kPatchVoid),
+        // ===== 崩溃上报 =====
+        P_PATCH("ScriptsRefactory.BaseService.BugReporter", "BugReporter", "ReportError", 3, kPatchVoid),
+        // ===== XDPerf 埋点（位置/UID/设备指纹/模拟器）=====
+        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "PostPosition", 3, kPatchVoid),
+        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportUid", 1, kPatchVoid),
+        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportXDPerfInfos", 0, kPatchVoid),
+        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportQuality", 2, kPatchVoid),
+        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportCustomQuality", 1, kPatchVoid),
+        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportTargetFrameRate", 1, kPatchVoid),
+        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "PostNetworkLatency", 1, kPatchVoid),
+        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportSceneName", 1, kPatchVoid),
+        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportChannel", 1, kPatchVoid),
+        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportServerId", 1, kPatchVoid),
+        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportLanguage", 1, kPatchVoid),
+        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "GetEmulatorType", 0, kPatchIntZero),
+        // ===== 数据字段类 =====
+        P_SBOOL("MonoGame.ScriptFramework", "CodeCheck", "IsMD5Match", true),
+        P_IBOOL("XDFramework.Core", "LogSystem", "get_Instance", "canSubmit", false),
+        P_IBOOL("XDFramework.Core", "LogSystem", "get_Instance", "captureScreenshot", false),
+        P_MULTI("MonoGame", "TypeRegister", "CheckMD5", aOne, kPatchVoid),
+        // ===== 开关调用（失败不致命）=====
+        P_INVOKE("", "ThemisSDKManager", "SetSwitch", false),
+        P_INVOKE("TapTap.Themis", "TapThemis", "U3d_ConfigAutoQuitApplication", false),
+        P_INVOKE("TapTap.TapDB.Mobile", "ThemisUtil", "U3d_ConfigAutoQuitApplication", false),
     };
-    for (const Target &t : kPerfTargets) {
-        if (PatchOne(t)) ++g_patched; else ++g_missed;
+    g_applied = 0;
+    g_pendingLeft = (int)g_pending.size();
+}
+
+// 尝试执行一条 pending，返回是否完成（成功）。
+bool TryOne(Pending &p) {
+    switch (p.kind) {
+        case kKindPatch:
+            return TryPatchMethod(p.ns, p.cls, p.name, p.argc, p.mode);
+        case kKindMulti:
+            for (int i = 0; i < p.argcCount; ++i) {
+                if (TryPatchMethod(p.ns, p.cls, p.name, p.argcs[i], p.mode)) return true;
+            }
+            return false;
+        case kKindStaticBool:
+            if (!FindClassByName(p.ns, p.cls)) return false;
+            SetStaticBool(p.ns, p.cls, p.name, p.bvalue);
+            return true;
+        case kKindInstanceBool:
+            if (!FindClassByName(p.ns, p.cls)) return false;
+            SetInstanceBool(p.ns, p.cls, p.extra, 0, p.name, p.bvalue);
+            return true;
+        case kKindInvokeBool:
+            return InvokeStaticVoidBool(p.ns, p.cls, p.name, p.bvalue);
     }
+    return false;
+}
 
-    // 日志系统：关掉「提交日志」与「日志附带截图」
-    SetInstanceBool("XDFramework.Core", "LogSystem", "get_Instance", 0, "canSubmit", false);
-    SetInstanceBool("XDFramework.Core", "LogSystem", "get_Instance", 0, "captureScreenshot", false);
+void ApplyPendingLocked() {
+    for (Pending &p : g_pending) {
+        if (p.done) continue;
+        if (p.tries >= kMaxTries) continue;
+        ++p.tries;
+        if (TryOne(p)) {
+            p.done = true;
+            ++g_applied;
+            LOGI(OBFUSCATE("[AntiBan] applied %s.%s.%s"), p.ns, p.cls, p.name);
+        }
+    }
+    g_pendingLeft = 0;
+    for (const Pending &p : g_pending) {
+        if (!p.done && p.tries < kMaxTries) ++g_pendingLeft;
+    }
+}
 
-    // Mono 程序集 MD5 校验：校验结果直接置 true，并让校验函数空转（防止覆盖）
-    SetStaticBool("MonoGame.ScriptFramework", "CodeCheck", "IsMD5Match", true);
-    PatchOverloads("MonoGame", "TypeRegister", "CheckMD5", {1}, kPatchVoid);
+void TryFrameHookLocked() {
+    if (g_frameHookOk) return;
+    if (g_frameTries++ >= kFrameMaxTries) return;
+    if (!_monoCompileMethod) return;
+    void *klass = FindClassByName("XD.Unity.Game", "GameApp");
+    if (!klass) klass = FindClassByName("", "GameApp");
+    if (!klass) return;
+    void *method = FindMethodEx(klass, "Update", 0);
+    if (!method) method = FindMethodEx(klass, "LateUpdate", 0);
+    if (!method) return;
+    void *target = _monoCompileMethod(method);
+    if (!target) return;
+    const int rc = DobbyHook(target, (void *)SMGameAppUpdate, (void **)&SMOldGameAppUpdate);
+    g_frameHookOk = (rc == 0) && SMOldGameAppUpdate != nullptr;
+    LOGI(OBFUSCATE("[AntiBan] GameApp.Update hook %s"), g_frameHookOk ? "ok" : "failed");
+}
+
+void RefreshStatusLocked() {
+    char buf[192];
+    snprintf(buf, sizeof(buf), "patched=%d pending=%d frame=%s", g_applied, g_pendingLeft,
+             g_frameHookOk ? "on" : "off");
+    g_status = buf;
+}
+
+// Bootstrap 首次调用：建表 + 一轮尝试。
+void InstallOnce() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (!g_listsReady) {
+        BuildPendingList();
+        g_listsReady = true;
+    }
+    AttachThread();
+    ApplyPendingLocked();
+    TryFrameHookLocked();
+    RefreshStatusLocked();
+    g_isAntiCheatActive = true;
+    LOGI(OBFUSCATE("[AntiBan] first pass: %s"), g_status.c_str());
 }
 
 }  // namespace
@@ -318,58 +370,66 @@ void ApplyTelemetryBlock() {
 //  对外接口
 // ============================================================================
 bool SMAntiBanHookFramePump() {
-    if (g_frameHookOk) return true;
-    if (!_monoCompileMethod) return false;
-
-    void *klass = FindClassByName("XD.Unity.Game", "GameApp");
-    if (!klass) {
-        // dump 里 GameApp 在 GameApp.dll / 命名空间 XD.Unity.Game；
-        // 兜底再按短名全镜像搜一次（ns 传空由 shim 扫全表）。
-        klass = FindClassByName("", "GameApp");
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        if (!g_listsReady) {
+            BuildPendingList();
+            g_listsReady = true;
+        }
+        TryFrameHookLocked();
     }
-    if (!klass) {
-        LOGI(OBFUSCATE("[AntiBan] GameApp class not found, frame pump hook skipped"));
-        return false;
-    }
-    void *method = FindMethodEx(klass, "Update", 0);
-    if (!method) method = FindMethodEx(klass, "LateUpdate", 0);
-    if (!method) {
-        LOGI(OBFUSCATE("[AntiBan] GameApp.Update not found"));
-        return false;
-    }
-    void *target = _monoCompileMethod(method);
-    if (!target) return false;
-
-    const int rc = DobbyHook(target, (void *)SMGameAppUpdate, (void **)&SMOldGameAppUpdate);
-    const bool ok = (rc == 0) && SMOldGameAppUpdate != nullptr;
-    LOGI(OBFUSCATE("[AntiBan] GameApp.Update hook %s target=%p old=%p"),
-         ok ? "ok" : "failed", target, (void *)SMOldGameAppUpdate);
-    g_frameHookOk = ok;
-    return ok;
+    return g_frameHookOk;
 }
 
 int SMAntiBanInstall() {
-    std::call_once(g_installOnce, []() {
-        AttachThread();
-        LOGI(OBFUSCATE("[AntiBan] install start"));
-
-        ApplyThemisBypass();
-        ApplyReportBlock();
-        ApplyTelemetryBlock();
-
-        // 帧泵：RVA 未标定时用它替代（Bootstrap 里优先调用）。
-        SMAntiBanHookFramePump();
-
-        // 与菜单的「反作弊模式」开关保持一致：默认视为已开启。
-        g_isAntiCheatActive = true;
-
-        char buf[160];
-        snprintf(buf, sizeof(buf), "patched=%d missed=%d frame=%s",
-                 g_patched, g_missed, g_frameHookOk ? "on" : "off");
-        g_status = buf;
-        LOGI(OBFUSCATE("[AntiBan] install done %s"), buf);
-    });
-    return g_patched;
+    std::call_once(g_initOnce, []() { InstallOnce(); });
+    std::lock_guard<std::mutex> lk(g_mtx);
+    return g_applied;
 }
 
-std::string SMAntiBanStatus() { return g_status; }
+// 渲染线程每秒调用：程序集是懒加载的，启动时没命中的补丁要等 image 上线再打。
+void SMAntiBanTick() {
+    static std::atomic<long long> lastMs{0};
+    if (!g_listsReady) return;
+
+    const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+    long long prev = lastMs.load(std::memory_order_relaxed);
+    if (nowMs - prev < 1200) return;
+    if (!lastMs.compare_exchange_strong(prev, nowMs, std::memory_order_relaxed)) return;
+
+    std::lock_guard<std::mutex> lk(g_mtx);
+    bool anyPending = false;
+    for (const Pending &p : g_pending) {
+        if (!p.done && p.tries < kMaxTries) {
+            anyPending = true;
+            break;
+        }
+    }
+    if (!anyPending && g_frameHookOk) return;
+
+    AttachThread();
+    ApplyPendingLocked();
+    TryFrameHookLocked();
+    RefreshStatusLocked();
+}
+
+std::string SMAntiBanStatus() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (g_status.empty()) return std::string("init");
+    if (g_pendingLeft > 0) {
+        // 把仍未命中的前几个目标名带出来，方便实机截图定位。
+        std::string extra;
+        for (const Pending &p : g_pending) {
+            if (p.done || p.tries < kMaxTries) continue;
+            extra += p.cls;
+            extra += ".";
+            extra += p.name;
+            extra += " ";
+            if (extra.size() > 90) break;
+        }
+        if (!extra.empty()) return g_status + " miss:" + extra;
+    }
+    return g_status;
+}
