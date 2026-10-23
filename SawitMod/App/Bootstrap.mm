@@ -25,6 +25,7 @@
 #include <string>
 #include <thread>
 
+#include "App/Alert.h"
 #include "App/CrashHandler.h"
 #include "App/OverlayWindow.h"
 #include "App/Platform.h"
@@ -46,6 +47,33 @@
 #include "Core/FramePump.h"
 
 namespace {
+
+// 读最近一次崩溃日志的头部，供下一次启动时弹窗展示（用户可以直接截图回报）。
+static NSString *SMLatestCrashSummary(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (docs.count == 0) return nil;
+    NSString *dir = docs.firstObject;
+    NSArray *names = [fm contentsOfDirectoryAtPath:dir error:nil];
+    NSString *best = nil;
+    NSDate *bestDate = nil;
+    for (NSString *name in names) {
+        if (![name hasPrefix:@"mod_menu_crash_"]) continue;
+        NSString *path = [dir stringByAppendingPathComponent:name];
+        NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
+        NSDate *date = attr[NSFileModificationDate];
+        if (!bestDate || [date compare:bestDate] == NSOrderedDescending) {
+            bestDate = date;
+            best = path;
+        }
+    }
+    if (!best) return nil;
+    NSString *text = [NSString stringWithContentsOfFile:best encoding:NSUTF8StringEncoding error:nil];
+    if (!text) return nil;
+    if (text.length > 900) text = [[text substringToIndex:900] stringByAppendingString:@"\n...(截断)"];
+    return text;
+}
+
 
 std::atomic<bool> g_runtimeReady{false};
 
@@ -100,6 +128,15 @@ void BootstrapThread() {
                            dispatch_get_main_queue(), tryStart);
         };
         tryStart();
+    });
+
+    // 上次崩溃日志：下一次启动弹原生窗口，方便直接截图回报。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NSString *crash = SMLatestCrashSummary();
+        if (crash.length == 0) return;
+        std::string msg = "上次停住: " + g_prevBreadcrumb + "\n\n" + std::string([crash UTF8String]);
+        SMAlert::Show("SawitMod 上次崩溃", msg, "知道了");
     });
 
     // 2) 本地授权：Android 版在 SetupJavaJNI 之后立刻读，这里同样尽早。

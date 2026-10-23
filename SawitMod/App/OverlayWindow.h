@@ -43,3 +43,6 @@ void SetForeground(bool foreground);
 
 // C 入口：App/Platform.mm 的 Toast 转发到这里。
 void SMOverlayShowToast(const std::string &text);
+
+// 方向调试串（dev/iface/plist/forced/angle），显示在菜单主页用于排查竖屏问题。
+std::string SMOrientationDebug(void);

@@ -84,6 +84,8 @@ bool EcdsaVerifyP256(const std::vector<uint8_t> &, const uint8_t[32],
 }  // namespace SMCrypto
 
 // ---- 崩溃处理器 ----
+extern std::string SMOrientationDebug(void) { return std::string("stub"); }
+
 namespace SMCrash {
 void Install() {}
 const char *LastCrashPath() { return nullptr; }

@@ -23,6 +23,7 @@
 
 #include "AndroidBrandConfig.h"
 #include "App/Alert.h"
+#include "App/OverlayWindow.h"
 #include "App/Platform.h"
 #include "ModFeatures.h"
 #include "ModUtils.h"
@@ -434,6 +435,7 @@ void DrawMenu() {
                 g_prevBreadcrumb != "verify:fail" && g_prevBreadcrumb != "boot") {
                 ImGui::TextColored(ActiveUI::kWarn, u8"上次停住: %s", g_prevBreadcrumb.c_str());
             }
+            ImGui::TextDisabled("%s", SMOrientationDebug().c_str());
         }
         ImGui::Spacing();
         ImGui::Separator();

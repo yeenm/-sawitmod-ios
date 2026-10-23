@@ -11,6 +11,7 @@
 // ============================================================================
 
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
 #import <QuartzCore/QuartzCore.h>
 #import <OpenGLES/EAGL.h>
 #import <OpenGLES/ES3/gl.h>
@@ -47,6 +48,7 @@ static CADisplayLink *g_link = nil;
 static id g_lifecycleObservers[2] = {nil, nil};
 static id g_orientationObserver = nil;
 static BOOL g_orientationStarted = NO;
+static CGFloat g_lastAngle = 0.0;
 
 // ---------------------------------------------------------------------------
 //  触摸队列：UIKit 回调在主线程，渲染也在主线程；仍然先入队再在帧内统一喂
@@ -269,7 +271,8 @@ static void SMRenderFrame(void) {
 // 浮层不参与系统旋转：方向由游戏自己的窗口决定，这里只做被动镜像。
 - (BOOL)shouldAutorotate { return NO; }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    return UIInterfaceOrientationMaskAll;
+    // 游戏是横屏；浮层也声明横屏，避免系统把 App 判成“允许竖屏”。
+    return UIInterfaceOrientationMaskLandscape;
 }
 
 - (void)loadView {
@@ -374,6 +377,76 @@ void SMOverlayShowToast(const std::string &text) {
     });
 }
 
+
+// ---------------------------------------------------------------------------
+//  强制横屏：注入后游戏被强制竖屏的根因是「App 的方向策略被浮层放宽成允许竖屏」。
+//  这里直接接管 App delegate 的 application:supportedInterfaceOrientationsForWindow:，
+//  永远返回横屏（如果 Info.plist 本身含横屏，就按 plist 的横屏位；否则强制横屏）。
+//  只有本游戏（横屏）适用。
+// ---------------------------------------------------------------------------
+static UIInterfaceOrientationMask SMInfoPlistOrientationMask(void) {
+    NSArray *list = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"UISupportedInterfaceOrientations"];
+    UIInterfaceOrientationMask mask = 0;
+    for (NSString *s in list) {
+        if ([s isEqualToString:@"UIInterfaceOrientationPortrait"])
+            mask |= UIInterfaceOrientationMaskPortrait;
+        else if ([s isEqualToString:@"UIInterfaceOrientationLandscapeLeft"])
+            mask |= UIInterfaceOrientationMaskLandscapeLeft;
+        else if ([s isEqualToString:@"UIInterfaceOrientationLandscapeRight"])
+            mask |= UIInterfaceOrientationMaskLandscapeRight;
+        else if ([s isEqualToString:@"UIInterfaceOrientationPortraitUpsideDown"])
+            mask |= UIInterfaceOrientationMaskPortraitUpsideDown;
+    }
+    return mask;
+}
+
+static UIInterfaceOrientationMask SMForcedOrientations(void) {
+    const UIInterfaceOrientationMask plistMask = SMInfoPlistOrientationMask();
+    if (plistMask & (UIInterfaceOrientationMaskLandscapeLeft | UIInterfaceOrientationMaskLandscapeRight)) {
+        return (UIInterfaceOrientationMask)(plistMask & UIInterfaceOrientationMaskLandscape);
+    }
+    return UIInterfaceOrientationMaskLandscape;
+}
+
+static UIInterfaceOrientationMask SMOrientationHook(id self, SEL _cmd, UIWindow *window) {
+    (void)self;
+    (void)_cmd;
+    (void)window;
+    return SMForcedOrientations();
+}
+
+static BOOL g_orientationHookInstalled = NO;
+
+static void SMInstallOrientationOverride(void) {
+    if (g_orientationHookInstalled) return;
+    id<UIApplicationDelegate> delegate = [UIApplication sharedApplication].delegate;
+    if (!delegate) return;
+    Class cls = object_getClass(delegate);
+    SEL sel = @selector(application:supportedInterfaceOrientationsForWindow:);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (m) {
+        method_setImplementation(m, (IMP)SMOrientationHook);
+    } else {
+        class_addMethod(cls, sel, (IMP)SMOrientationHook, "Q@:@");
+    }
+    g_orientationHookInstalled = YES;
+    NSLog(@"[SawitMod] orientation override installed (forced=%lu)",
+          (unsigned long)SMForcedOrientations());
+}
+
+std::string SMOrientationDebug(void) {
+    char buf[256];
+    const UIDeviceOrientation dev = [UIDevice currentDevice].orientation;
+    UIInterfaceOrientation iface = UIInterfaceOrientationUnknown;
+    if (@available(iOS 13.0, *)) {
+        iface = g_window.windowScene.interfaceOrientation;
+    }
+    snprintf(buf, sizeof(buf), "dev=%ld iface=%ld plist=%lu forced=%lu angle=%.0f",
+             (long)dev, (long)iface, (unsigned long)SMInfoPlistOrientationMask(),
+             (unsigned long)SMForcedOrientations(), g_lastAngle * 180.0 / M_PI);
+    return std::string(buf);
+}
+
 // ---------------------------------------------------------------------------
 //  屏幕方向
 // ---------------------------------------------------------------------------
@@ -428,6 +501,7 @@ static void SMUpdateOrientation(void) {
         }
     }
 
+    g_lastAngle = angle;
     if (fabs(angle) > 0.01) {
         g_glView.transform = CGAffineTransformMakeRotation(angle);
         g_glView.bounds = CGRectMake(0, 0, screen.height, screen.width);
@@ -483,6 +557,8 @@ bool Start() {
     window.rootViewController = [[SMOverlayVC alloc] init];
     window.hidden = NO;
     g_window = window;
+
+    SMInstallOrientationOverride();
 
     // 把 key window 还给游戏，避免浮层接管方向/状态栏等全局策略。
     if (previousKeyWindow && previousKeyWindow != window) {
