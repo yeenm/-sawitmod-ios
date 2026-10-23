@@ -59,11 +59,13 @@ enum PatchMode {
 
 // 补丁类型：单参数个数 / 多参数个数候选（重载）/ 字段写 / 静态方法调用
 enum Kind {
-    kKindPatch = 0,
+    kKindPatch = 0,       // ⚠️ 仅越狱设备可行；侧载 iOS 上必然失败，默认不加入 pending
     kKindMulti,
     kKindStaticBool,
     kKindInstanceBool,
     kKindInvokeBool,
+    kKindStaticNull,      // 静态对象字段置 null（摘掉回调/消息对象）
+    kKindStaticInt,       // 静态枚举/整型字段写值
 };
 
 struct Pending {
@@ -77,6 +79,7 @@ struct Pending {
     int argcCount;
     PatchMode mode;
     bool bvalue;
+    long long ivalue;
     // 运行时状态
     bool done;
     int tries;
@@ -168,6 +171,28 @@ void SetStaticBool(const char *ns, const char *cls, const char *field, bool valu
     a.field_static_set_value(f, &v);
 }
 
+void SetStaticNull(const char *ns, const char *cls, const char *field) {
+    void *klass = FindClassByName(ns, cls);
+    if (!klass || !field) return;
+    void *f = _monoClassGetFieldFromName(klass, field);
+    if (!f) return;
+    const API &a = Get();
+    if (!a.field_static_set_value) return;
+    void *nullValue = nullptr;
+    a.field_static_set_value(f, &nullValue);
+}
+
+void SetStaticInt(const char *ns, const char *cls, const char *field, long long value) {
+    void *klass = FindClassByName(ns, cls);
+    if (!klass || !field) return;
+    void *f = _monoClassGetFieldFromName(klass, field);
+    if (!f) return;
+    const API &a = Get();
+    if (!a.field_static_set_value) return;
+    int v = (int)value;
+    a.field_static_set_value(f, &v);
+}
+
 // 通过 static get_Instance() 拿到单例，再写它的实例字段。
 void SetInstanceBool(const char *ns, const char *cls, const char *getter, int getterArgc,
                      const char *fieldName, bool value) {
@@ -201,81 +226,46 @@ bool InvokeStaticVoidBool(const char *ns, const char *cls, const char *method, b
 //  pending 表
 // ---------------------------------------------------------------------------
 #define P_PATCH(ns, cls, meth, argc, mode) \
-    Pending{kKindPatch, ns, cls, meth, nullptr, argc, nullptr, 0, mode, false, false, 0}
+    Pending{kKindPatch, ns, cls, meth, nullptr, argc, nullptr, 0, mode, false, false, 0, 0}
+#define P_SNULL(ns, cls, field) \
+    Pending{kKindStaticNull, ns, cls, field, nullptr, 0, nullptr, 0, kPatchVoid, false, false, 0, 0}
+#define P_SINT(ns, cls, field, val) \
+    Pending{kKindStaticInt, ns, cls, field, nullptr, 0, nullptr, 0, kPatchVoid, false, false, 0, (long long)(val)}
 #define P_MULTI(ns, cls, meth, arr, mode) \
-    Pending{kKindMulti, ns, cls, meth, nullptr, 0, arr, (int)(sizeof(arr) / sizeof(int)), mode, false, false, 0}
+    Pending{kKindMulti, ns, cls, meth, nullptr, 0, arr, (int)(sizeof(arr) / sizeof(int)), mode, false, false, 0, 0}
 #define P_SBOOL(ns, cls, field, val) \
-    Pending{kKindStaticBool, ns, cls, field, nullptr, 0, nullptr, 0, kPatchVoid, val, false, 0}
+    Pending{kKindStaticBool, ns, cls, field, nullptr, 0, nullptr, 0, kPatchVoid, val, false, 0, 0}
 #define P_IBOOL(ns, cls, getter, field, val) \
-    Pending{kKindInstanceBool, ns, cls, field, getter, 0, nullptr, 0, kPatchVoid, val, false, 0}
+    Pending{kKindInstanceBool, ns, cls, field, getter, 0, nullptr, 0, kPatchVoid, val, false, 0, 0}
 #define P_INVOKE(ns, cls, meth, val) \
-    Pending{kKindInvokeBool, ns, cls, meth, nullptr, 1, nullptr, 0, kPatchVoid, val, false, 0}
+    Pending{kKindInvokeBool, ns, cls, meth, nullptr, 1, nullptr, 0, kPatchVoid, val, false, 0, 0}
 
 void BuildPendingList() {
-    static const int aLogan[] = {1, 2};
-    static const int aOne[] = {1};
-    static const int aMgr[] = {1, 2, 3};
-
+    // ⚠️ 非越狱侧载 iOS 上 __TEXT 受代码签名保护，inline patch（含 Dobby）都不可行
+    // （实测：所有方法体补丁 0 命中，而字段/调用类补丁全部成功）。
+    // 因此这里只做**数据面**拦截：写 __DATA 里的开关/字段，副作用最小也最稳。
     g_pending = {
-        // ===== Themis 托管包装（TapTap.Themis / TapThemis）=====
-        P_PATCH("TapTap.Themis", "TapThemis", "ReportException", 3, kPatchVoid),
-        P_PATCH("TapTap.Themis", "TapThemis", "ReportLogError", 3, kPatchVoid),
-        P_PATCH("TapTap.Themis", "TapThemis", "ReportCustomException", 4, kPatchVoid),
-        P_PATCH("TapTap.Themis", "TapThemis", "ReportCustomExceptionEx", 6, kPatchVoid),
-        P_PATCH("TapTap.Themis", "TapThemis", "AddCustomField", 2, kPatchVoid),
-        P_PATCH("TapTap.Themis", "TapThemis", "TMCR", 2, kPatchVoid),
-        P_PATCH("TapTap.Themis", "TapThemis", "U3d_ConfigAutoQuitApplication", 1, kPatchVoid),
-        // 检测状态回调：不让游戏/模组层收到"环境不安全"的状态
-        P_PATCH("TapTap.Themis", "TapThemisAgentIOS", "_onThemisStateCB", 2, kPatchVoid),
-        // TapThemisAgentIOS 的 native 上报桥（ThemisSDK 真正的上报入口）
-        P_PATCH("TapTap.Themis", "TapThemisAgentIOS", "_lib_report_exception_with_type", 5, kPatchVoid),
-        P_PATCH("TapTap.Themis", "TapThemisAgentIOS", "_lib_report_custom_exception_ex", 6, kPatchVoid),
-        P_PATCH("TapTap.Themis", "TapThemisAgentIOS", "_add_custom_field", 2, kPatchVoid),
-        P_PATCH("TapTap.Themis", "TapThemisAgentIOS", "_lib_enable_debug_mode", 1, kPatchVoid),
-        P_PATCH("TapTap.Themis", "TapThemisCallBackImp", "onHandleThemisState", 2, kPatchVoid),
-        // ===== 引擎侧 Themis 管理类（全局命名空间）=====
-        P_PATCH("", "ThemisSDKManager", "ReportException", 3, kPatchVoid),
-        P_PATCH("", "ThemisSDKManager", "ReportLogError", 3, kPatchVoid),
-        P_PATCH("", "ThemisSDKManager", "ReportCustomException", 4, kPatchVoid),
-        P_PATCH("", "ThemisSDKManager", "ReportCustomExceptionEx", 6, kPatchVoid),
-        P_PATCH("", "ThemisSDKManager", "AddCustomPlayer", 2, kPatchVoid),
-        // ===== TapDB 的 Themis 工具类 =====
-        P_PATCH("TapTap.TapDB.Mobile", "ThemisUtil", "ExceptionReport", 2, kPatchVoid),
-        P_PATCH("TapTap.TapDB.Mobile", "ThemisUtil", "ReportException", 4, kPatchVoid),
-        P_PATCH("TapTap.TapDB.Mobile", "ThemisUtil", "U3d_ConfigAutoQuitApplication", 1, kPatchVoid),
-        // ===== Logan 日志上传 =====
-        P_MULTI("", "Logan", "UploadLogs", aLogan, kPatchVoid),
-        P_MULTI("", "LoganBridge", "UploadLogs", aOne, kPatchVoid),
-        P_MULTI("", "LoganBridge", "UpLoadLogs", aOne, kPatchVoid),
-        P_MULTI("", "LoganBridge", "uploadLogsByDay", aOne, kPatchVoid),
-        P_MULTI("", "LoganManager", "UploadLogs", aMgr, kPatchVoid),
-        // ===== XD.SDK.Report 举报 / 证据上传 =====
-        P_PATCH("XD.SDK.Report", "XDGReport", "Report", 2, kPatchVoid),
-        P_PATCH("XD.SDK.Report", "XDReportImpl", "Report", 2, kPatchVoid),
-        P_PATCH("XD.SDK.Report", "XDReportImpl", "ReportAsync", 3, kPatchVoid),
-        P_PATCH("XD.SDK.Report", "XDReportImpl", "UploadEvidence", 3, kPatchVoid),
-        P_PATCH("XD.SDK.Report", "XDReportImpl", "UploadEvidenceBySignedOssUrl", 4, kPatchVoid),
-        // ===== 崩溃上报 =====
-        P_PATCH("ScriptsRefactory.BaseService.BugReporter", "BugReporter", "ReportError", 3, kPatchVoid),
-        // ===== XDPerf 埋点（位置/UID/设备指纹/模拟器）=====
-        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "PostPosition", 3, kPatchVoid),
-        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportUid", 1, kPatchVoid),
-        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportXDPerfInfos", 0, kPatchVoid),
-        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportQuality", 2, kPatchVoid),
-        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportCustomQuality", 1, kPatchVoid),
-        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportTargetFrameRate", 1, kPatchVoid),
-        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "PostNetworkLatency", 1, kPatchVoid),
-        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportSceneName", 1, kPatchVoid),
-        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportChannel", 1, kPatchVoid),
-        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportServerId", 1, kPatchVoid),
-        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "ReportLanguage", 1, kPatchVoid),
-        P_PATCH("XDPlugin.XDKWPerf", "XDPerf", "GetEmulatorType", 0, kPatchIntZero),
-        // ===== 数据字段类 =====
-        P_SBOOL("MonoGame.ScriptFramework", "CodeCheck", "IsMD5Match", true),
+        // ===== Themis / TapSDK：把总开关和自动行为全部关掉 =====
+        P_SBOOL("TapTap.Themis", "TapThemis", "Open", false),
+        P_SBOOL("TapTap.Themis", "TapThemis", "_autoQuitApplicationAfterReport", false),
+        P_SBOOL("TapTap.Themis", "TapThemis", "_debugMode", false),
+        P_SNULL("TapTap.Themis", "TapThemis", "_LogCallbackEventHandler"),
+        // 摘掉 native -> 托管 的状态/消息回调对象
+        P_SNULL("TapTap.Themis", "TapThemisAgentIOS", "_callbackImp"),
+        P_SNULL("TapTap.Themis", "TapThemisCallBackImp", "_callback"),
+        // 引擎侧 Themis 管理类：摘掉附加消息对象（心跳/额外上报数据）
+        P_SNULL("", "ThemisSDKManager", "unityextraMsg"),
+        // TapDB 的 Themis 工具类：关自动退出/调试/日志回调
+        P_SBOOL("TapTap.TapDB.Mobile", "ThemisUtil", "_autoQuitApplicationAfterReport", false),
+        P_SBOOL("TapTap.TapDB.Mobile", "ThemisUtil", "enableDebug", false),
+        P_SBOOL("TapTap.TapDB.Mobile", "ThemisUtil", "_uncaughtAutoReportOnce", false),
+        P_SNULL("TapTap.TapDB.Mobile", "ThemisUtil", "_LogCallbackEventHandler"),
+        // ===== 日志系统：不上传、不附带截图（本地文件仍可写） =====
         P_IBOOL("XDFramework.Core", "LogSystem", "get_Instance", "canSubmit", false),
         P_IBOOL("XDFramework.Core", "LogSystem", "get_Instance", "captureScreenshot", false),
-        P_MULTI("MonoGame", "TypeRegister", "CheckMD5", aOne, kPatchVoid),
-        // ===== 开关调用（失败不致命）=====
+        // ===== Mono 程序集防篡改校验：直接标记通过 =====
+        P_SBOOL("MonoGame.ScriptFramework", "CodeCheck", "IsMD5Match", true),
+        // ===== 主动调用类补丁（这些能真正执行代码，不依赖改指令）=====
         P_INVOKE("", "ThemisSDKManager", "SetSwitch", false),
         P_INVOKE("TapTap.Themis", "TapThemis", "U3d_ConfigAutoQuitApplication", false),
         P_INVOKE("TapTap.TapDB.Mobile", "ThemisUtil", "U3d_ConfigAutoQuitApplication", false),
@@ -304,6 +294,14 @@ bool TryOne(Pending &p) {
             return true;
         case kKindInvokeBool:
             return InvokeStaticVoidBool(p.ns, p.cls, p.name, p.bvalue);
+        case kKindStaticNull:
+            if (!FindClassByName(p.ns, p.cls)) return false;
+            SetStaticNull(p.ns, p.cls, p.name);
+            return true;
+        case kKindStaticInt:
+            if (!FindClassByName(p.ns, p.cls)) return false;
+            SetStaticInt(p.ns, p.cls, p.name, p.ivalue);
+            return true;
     }
     return false;
 }
@@ -326,6 +324,9 @@ void ApplyPendingLocked() {
 }
 
 void TryFrameHookLocked() {
+    // 侧载 iOS：无法分配可执行内存做 inline hook。帧泵改由 CADisplayLink（主线程）
+    // 驱动，见 App/OverlayWindow.mm 的 SMRunUnityFramePump() 调用。
+    return;
     if (g_frameHookOk) return;
     if (g_frameTries++ >= kFrameMaxTries) return;
     if (!_monoCompileMethod) return;
@@ -344,8 +345,8 @@ void TryFrameHookLocked() {
 
 void RefreshStatusLocked() {
     char buf[192];
-    snprintf(buf, sizeof(buf), "patched=%d pending=%d frame=%s", g_applied, g_pendingLeft,
-             g_frameHookOk ? "on" : "off");
+    snprintf(buf, sizeof(buf), "fields=%d pending=%d pump=%s", g_applied, g_pendingLeft,
+             g_unityFramePumpReady.load(std::memory_order_relaxed) ? "link" : "off");
     g_status = buf;
 }
 

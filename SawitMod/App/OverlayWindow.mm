@@ -25,6 +25,7 @@
 #include "App/OverlayWindow.h"
 #include "App/Platform.h"
 #include "Core/AntiBan.h"
+#include "Core/FramePump.h"
 #include "Core/State.h"
 #include "UI/MenuGlue.h"
 
@@ -182,6 +183,9 @@ static void SMRenderFrame(void) {
 
     // 防封补丁重试：il2cpp 程序集懒加载，启动时没命中的补丁在后续帧补上。
     SMAntiBanTick();
+
+    // 帧泵：CADisplayLink 在主线程（= Unity 主线程）触发，替代不可用的 inline hook。
+    SMRunUnityFramePump();
 
     FlushTouches();
 

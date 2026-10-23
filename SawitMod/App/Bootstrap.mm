@@ -212,9 +212,13 @@ void BootstrapThread() {
     // 3.5) 防封/过检测：按托管类名打补丁（Themis/日志/举报上报）+ 帧泵兜底。
     SMAntiBanInstall();
 
-    // 4) 帧泵 hook：失败不影响菜单。
-    const bool pumpReady = InstallFramePumpHook();
-    g_unityFramePumpReady.store(pumpReady);
+    // 4) 帧泵：侧载 iOS 没有 JIT/可写代码页，Dobby inline hook 不可行；
+    //    改由 OverlayWindow 的 CADisplayLink（主线程 == Unity 主线程）每帧驱动
+    //    SMRunUnityFramePump()。hook 仍尝试一次（越狱设备可加速），失败不影响。
+    const bool hookReady = InstallFramePumpHook();
+    g_unityFramePumpReady.store(true);
+    NSLog(@"[SawitMod] frame pump via display-link (dobby hook=%@)",
+          hookReady ? @"on" : @"unavailable");
 
     // 5) 遥测/远程控制：必须在运行时就绪之后。
     ClientControlAgent::InitializeAfterMono();

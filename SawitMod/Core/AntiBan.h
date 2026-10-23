@@ -30,5 +30,6 @@ bool SMAntiBanHookFramePump();
 // 渲染线程每秒调用：重试启动时因程序集未加载而 miss 的补丁。
 void SMAntiBanTick();
 
-// 运行期状态/统计（菜单展示用）。
+// 运行期状态/统计（菜单展示用）：fields=N pending=M pump=link|off。
+// 注：侧载 iOS 无法 inline patch，本模块只做数据面拦截。
 std::string SMAntiBanStatus();
