@@ -98,6 +98,13 @@ void DrawMenu() {
     // 功能页内容也换成卡密提示，FetchAndExecute 同样被挡住（NetAuth 里还有一道）。
     const bool cardVerified = Weiyan::IsVerified();
     ActiveUI::features_unlocked = cardVerified;
+    {
+        static bool bcUnlock = false;
+        if (cardVerified && !bcUnlock) {
+            bcUnlock = true;
+            SMPlatform::SetBreadcrumb("ui:unlock");
+        }
+    }
 
     // 标题栏右侧显示版本号（Version.h 的 SAWIT_UI_VERSION，仅界面用）。
     ActiveUI::FrameInfo frame = ActiveUI::BeginChrome(
@@ -145,6 +152,7 @@ void DrawMenu() {
     }
     if (cloudDone && !cloudToastShown) {
         cloudToastShown = true;
+        SMPlatform::SetBreadcrumb("ui:cloud-toast");
         ActiveUI::ShowToast(u8"云下发接收成功", 3.2f);
     }
 
@@ -304,6 +312,10 @@ void DrawMenu() {
         // 卡密验证是唯一的门槛：通过后才显示功能页，并通过后在这里显示授权信息。
         static std::atomic<bool> verifyBusy{false};
         if (cardVerified) {
+            {
+                static bool bcCardInfo = false;
+                if (!bcCardInfo) { bcCardInfo = true; SMPlatform::SetBreadcrumb("ui:cardinfo"); }
+            }
             const ImVec4 okColor(0.35f, 0.78f, 0.45f, 1.0f);
             InfoRow(Tr("Card key", u8"卡密状态"), Tr("Verified", u8"验证通过"), okColor);
             const std::string km = Weiyan::CurrentCard();
@@ -355,6 +367,10 @@ void DrawMenu() {
                 g_avatarMode = false;
                 ActiveUI::tab_stored = 0;
             }
+            ImGui::PopStyleColor();
+            // 上面 push 了 Button/ButtonHovered/Text 三个颜色，必须配平，
+            // 否则 ImGui 样式栈每帧泄漏 2 个，长时间运行后界面会异常。
+            ImGui::PopStyleColor();
             ImGui::PopStyleColor();
         } else {
             ImGui::TextDisabled("%s", u8"输入卡密并验证通过后才会显示全部功能");
@@ -2942,6 +2958,10 @@ void DrawMenu() {
     }
 
     ActiveUI::EndContent(!productUsesInnerScroll);
+    {
+        static bool bcDrawEnd = false;
+        if (!bcDrawEnd) { bcDrawEnd = true; SMPlatform::SetBreadcrumb("ui:draw-end"); }
+    }
     ActiveUI::EndChrome(frame, &is_english);
     // 固定中文：不再根据 is_english 切回英文。
     g_language = LANG_CN;
