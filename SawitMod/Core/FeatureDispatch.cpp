@@ -588,7 +588,7 @@ extern "C" VIRBOX_TARGET_ATTR void *Virbox_ExecuteDynamic(
 
     void *exc = nullptr;
     void *finalResult = _monoRuntimeInvoke(method, objPtr, invokeArgs, &exc);
-    SMPlatform::SetBreadcrumbLight("inv:done");
+    SMPlatform::SetBreadcrumbLight("inv:done:" + className + "." + methodName);
 
     if (exc) {
         LOGE(OBFUSCATE("[INVOKE] Terjadi EXCEPTION dari dalam game saat mengeksekusi Method!"));
