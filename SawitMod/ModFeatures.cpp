@@ -2210,6 +2210,7 @@ void ScanCookersNative() {
         context.method_inst = methodInst;
 
         void *closedMethod = _mono_class_inflate_generic_method(openMethod, &context);
+        if (closedMethod) _monoCompileMethod(closedMethod);   // 解释器模式必须先编译
 
         void *exc = nullptr;
         void *sysObj = _monoRuntimeInvoke(closedMethod, nullptr, nullptr, &exc);
@@ -2516,6 +2517,7 @@ int GetCookerStatusNative(CookerTarget cooker) {
         context.method_inst = methodInst;
 
         void *closedMethod = _mono_class_inflate_generic_method(openMethod, &context);
+        if (closedMethod) _monoCompileMethod(closedMethod);   // 解释器模式必须先编译
 
         void *exc = nullptr;
         void *sysObj = _monoRuntimeInvoke(closedMethod, nullptr, nullptr, &exc);

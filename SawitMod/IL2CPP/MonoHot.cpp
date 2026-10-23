@@ -1105,7 +1105,10 @@ void *SignatureGetParams(void *signature, void **iter) {
         !g_api.signature_get_params)
         return nullptr;
     EnsureAttached();
-    return g_api.signature_get_params(signature, iter);
+    void *type = g_api.signature_get_params(signature, iter);
+    // ★ 参数类型也要打标：否则 MonoClassFromMonoType 走 il2cpp，List<T> 建不出来
+    if (type) TagMonoType(type);
+    return type;
 }
 
 void *SignatureGetReturnType(void *signature) {
@@ -1395,23 +1398,33 @@ void *ClassInflateGenericMethod(void *method, void *context) {
         !g_api.class_inflate_generic_method)
         return nullptr;
     EnsureAttached();
-    return g_api.class_inflate_generic_method(method, context);
+    void *result = g_api.class_inflate_generic_method(method, context);
+    // ★ 膨胀出来的 MonoMethod* 必须登记成 mono 句柄：否则 MonoCompat 会把
+    //   它当 il2cpp 方法走 il2cpp_runtime_invoke（跨运行时 SIGSEGV），
+    //   而且 MethodGetFlags 会因 !IsMonoMethod 恒返回 0（静态/实例判断全错）。
+    if (result) TagMonoMethod(result);
+    return result;
 }
 
 void *ClassInflateGenericType(void *type, void *context) {
     if (!IsMonoType(type) || !Available() || !g_api.class_inflate_generic_type)
         return nullptr;
     EnsureAttached();
-    return g_api.class_inflate_generic_type(type, context);
+    void *result = g_api.class_inflate_generic_type(type, context);
+    if (result) TagMonoType(result);
+    return result;
 }
 
 void *ClassInflateGenericMethodChecked(void *method, void *context, void *error) {
     if (!IsMonoMethod(method) || !Available()) return nullptr;
     EnsureAttached();
+    void *checkedResult = nullptr;
     if (g_api.class_inflate_generic_method_checked)
-        return g_api.class_inflate_generic_method_checked(method, context, error);
-    if (g_api.class_inflate_generic_method)
-        return g_api.class_inflate_generic_method(method, context);
+        checkedResult = g_api.class_inflate_generic_method_checked(method, context, error);
+    else if (g_api.class_inflate_generic_method)
+        checkedResult = g_api.class_inflate_generic_method(method, context);
+    if (checkedResult) TagMonoMethod(checkedResult);
+    return checkedResult;
     return nullptr;
 }
 
