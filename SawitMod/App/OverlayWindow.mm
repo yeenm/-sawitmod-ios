@@ -441,8 +441,9 @@ std::string SMOrientationDebug(void) {
     if (@available(iOS 13.0, *)) {
         iface = g_window.windowScene.interfaceOrientation;
     }
-    snprintf(buf, sizeof(buf), "dev=%ld iface=%ld plist=%lu forced=%lu angle=%.0f",
-             (long)dev, (long)iface, (unsigned long)SMInfoPlistOrientationMask(),
+    const BOOL winLandscape = g_window && g_window.bounds.size.width > g_window.bounds.size.height;
+    snprintf(buf, sizeof(buf), "dev=%ld iface=%ld win=%d plist=%lu forced=%lu angle=%.0f",
+             (long)dev, (long)iface, (int)winLandscape, (unsigned long)SMInfoPlistOrientationMask(),
              (unsigned long)SMForcedOrientations(), g_lastAngle * 180.0 / M_PI);
     return std::string(buf);
 }
@@ -482,6 +483,18 @@ static void SMUpdateOrientation(void) {
     if (!g_window || !g_glView) return;
 
     const CGSize screen = g_window.bounds.size;
+    const BOOL windowLandscape = screen.width > screen.height;
+
+    // 0) 窗口本身已经是横屏：内容本来就是横向的，绝对不能再转 90°，
+    //    否则就是实机看到的“菜单歪着/躺着”。（上一版就是漏了这个判断）
+    if (windowLandscape) {
+        g_lastAngle = 0.0;
+        g_glView.transform = CGAffineTransformIdentity;
+        g_glView.bounds = CGRectMake(0, 0, screen.width, screen.height);
+        g_glView.center = CGPointMake(screen.width * 0.5, screen.height * 0.5);
+        [g_glView setNeedsLayout];
+        return;
+    }
 
     // 1) 优先“镜像”游戏视图的旋转：游戏横屏怎么转，菜单就怎么转。
     //    这样玩到一半设备方向变了也不会突然跳成竖屏。

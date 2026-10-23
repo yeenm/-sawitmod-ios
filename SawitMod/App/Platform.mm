@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 //  Platform.mm — iOS 平台能力实现
 // ============================================================================
 
@@ -82,17 +82,21 @@ std::string DocumentDir() { return UTF8(DocumentsPath()); }
 std::string LibraryDir() { return UTF8(NSTemporaryDirectory()); }
 
 std::string DataDir() {
+    // 注意：渲染线程和登录线程都会取这个路径，必须线程安全。
+    // 之前是 static std::string + if (!empty)，两个线程同时首次调用会撕裂 std::string。
     static std::string cached;
-    if (!cached.empty()) return cached;
-    NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
-                                                        NSUserDomainMask, YES);
-    NSString *base = dirs.firstObject ?: DocumentsPath();
-    NSString *dir = [base stringByAppendingPathComponent:@"SawitMod"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                              withIntermediateDirectories:YES
-                                               attributes:nil
-                                                    error:nil];
-    cached = UTF8(dir);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
+                                                            NSUserDomainMask, YES);
+        NSString *base = dirs.firstObject ?: DocumentsPath();
+        NSString *dir = [base stringByAppendingPathComponent:@"SawitMod"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:nil];
+        cached = UTF8(dir);
+    });
     return cached;
 }
 
@@ -121,19 +125,30 @@ std::string SystemVersion() { return UTF8([UIDevice currentDevice].systemVersion
 std::string DeviceName() { return UTF8([UIDevice currentDevice].name); }
 
 std::string HWID() {
+    // ⚠️ 不用 Keychain：侧载/自签 App 的 entitlements 里通常没有
+    // keychain-access-groups，第一次 SecItemCopyMatching 就可能被 securityd
+    // 直接 SIGKILL（无 crash 文件、表现就是“点登录卡密秒退”）。
+    // 设备码改成「Documents 旁边的 DataDir 里存一份 UUID 文本」，卸载重装会变，
+    // 但注入场景够用，也不会碰系统安全组件。
     static std::string cached;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSString *stored = KeychainRead(kKeychainService, kKeychainAccount);
-        if (stored.length > 0) {
+        NSString *dir = [NSString stringWithUTF8String:DataDir().c_str()];
+        NSString *file = [dir stringByAppendingPathComponent:@"hwid.txt"];
+        NSString *stored = [NSString stringWithContentsOfFile:file
+                                                     encoding:NSUTF8StringEncoding
+                                                        error:nil];
+        stored = [stored stringByTrimmingCharactersInSet:
+                             [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (stored.length >= 8) {
             cached = UTF8(stored);
             return;
         }
         NSString *vendor = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
         NSString *value = vendor.length > 0 ? vendor : [[NSUUID UUID] UUIDString];
-        // Android 的 ANDROID_ID 是 16 位 hex；这里保持同一形状，服务端只当字符串用。
-        NSString *clean = [[value stringByReplacingOccurrencesOfString:@"-" withString:@""] lowercaseString];
-        KeychainWrite(kKeychainService, kKeychainAccount, clean);
+        NSString *clean = [[value stringByReplacingOccurrencesOfString:@"-" withString:@""]
+            lowercaseString];
+        [clean writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:nil];
         cached = UTF8(clean);
     });
     return cached.empty() ? "UNKNOWN_HWID" : cached;
