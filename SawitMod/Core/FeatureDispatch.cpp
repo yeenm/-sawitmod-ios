@@ -272,6 +272,8 @@ extern "C" VIRBOX_TARGET_ATTR void *Virbox_ExecuteDynamic(
         std::string dllName, std::string nameSpace, std::string className,
         std::string methodName, std::string paramInput, bool isStatic,
         std::string instancePtrHexStr) {
+    SMPlatform::SetBreadcrumbLight("inv@@" + className + "." + methodName);
+
     TrimString(dllName);
     TrimString(nameSpace);
     TrimString(className);

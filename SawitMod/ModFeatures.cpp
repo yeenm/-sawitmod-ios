@@ -1,6 +1,7 @@
 #include "ModFeatures.h"
 #include "ModUtils.h"
 #include "IL2CPP/MonoCompat.h"
+#include "App/Platform.h"
 #include "Includes/obfuscate.h"
 #include "VirboxTargets.h"
 #include "Includes/Dobby/dobby.h"
@@ -486,6 +487,7 @@ uint32_t GetSeedNetId(int staticId) {
 }
 
 void ScanPotsNative() {
+    SMPlatform::SetBreadcrumbLight("scan:pots");
     if (g_gardenPlayerNetId == 0) GetPlayerNetIdOnUnityThread();
     if (g_gardenPlayerNetId == 0) return;
 
@@ -8206,6 +8208,7 @@ void EnsureTeleportAntiCrashPatched() {
 }
 
 void AutoMoveTransferDirect(Vector3 pos) {
+    SMPlatform::SetBreadcrumbLight("tp:auto");
     LOGI("[TeleportFix] AutoMoveTransferDirect dipanggil untuk posisi: %.2f, %.2f, %.2f", pos.x, pos.y, pos.z);
 
     if (_monoGetRootDomain && _monoThreadAttach) {
@@ -8330,6 +8333,7 @@ void AutoMoveTransferDirect(Vector3 pos) {
 }
 
 void Transfer2EntityDirect(uint32_t entityNetId) {
+    SMPlatform::SetBreadcrumbLight("tp:entity");
     if (entityNetId == 0) return;
     LOGI("[TeleportFix] Transfer2EntityDirect dipanggil untuk entityNetId: %u", entityNetId);
 

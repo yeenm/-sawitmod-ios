@@ -317,6 +317,7 @@ void SMRunUnityFramePump() {
         for (auto &req: pendingRequests) {
             if (!ValidasiOtentikasiKetat() || req.generasiSesi == 0 || req.generasiSesi != GenerasiSesi())
                 continue;
+            SMPlatform::SetBreadcrumbLight("qreq:" + req.featureId);
 
             if (!req.vmStream.empty()) {
                 PayloadVM::Context vmContext;

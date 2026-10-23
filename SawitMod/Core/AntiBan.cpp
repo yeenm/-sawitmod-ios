@@ -38,6 +38,7 @@
 #include "Core/FramePump.h"
 #include "Core/State.h"
 #include "IL2CPP/Il2CppApi.h"
+#include "IL2CPP/MonoHot.h"
 #include "IL2CPP/MonoCompat.h"
 #include "Includes/Dobby/dobby.h"
 #include "Includes/Logger.h"
@@ -164,38 +165,45 @@ bool TryPatchMethod(const char *ns, const char *cls, const char *method, int arg
     return WritePatch(code, mode);
 }
 
+
+// 统一静态字段写：先判断字段属于哪套运行时。
+// 之前一律用 il2cpp_field_static_set_value，若 class 实际来自热更 mono
+// （TapThemis/ThemisUtil 在 mono 层也有同名类），就会拿 il2cpp API 操作 mono
+// 字段 → 立刻 SIGSEGV（实测崩在 ThemisUtil._autoQuitApplicationAfterReport）。
+bool WriteStaticField(void *klass, const char *fieldName, void *valuePtr) {
+    if (!klass || !fieldName) return false;
+    void *f = _monoClassGetFieldFromName(klass, fieldName);
+    if (!f) return false;
+    if (SMMonoHot::IsMonoField(f) || SMMonoHot::IsMonoClass(klass)) {
+        SMMonoHot::FieldStaticSetValue(nullptr, f, valuePtr);
+        return true;
+    }
+    const API &a = Get();
+    if (!a.field_static_set_value) return false;
+    a.field_static_set_value(f, valuePtr);
+    return true;
+}
+
 void SetStaticBool(const char *ns, const char *cls, const char *field, bool value) {
     SMPlatform::SetBreadcrumb(("ab:" + std::string(cls) + "." + field).c_str());
     void *klass = FindClassByName(ns, cls);
     if (!klass || !field) return;
-    void *f = _monoClassGetFieldFromName(klass, field);
-    if (!f) return;
-    const API &a = Get();
-    if (!a.field_static_set_value) return;
     bool v = value;
-    a.field_static_set_value(f, &v);
+    WriteStaticField(klass, field, &v);
 }
 
 void SetStaticNull(const char *ns, const char *cls, const char *field) {
     void *klass = FindClassByName(ns, cls);
     if (!klass || !field) return;
-    void *f = _monoClassGetFieldFromName(klass, field);
-    if (!f) return;
-    const API &a = Get();
-    if (!a.field_static_set_value) return;
     void *nullValue = nullptr;
-    a.field_static_set_value(f, &nullValue);
+    WriteStaticField(klass, field, &nullValue);
 }
 
 void SetStaticInt(const char *ns, const char *cls, const char *field, long long value) {
     void *klass = FindClassByName(ns, cls);
     if (!klass || !field) return;
-    void *f = _monoClassGetFieldFromName(klass, field);
-    if (!f) return;
-    const API &a = Get();
-    if (!a.field_static_set_value) return;
     int v = (int)value;
-    a.field_static_set_value(f, &v);
+    WriteStaticField(klass, field, &v);
 }
 
 // 通过 static get_Instance() 拿到单例，再写它的实例字段。
@@ -220,12 +228,11 @@ bool InvokeStaticVoidBool(const char *ns, const char *cls, const char *method, b
     if (!klass) return false;
     void *m = FindMethodEx(klass, method, 1);
     if (!m) return false;
-    const API &a = Get();
-    if (!a.runtime_invoke) return false;
+    if (!_monoRuntimeInvoke) return false;
     bool v = arg;
     void *params[1] = {&v};
     void *exc = nullptr;
-    a.runtime_invoke(m, nullptr, params, &exc);
+    _monoRuntimeInvoke(m, nullptr, params, &exc);
     return exc == nullptr;
 }
 
