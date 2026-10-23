@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #include "Global.h"
 #include "ModUtils.h"
+#include "App/Platform.h"
 #include "NetAuth.h"
 #include "obfuscate.h"
 #include "Logger.h"
@@ -1295,6 +1296,7 @@ inline bool TryCollectOneFinishedSculptureNative(uint32_t& outNetId) {
 // Identical to Bugtopia's ProcessSandSculptureOnUpdate / SandApiState
 // -------------------------------------------------------------------------
 inline void RunAutoSandSculptureLoop() {
+    SMPlatform::SetBreadcrumbLight("sand:loop");
     LOGI("[Sand] === START BUGTOPIA-IDENTICAL AUTO SAND LOOP ===");
 
     std::string sandWire = WireForOp(OP_AUTO_SAND);

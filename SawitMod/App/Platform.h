@@ -51,6 +51,8 @@ void SetBreadcrumb(const std::string &step);
 // 轻量版：只更新内存缓冲（崩溃处理器会把它写进崩溃报告头），
 // 不做 fsync/NSUserDefaults，可放在每帧/功能热路径上。
 void SetBreadcrumbLight(const std::string &step);
+// 崩溃用：最近 N 条轻量面包屑（带线程 tag），崩溃处理器逐条写进报告。
+int BreadcrumbRingDump(std::string *outLines, int maxLines);
 std::string TakeBreadcrumb();
 const char *BreadcrumbCStr();
 void SetClipboard(const std::string &text);

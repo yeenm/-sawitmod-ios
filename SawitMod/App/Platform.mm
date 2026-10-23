@@ -201,6 +201,9 @@ void SetBreadcrumb(const std::string &step) {
     {
         std::lock_guard<std::mutex> lk(g_bcMutex);
         snprintf(g_bcBuf, sizeof(g_bcBuf), "%s", step.c_str());
+        const unsigned slot = g_bcRingIdx.fetch_add(1, std::memory_order_relaxed) % kBcRingSize;
+        snprintf(g_bcRingMsg[slot], kBcMsgLen, "%s", step.c_str());
+        snprintf(g_bcRingTag[slot], kBcTagLen, "t%llx", CurrentThreadTag() & 0xFFFFFULL);
     }
     NSString *key = @"sm_breadcrumb";
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
@@ -217,6 +220,33 @@ void SetBreadcrumb(const std::string &step) {
         fsync(fileno(fp));
         fclose(fp);
     }
+}
+
+
+// ---- 轻量面包屑环形缓冲（崩溃时由 CrashHandler 读出，无需加锁无分配）----
+static constexpr int kBcRingSize = 16;
+static constexpr int kBcMsgLen = 96;
+static constexpr int kBcTagLen = 24;
+static char g_bcRingMsg[kBcRingSize][kBcMsgLen];
+static char g_bcRingTag[kBcRingSize][kBcTagLen];
+static std::atomic<unsigned> g_bcRingIdx{0};
+
+static unsigned long long CurrentThreadTag() {
+    return (unsigned long long)(uintptr_t)pthread_self() * 2654435761ULL;
+}
+
+int BreadcrumbRingDump(std::string *outLines, int maxLines) {
+    if (!outLines || maxLines <= 0) return 0;
+    const unsigned idx = g_bcRingIdx.load(std::memory_order_relaxed);
+    int count = 0;
+    for (int i = 1; i <= kBcRingSize && count < maxLines; ++i) {
+        const unsigned slot = (idx + kBcRingSize - i) % kBcRingSize;
+        if (g_bcRingMsg[slot][0] == 0) break;
+        char line[160];
+        snprintf(line, sizeof(line), "%s | %s", g_bcRingTag[slot], g_bcRingMsg[slot]);
+        outLines[count++] = line;
+    }
+    return count;
 }
 
 void SetBreadcrumbLight(const std::string &step) {

@@ -317,9 +317,10 @@ void SMRunUnityFramePump() {
         for (auto &req: pendingRequests) {
             if (!ValidasiOtentikasiKetat() || req.generasiSesi == 0 || req.generasiSesi != GenerasiSesi())
                 continue;
-            SMPlatform::SetBreadcrumbLight("qreq:" + req.featureId);
+            SMPlatform::SetBreadcrumbLight("qreq:" + req.featureId + "#op" + std::to_string(req.op));
 
             if (!req.vmStream.empty()) {
+                SMPlatform::SetBreadcrumbLight("vm:begin#op" + std::to_string(req.op));
                 PayloadVM::Context vmContext;
                 vmContext.nonce = req.vmNonce;
                 vmContext.hwid = req.vmHwid;
@@ -331,7 +332,9 @@ void SMRunUnityFramePump() {
                 vmContext.channel = req.vmBindChannel.empty() ? std::string(SAWIT_CHANNEL)
                                                               : req.vmBindChannel;
                 vmContext.expectedOp = req.op;
-                if (!PayloadVM::InterpretProtected(req.vmStream, vmContext, req)) {
+                const bool vmOk = PayloadVM::InterpretProtected(req.vmStream, vmContext, req);
+                SMPlatform::SetBreadcrumbLight(vmOk ? "vm:done" : "vm:fail");
+                if (!vmOk) {
                     PayloadVM::WipeString(req.vmStream);
                     PayloadVM::WipeString(req.vmNonce);
                     PayloadVM::WipeString(req.vmHwid);

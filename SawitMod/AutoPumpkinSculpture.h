@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include "Global.h"
 #include "ModUtils.h"
+#include "App/Platform.h"
 #include "NetAuth.h"
 #include "obfuscate.h"
 #include "Logger.h"
@@ -1615,6 +1616,7 @@ inline void ProcessPumpkinCarvingOnUpdate() {
 }
 
 inline void RunAutoPumpkinCarvingLoop() {
+    SMPlatform::SetBreadcrumbLight("pumpkin:loop");
     InvokeRequest req = FetchPayloadSync(WireForOp(OP_AUTO_PUMPKIN));
     if (req.op != OP_AUTO_PUMPKIN || req.methodDesc != "CUSTOM_AUTO_PUMPKIN" ||
         req.payloadRaw.empty() || !SesiAktif()) {

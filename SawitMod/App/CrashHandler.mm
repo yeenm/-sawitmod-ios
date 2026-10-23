@@ -85,6 +85,15 @@ void WriteHeader(int sig) {
     snprintf(line, sizeof(line), "Last Step          : %s\n",
              SMPlatform::BreadcrumbCStr());
     WriteRaw(line);
+    WriteRaw("--- recent steps (newest first) ---\n");
+    {
+        std::string steps[10];
+        const int n = SMPlatform::BreadcrumbRingDump(steps, 10);
+        for (int i = 0; i < n; ++i) {
+            WriteRaw(steps[i].c_str());
+            WriteRaw("\n");
+        }
+    }
     WriteRaw("************* Crash Head ****************\n\n");
 }
 

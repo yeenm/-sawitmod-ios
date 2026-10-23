@@ -49,6 +49,14 @@
 #include "imgui/imgui.h"
 bool PatchMethodReturnInt(const char *asmName, const char *ns, const char *clsName,
                           const char *methodName, int paramCount, int returnValue) {
+#if defined(__APPLE__)
+    // 侧载 iOS：__TEXT 受代码签名保护、mono 方法体是解释器入口。
+    // 这里改指令只会把方法写坏（实测“传送采集”崩在 tp:auto 的补丁阶段）。
+    // 统一放弃，全部按“补丁未生效”降级。
+    (void)asmName; (void)ns; (void)clsName; (void)methodName; (void)paramCount;
+    return false;
+#endif
+
     if (!_monoCompileMethod) { LOGE("[PATCH] _monoCompileMethod NULL (symbol tak ada)"); return false; }
     void *img = _monoImageLoaded(asmName);
     std::string assemblyWithDll;
@@ -227,6 +235,14 @@ bool PatchMethodReturnTrue(const char *asmName, const char *ns, const char *clsN
 
 bool PatchMethodReturnFalse(const char *asmName, const char *ns, const char *clsName,
                             const char *methodName, int paramCount) {
+#if defined(__APPLE__)
+    // 侧载 iOS：__TEXT 受代码签名保护、mono 方法体是解释器入口。
+    // 这里改指令只会把方法写坏（实测“传送采集”崩在 tp:auto 的补丁阶段）。
+    // 统一放弃，全部按“补丁未生效”降级。
+    (void)asmName; (void)ns; (void)clsName; (void)methodName; (void)paramCount;
+    return false;
+#endif
+
     try {
         void *img = _monoImageLoaded(asmName);
         std::string assemblyWithDll;

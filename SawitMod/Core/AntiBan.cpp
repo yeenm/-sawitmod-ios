@@ -283,7 +283,8 @@ void BuildPendingList() {
         P_IBOOL("XDFramework.Core", "LogSystem", "get_Instance", "canSubmit", false),
         P_IBOOL("XDFramework.Core", "LogSystem", "get_Instance", "captureScreenshot", false),
         // ===== Mono 程序集防篡改校验：直接标记通过 =====
-        P_SBOOL("MonoGame.ScriptFramework", "CodeCheck", "IsMD5Match", true),
+        // CodeCheck.IsMD5Match：实测写这个静态字段会崩（类元数据归属异常），
+        // 放弃这一条；Mono 程序集 MD5 校验交给下面的 TypeRegister 补丁。
         // ===== 主动调用类补丁（这些能真正执行代码，不依赖改指令）=====
     };
     g_applied = 0;

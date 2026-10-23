@@ -799,11 +799,11 @@ void DrawMenu() {
                 // 侧载 iOS 没有 hook，帧泵由主线程每帧轮询驱动；加载阶段跑会卡死，
                 // 所以默认关闭，让玩家进到世界以后手动打开。
                 bool pumpArmed = g_framePumpArmed;
-                if (ImGui::Checkbox(u8"启用每帧功能（进世界后再勾）##pump", &pumpArmed)) {
+                if (ImGui::Checkbox(u8"启用每帧功能（默认 90 秒后自动开启）##pump", &pumpArmed)) {
                     g_framePumpArmed = pumpArmed;
                 }
                 bool antiBanArmed = SMAntiBanArmed();
-                if (ImGui::Checkbox(u8"启用防封拦截（进世界后再勾）##antiban", &antiBanArmed)) {
+                if (ImGui::Checkbox(u8"启用防封拦截（默认 110 秒后自动开启）##antiban", &antiBanArmed)) {
                     if (antiBanArmed) SMAntiBanArm();
                 }
             }

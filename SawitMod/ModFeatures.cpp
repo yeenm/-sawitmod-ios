@@ -1868,10 +1868,12 @@ void ExecuteAutoPlantFlower() {
     }
 }
 
-void PickAllOwnedMaturePlants(const std::string& dllName,
+void PickAllOwnedMaturePlants(
+                              const std::string& dllName,
                               const std::string& protocolNamespace,
                               const std::string& protocolClass,
                               const std::string& payloadRaw) {
+    SMPlatform::SetBreadcrumbLight("pickall:enter");
     if (g_pickAllPlantsBusy.exchange(true, std::memory_order_acq_rel)) return;
     struct BusyReset { ~BusyReset() { g_pickAllPlantsBusy.store(false, std::memory_order_release); } } reset;
 
@@ -4854,7 +4856,9 @@ static std::vector<InstantFarmWaypoint> BuildResourceSearchPoints() {
     return points;
 }
 
-void ExecuteInstantFarmThread(std::string dllName, const std::string& nameSpace, const std::string& className) {
+void ExecuteInstantFarmThread(
+        std::string dllName, const std::string& nameSpace, const std::string& className) {
+    SMPlatform::SetBreadcrumbLight("farm:instant");
         const uint64_t workerGeneration = g_instantFarmGeneration.load(std::memory_order_acquire);
         if (!g_instantFarmingActive || workerGeneration == 0) return;
 
@@ -7623,6 +7627,7 @@ static uint32_t GetActiveSnowTargetNetId() {
 // Auto Sand Sculpture logic ported to AutoSandSculpture.h
 
 void RunAutoSnowSculptureLoop() {
+    SMPlatform::SetBreadcrumbLight("snow:loop");
     LOGI(OBFUSCATE("[Snow] === START FULL AUTO SNOW FAST LOOP ==="));
 
     while (g_isAutoSnowActive) {
