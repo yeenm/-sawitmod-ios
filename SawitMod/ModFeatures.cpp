@@ -487,6 +487,31 @@ uint32_t GetSeedNetId(int staticId) {
     return 0;
 }
 
+// 把 mono 方法签名压成短串："s<static>a<argc>t<类型码...>"，用于面包屑定位。
+// 侧载 iOS 上热更 Mono 程序集是加密的、dump 里没有这些类，只能运行期读签名。
+static std::string CompactMethodSig(void *method) {
+    if (!method) return std::to_string(0);
+    if (!SMMonoHot::IsMonoMethod(method)) return std::string("il2cpp");
+    uint32_t flags = SMMonoHot::MethodGetFlags(method, nullptr);
+    const bool isStatic = (flags & 0x10u) != 0;   // MONO_METHOD_ATTR_STATIC
+    int argc = 0;
+    char types[24] = {0};
+    void *sig = SMMonoHot::MethodSignature(method);
+    if (sig) {
+        void *iter = nullptr;
+        while (void *type = SMMonoHot::SignatureGetParams(sig, &iter)) {
+            const int t = SMMonoHot::TypeGetType(type);
+            if (argc < 12) types[argc] = "0123456789abcdef"[(t >> 0) & 0xF];
+            ++argc;
+            if (argc >= 16) break;
+        }
+    }
+    char buf[80];
+    snprintf(buf, sizeof(buf), "s%da%dt%s", isStatic ? 1 : 0, argc, types);
+    return std::string(buf);
+}
+
+
 void ScanPotsNative() {
     SMPlatform::SetBreadcrumbLight("scan:pots");
     if (g_gardenPlayerNetId == 0) GetPlayerNetIdOnUnityThread();
@@ -522,14 +547,23 @@ void ScanPotsNative() {
     if (!worldKlass) worldKlass = _monoClassFromName(imgData,
         (const char *) OBFUSCATE("XDTGame.GAS.Client"), (const char *) OBFUSCATE("EntityWorld"));
 
+    SMPlatform::SetBreadcrumbLight("scan:world");
     void *openMethod = worldKlass ? FindMethodInHierarchy(worldKlass, (const char *) OBFUSCATE("GetComponentSystem"), 0) : nullptr;
-    if (!openMethod) return;
+    if (!openMethod) {
+        SMPlatform::SetBreadcrumbLight("scan:no-open");
+        return;
+    }
+    SMPlatform::SetBreadcrumbLight("scan:sig:" + CompactMethodSig(openMethod));
 
     void *typeArgs[1] = { potType };
     void *mi = _mono_metadata_get_generic_inst(1, typeArgs);
     MonoGenericContext ctx; ctx.class_inst = nullptr; ctx.method_inst = mi;
     void *closed = _mono_class_inflate_generic_method(openMethod, &ctx);
-    if (!closed) return;
+    if (!closed) {
+        SMPlatform::SetBreadcrumbLight("scan:no-inflate");
+        return;
+    }
+    SMPlatform::SetBreadcrumbLight("scan:inflated");
 
     SMPlatform::SetBreadcrumbLight("scan:compsys");
     void *exc = nullptr;
@@ -8241,14 +8275,17 @@ void EnsureTeleportAntiCrashPatched() {
     }
 }
 
+
 void AutoMoveTransferDirect(Vector3 pos) {
     SMPlatform::SetBreadcrumbLight("tp:auto");
     LOGI("[TeleportFix] AutoMoveTransferDirect dipanggil untuk posisi: %.2f, %.2f, %.2f", pos.x, pos.y, pos.z);
 
+    SMPlatform::SetBreadcrumbLight("tp:att");
     if (_monoGetRootDomain && _monoThreadAttach) {
         void *domain = _monoGetRootDomain();
         if (domain) _monoThreadAttach(domain);
     }
+    SMPlatform::SetBreadcrumbLight("tp:att-done");
 
     // Pastikan patch anti-crash aktif sebelum transfer
     SMPlatform::SetBreadcrumbLight("tp:patch");
@@ -8276,6 +8313,16 @@ void AutoMoveTransferDirect(Vector3 pos) {
     if (!autoMoveMethod) {
         LOGE("[TeleportFix] AutoMoveTransferDirect GAGAL: AutoMoveTransfer method tidak ditemukan.");
         return;
+    }
+
+    // 先看签名：如果是实例方法(s0)就不能传 nullptr，直接跳过并记录。
+    SMPlatform::SetBreadcrumbLight("tp:sig:" + CompactMethodSig(autoMoveMethod));
+    {
+        const uint32_t mf = SMMonoHot::MethodGetFlags(autoMoveMethod, nullptr);
+        if (SMMonoHot::IsMonoMethod(autoMoveMethod) && (mf & 0x10u) == 0) {
+            SMPlatform::SetBreadcrumbLight("tp:skip:s0");
+            return;
+        }
     }
 
     // Panggil sebagai static method (instance = nullptr)
