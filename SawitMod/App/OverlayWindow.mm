@@ -265,6 +265,13 @@ static void SMRenderFrame(void) {
 @end
 
 @implementation SMOverlayVC
+
+// 浮层不参与系统旋转：方向由游戏自己的窗口决定，这里只做被动镜像。
+- (BOOL)shouldAutorotate { return NO; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    return UIInterfaceOrientationMaskAll;
+}
+
 - (void)loadView {
     SMGLView *view = [[SMGLView alloc] initWithFrame:[UIScreen mainScreen].bounds];
     view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -283,6 +290,13 @@ static void SMRenderFrame(void) {
 @end
 
 @implementation SMOverlayWindow
+
+// 关键：浮层窗口不能变成 key window。
+// 否则 iOS 会用它的 rootViewController 决定整个 App 支持的方向，
+// 游戏原本的横屏锁定会被“允许竖屏”覆盖 —— 表现为注入后游戏强制竖屏。
+- (BOOL)canBecomeKeyWindow { return NO; }
+- (BOOL)canBecomeFocused { return NO; }
+
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
     // 注意：本窗口的 rootViewController.view 就是 SMGLView 本身。
@@ -456,6 +470,12 @@ bool Start() {
     }
     [EAGLContext setCurrentContext:g_ctx];
 
+    // 先记住游戏自己的 key window，浮层显示后要把 key 还回去。
+    UIWindow *previousKeyWindow = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.isKeyWindow) { previousKeyWindow = w; break; }
+    }
+
     SMOverlayWindow *window = [[SMOverlayWindow alloc] initWithWindowScene:scene];
     window.frame = scene.coordinateSpace.bounds;
     window.windowLevel = UIWindowLevelAlert + 100.0;
@@ -463,6 +483,11 @@ bool Start() {
     window.rootViewController = [[SMOverlayVC alloc] init];
     window.hidden = NO;
     g_window = window;
+
+    // 把 key window 还给游戏，避免浮层接管方向/状态栏等全局策略。
+    if (previousKeyWindow && previousKeyWindow != window) {
+        [previousKeyWindow makeKeyWindow];
+    }
 
     // 让 GLView 拿到 bounds 之后建 framebuffer
     [window.rootViewController.view layoutIfNeeded];
