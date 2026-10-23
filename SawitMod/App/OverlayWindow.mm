@@ -55,17 +55,19 @@ static CGFloat g_lastAngle = 0.0;
 //  ImGui，避免在 NewFrame 之外改 io 状态。
 // ---------------------------------------------------------------------------
 namespace {
+enum TouchKind { TouchDown = 0, TouchUp = 1, TouchMove = 2 };
+
 struct TouchEvent {
-    bool down;
+    int kind;
     float x;
     float y;
 };
 std::mutex g_touchMutex;
 std::vector<TouchEvent> g_touchQueue;
 
-void PushTouch(bool down, float x, float y) {
+void PushTouch(int kind, float x, float y) {
     std::lock_guard<std::mutex> lock(g_touchMutex);
-    g_touchQueue.push_back({down, x, y});
+    g_touchQueue.push_back({kind, x, y});
 }
 
 void FlushTouches() {
@@ -76,8 +78,14 @@ void FlushTouches() {
     }
     ImGuiIO &io = ImGui::GetIO();
     for (const TouchEvent &e : events) {
+        // 移动事件只更新位置，按键状态保持不变 —— 这样拖窗口/拖滑块才跟手。
+        // 之前把移动拆成“松开+按下”，导致拖动一顿一顿、点击也容易被判成拖动。
         io.AddMousePosEvent(e.x, e.y);
-        io.AddMouseButtonEvent(0, e.down);
+        if (e.kind == TouchDown) {
+            io.AddMouseButtonEvent(0, true);
+        } else if (e.kind == TouchUp) {
+            io.AddMouseButtonEvent(0, false);
+        }
     }
 }
 
@@ -232,7 +240,7 @@ static void SMRenderFrame(void) {
         const CGFloat scale = (self.bounds.size.width > 1.0)
                                   ? (CGFloat)g_width / self.bounds.size.width
                                   : [UIScreen mainScreen].scale;
-        PushTouch(true, (float)(p.x * scale), (float)(p.y * scale));
+        PushTouch(TouchDown, (float)(p.x * scale), (float)(p.y * scale));
     }
 }
 
@@ -242,8 +250,7 @@ static void SMRenderFrame(void) {
         const CGFloat scale = (self.bounds.size.width > 1.0)
                                   ? (CGFloat)g_width / self.bounds.size.width
                                   : [UIScreen mainScreen].scale;
-        PushTouch(false, (float)(p.x * scale), (float)(p.y * scale));
-        PushTouch(true, (float)(p.x * scale), (float)(p.y * scale));
+        PushTouch(TouchMove, (float)(p.x * scale), (float)(p.y * scale));
     }
 }
 
@@ -253,7 +260,7 @@ static void SMRenderFrame(void) {
         const CGFloat scale = (self.bounds.size.width > 1.0)
                                   ? (CGFloat)g_width / self.bounds.size.width
                                   : [UIScreen mainScreen].scale;
-        PushTouch(false, (float)(p.x * scale), (float)(p.y * scale));
+        PushTouch(TouchUp, (float)(p.x * scale), (float)(p.y * scale));
     }
 }
 
@@ -682,7 +689,10 @@ bool PointInsideMenu(float px, float py) {
         mini = g_MinRect;
     }
     auto contains = [](const MenuBounds &r, float x, float y) {
-        return r.active && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+        // 触摸公差：手指落点通常比视觉边界外偏几个像素，边缘按钮会“点不动”。
+        const float m = 10.0f;
+        return r.active && x >= r.x - m && x < r.x + r.w + m &&
+               y >= r.y - m && y < r.y + r.h + m;
     };
     return contains(menu, px, py) || contains(mini, px, py);
 }

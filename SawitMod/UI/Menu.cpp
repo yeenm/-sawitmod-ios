@@ -381,10 +381,12 @@ void DrawMenu() {
             ImVec2 sign_min = ImGui::GetCursorScreenPos();
             if (ActiveUI::SignInButton(u8"验证卡密", verifyBusy.load(),
                                      sign_min, ImVec2(half, ActiveUI::S(38)))) {
+                SMPlatform::SetBreadcrumb("verify:click");
                 if (!verifyBusy.exchange(true)) {
                     std::string key = license_input;
                                         std::thread([key]() {
                         SMPlatform::RunWithAutoreleasePool([key]() {
+                            SMPlatform::SetBreadcrumb("verify:thread");
                             // 卡密为空时先试上次保存的卡密，和原版输入 y 的行为一致
                             std::string use = key;
                             if (use.empty()) use = Weiyan::LoadSavedCard();

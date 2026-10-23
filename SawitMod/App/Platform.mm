@@ -14,6 +14,8 @@
 #import <unistd.h>
 
 #include <mach-o/dyld.h>
+#include <cstdio>
+#include <unistd.h>
 #include <mutex>
 #include <cstring>
 
@@ -204,6 +206,17 @@ void SetBreadcrumb(const std::string &step) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     [d setObject:[NSString stringWithUTF8String:step.c_str()] forKey:key];
     [d synchronize];
+
+    // 再写一份到文件并 fsync：SIGKILL（被系统杀）时 NSUserDefaults 不一定落盘，
+    // 文件里这条就是下一次启动能看到的“最后一步”。
+    NSString *path = [NSString stringWithUTF8String:(DataDir() + "/last_step.txt").c_str()];
+    FILE *fp = fopen([path fileSystemRepresentation], "w");
+    if (fp) {
+        fputs(step.c_str(), fp);
+        fflush(fp);
+        fsync(fileno(fp));
+        fclose(fp);
+    }
 }
 
 std::string TakeBreadcrumb() {
@@ -211,6 +224,18 @@ std::string TakeBreadcrumb() {
     NSString *v = [d stringForKey:@"sm_breadcrumb"];
     [d removeObjectForKey:@"sm_breadcrumb"];
     [d synchronize];
+    if (v.length == 0) {
+        // NSUserDefaults 没写进去（被 SIGKILL 打断）时，退回文件里的最后一步。
+        NSString *path = [NSString stringWithUTF8String:(DataDir() + "/last_step.txt").c_str()];
+        NSString *f = [NSString stringWithContentsOfFile:path
+                                                encoding:NSUTF8StringEncoding
+                                                   error:nil];
+        f = [f stringByTrimmingCharactersInSet:
+                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (f.length > 0) v = f;
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:
+        [NSString stringWithUTF8String:(DataDir() + "/last_step.txt").c_str()] error:nil];
     return v ? UTF8(v) : std::string();
 }
 
