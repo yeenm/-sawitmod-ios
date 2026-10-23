@@ -16,6 +16,8 @@
 #include <mach-o/dyld.h>
 #include <cstdio>
 #include <unistd.h>
+#include <atomic>
+#include <pthread.h>
 #include <mutex>
 #include <cstring>
 
@@ -197,32 +199,6 @@ std::string Clipboard() {
 static std::mutex g_bcMutex;
 static char g_bcBuf[128] = {0};
 
-void SetBreadcrumb(const std::string &step) {
-    {
-        std::lock_guard<std::mutex> lk(g_bcMutex);
-        snprintf(g_bcBuf, sizeof(g_bcBuf), "%s", step.c_str());
-        const unsigned slot = g_bcRingIdx.fetch_add(1, std::memory_order_relaxed) % kBcRingSize;
-        snprintf(g_bcRingMsg[slot], kBcMsgLen, "%s", step.c_str());
-        snprintf(g_bcRingTag[slot], kBcTagLen, "t%llx", CurrentThreadTag() & 0xFFFFFULL);
-    }
-    NSString *key = @"sm_breadcrumb";
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    [d setObject:[NSString stringWithUTF8String:step.c_str()] forKey:key];
-    [d synchronize];
-
-    // 再写一份到文件并 fsync：SIGKILL（被系统杀）时 NSUserDefaults 不一定落盘，
-    // 文件里这条就是下一次启动能看到的“最后一步”。
-    NSString *path = [NSString stringWithUTF8String:(DataDir() + "/last_step.txt").c_str()];
-    FILE *fp = fopen([path fileSystemRepresentation], "w");
-    if (fp) {
-        fputs(step.c_str(), fp);
-        fflush(fp);
-        fsync(fileno(fp));
-        fclose(fp);
-    }
-}
-
-
 // ---- 轻量面包屑环形缓冲（崩溃时由 CrashHandler 读出，无需加锁无分配）----
 static constexpr int kBcRingSize = 16;
 static constexpr int kBcMsgLen = 96;
@@ -249,10 +225,38 @@ int BreadcrumbRingDump(std::string *outLines, int maxLines) {
     return count;
 }
 
+
+
+void SetBreadcrumb(const std::string &step) {
+    {
+        std::lock_guard<std::mutex> lk(g_bcMutex);
+        snprintf(g_bcBuf, sizeof(g_bcBuf), "%s", step.c_str());
+    }
+    NSString *key = @"sm_breadcrumb";
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setObject:[NSString stringWithUTF8String:step.c_str()] forKey:key];
+    [d synchronize];
+
+    // 再写一份到文件并 fsync：SIGKILL（被系统杀）时 NSUserDefaults 不一定落盘，
+    // 文件里这条就是下一次启动能看到的“最后一步”。
+    NSString *path = [NSString stringWithUTF8String:(DataDir() + "/last_step.txt").c_str()];
+    FILE *fp = fopen([path fileSystemRepresentation], "w");
+    if (fp) {
+        fputs(step.c_str(), fp);
+        fflush(fp);
+        fsync(fileno(fp));
+        fclose(fp);
+    }
+}
+
+
 void SetBreadcrumbLight(const std::string &step) {
     {
         std::lock_guard<std::mutex> lk(g_bcMutex);
         snprintf(g_bcBuf, sizeof(g_bcBuf), "%s", step.c_str());
+        const unsigned slot = g_bcRingIdx.fetch_add(1, std::memory_order_relaxed) % kBcRingSize;
+        snprintf(g_bcRingMsg[slot], kBcMsgLen, "%s", step.c_str());
+        snprintf(g_bcRingTag[slot], kBcTagLen, "t%llx", CurrentThreadTag() & 0xFFFFFULL);
     }
     // 同步写文件（不做 fsync）：写进内核页缓存就够——SIGSEGV/SIGKILL 后
     // 下一次启动能从 last_step.txt 读回来显示在菜单上（上一版只写内存，
