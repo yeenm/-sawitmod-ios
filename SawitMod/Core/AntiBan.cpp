@@ -110,10 +110,13 @@ void AttachThread() {
     }
 }
 
-// 跨镜像找类：ns 传 "" 也能找到全局命名空间的类（shim 会扫全部 image）。
+// 只在 **il2cpp AOT 层**找类。
+// 不能走 MonoCompat 的混合分发：iOS 包里 Themis 相关类在热更 mono 层也有
+// 同名副本，一旦解析到 mono 那份，写静态字段/调用都会跨运行时崩
+// （实测 ab:ThemisUtil._autoQuitApplicationAfterReport）。
 void *FindClassByName(const char *ns, const char *name) {
     if (!name) return nullptr;
-    return _monoClassFromName(nullptr, ns ? ns : "", name);
+    return FindClassAnywhere(ns ? ns : "", name);
 }
 
 void *FindMethodEx(void *klass, const char *name, int argc) {
@@ -166,44 +169,40 @@ bool TryPatchMethod(const char *ns, const char *cls, const char *method, int arg
 }
 
 
-// 统一静态字段写：先判断字段属于哪套运行时。
-// 之前一律用 il2cpp_field_static_set_value，若 class 实际来自热更 mono
-// （TapThemis/ThemisUtil 在 mono 层也有同名类），就会拿 il2cpp API 操作 mono
-// 字段 → 立刻 SIGSEGV（实测崩在 ThemisUtil._autoQuitApplicationAfterReport）。
-bool WriteStaticField(void *klass, const char *fieldName, void *valuePtr) {
-    if (!klass || !fieldName) return false;
-    void *f = _monoClassGetFieldFromName(klass, fieldName);
-    if (!f) return false;
-    if (SMMonoHot::IsMonoField(f) || SMMonoHot::IsMonoClass(klass)) {
-        SMMonoHot::FieldStaticSetValue(nullptr, f, valuePtr);
-        return true;
-    }
-    const API &a = Get();
-    if (!a.field_static_set_value) return false;
-    a.field_static_set_value(f, valuePtr);
-    return true;
-}
-
 void SetStaticBool(const char *ns, const char *cls, const char *field, bool value) {
     SMPlatform::SetBreadcrumb(("ab:" + std::string(cls) + "." + field).c_str());
     void *klass = FindClassByName(ns, cls);
     if (!klass || !field) return;
+    const API &a = Get();
+    if (!a.class_get_field_from_name || !a.field_static_set_value) return;
+    void *f = a.class_get_field_from_name(klass, field);
+    if (!f) return;
     bool v = value;
-    WriteStaticField(klass, field, &v);
+    a.field_static_set_value(f, &v);
 }
 
 void SetStaticNull(const char *ns, const char *cls, const char *field) {
+    SMPlatform::SetBreadcrumb(("ab:" + std::string(cls) + "." + field).c_str());
     void *klass = FindClassByName(ns, cls);
     if (!klass || !field) return;
+    const API &a = Get();
+    if (!a.class_get_field_from_name || !a.field_static_set_value) return;
+    void *f = a.class_get_field_from_name(klass, field);
+    if (!f) return;
     void *nullValue = nullptr;
-    WriteStaticField(klass, field, &nullValue);
+    a.field_static_set_value(f, &nullValue);
 }
 
 void SetStaticInt(const char *ns, const char *cls, const char *field, long long value) {
+    SMPlatform::SetBreadcrumb(("ab:" + std::string(cls) + "." + field).c_str());
     void *klass = FindClassByName(ns, cls);
     if (!klass || !field) return;
+    const API &a = Get();
+    if (!a.class_get_field_from_name || !a.field_static_set_value) return;
+    void *f = a.class_get_field_from_name(klass, field);
+    if (!f) return;
     int v = (int)value;
-    WriteStaticField(klass, field, &v);
+    a.field_static_set_value(f, &v);
 }
 
 // 通过 static get_Instance() 拿到单例，再写它的实例字段。
@@ -212,14 +211,19 @@ void SetInstanceBool(const char *ns, const char *cls, const char *getter, int ge
     SMPlatform::SetBreadcrumb(("ab:" + std::string(cls) + "." + fieldName).c_str());
     void *klass = FindClassByName(ns, cls);
     if (!klass) return;
-    void *gm = FindMethodEx(klass, getter, getterArgc);
-    void *f = _monoClassGetFieldFromName(klass, fieldName);
-    if (!gm || !f || !_monoRuntimeInvoke || !_monoFieldSetValue) return;
+    const API &a = Get();
+    if (!a.class_get_method_from_name || !a.runtime_invoke ||
+        !a.class_get_field_from_name || !a.field_set_value) {
+        return;
+    }
+    void *gm = a.class_get_method_from_name(klass, getter, getterArgc);
+    void *f = a.class_get_field_from_name(klass, fieldName);
+    if (!gm || !f) return;
     void *exc = nullptr;
-    void *inst = _monoRuntimeInvoke(gm, nullptr, nullptr, &exc);
+    void *inst = a.runtime_invoke(gm, nullptr, nullptr, &exc);
     if (!inst) return;
     bool v = value;
-    _monoFieldSetValue(inst, f, &v);
+    a.field_set_value(inst, f, &v);
 }
 
 bool InvokeStaticVoidBool(const char *ns, const char *cls, const char *method, bool arg) {

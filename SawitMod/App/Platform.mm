@@ -220,8 +220,24 @@ void SetBreadcrumb(const std::string &step) {
 }
 
 void SetBreadcrumbLight(const std::string &step) {
-    std::lock_guard<std::mutex> lk(g_bcMutex);
-    snprintf(g_bcBuf, sizeof(g_bcBuf), "%s", step.c_str());
+    {
+        std::lock_guard<std::mutex> lk(g_bcMutex);
+        snprintf(g_bcBuf, sizeof(g_bcBuf), "%s", step.c_str());
+    }
+    // 同步写文件（不做 fsync）：写进内核页缓存就够——SIGSEGV/SIGKILL 后
+    // 下一次启动能从 last_step.txt 读回来显示在菜单上（上一版只写内存，
+    // 菜单只能读到很久以前的重面包屑，定位不到真实崩溃点）。
+    static NSString *stepPath = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        stepPath = [NSString stringWithUTF8String:(DataDir() + "/last_step.txt").c_str()];
+    });
+    if (!stepPath) return;
+    FILE *fp = fopen([stepPath fileSystemRepresentation], "w");
+    if (fp) {
+        fputs(step.c_str(), fp);
+        fclose(fp);
+    }
 }
 
 std::string TakeBreadcrumb() {
