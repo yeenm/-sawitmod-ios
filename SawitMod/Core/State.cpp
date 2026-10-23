@@ -300,6 +300,7 @@ std::string ac_cl_sel;
 std::string ac_m_int;
 std::string ac_p_true;
 std::string g_prevBreadcrumb;
+std::string g_prevCrashHead;
 
 // ============================================================================
 //  State_manual.inc — State.cpp 的手写尾部（生成器原样拼接）

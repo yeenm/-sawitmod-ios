@@ -437,7 +437,16 @@ void DrawMenu() {
                 g_prevBreadcrumb != "verify:fail" && g_prevBreadcrumb != "boot") {
                 ImGui::TextColored(ActiveUI::kWarn, u8"上次停住: %s", g_prevBreadcrumb.c_str());
             }
-            ImGui::TextDisabled("%s", SMOrientationDebug().c_str());
+            {
+                std::string dbg = SMOrientationDebug();
+                dbg += " prev=";
+                dbg += g_prevBreadcrumb.empty() ? std::string("-") : g_prevBreadcrumb;
+                if (!g_prevCrashHead.empty()) {
+                    dbg += " crash=";
+                    dbg += g_prevCrashHead.substr(0, 160);
+                }
+                ImGui::TextDisabled("%s", dbg.c_str());
+            }
         }
         ImGui::Spacing();
         ImGui::Separator();

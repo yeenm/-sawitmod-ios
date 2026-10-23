@@ -48,6 +48,35 @@
 
 namespace {
 
+// 崩溃文件的第一行摘要（给菜单调试行显示用，避免用户看不到弹窗时也能回报）。
+static std::string SMFirstCrashHead(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (docs.count == 0) return std::string();
+    NSString *dir = docs.firstObject;
+    NSArray *names = [fm contentsOfDirectoryAtPath:dir error:nil];
+    NSString *best = nil;
+    NSDate *bestDate = nil;
+    for (NSString *name in names) {
+        if (![name hasPrefix:@"mod_menu_crash_"]) continue;
+        NSString *path = [dir stringByAppendingPathComponent:name];
+        NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
+        NSDate *date = attr[NSFileModificationDate];
+        if (!bestDate || [date compare:bestDate] == NSOrderedDescending) {
+            bestDate = date;
+            best = path;
+        }
+    }
+    if (!best) return std::string();
+    NSString *text = [NSString stringWithContentsOfFile:best encoding:NSUTF8StringEncoding error:nil];
+    if (!text) return std::string();
+    if (text.length > 400) text = [text substringToIndex:400];
+    text = [text stringByReplacingOccurrencesOfString:@"\n" withString:@" | "];
+    text = [text stringByReplacingOccurrencesOfString:@"\r" withString:@" "];
+    const char *c = [text UTF8String];
+    return c ? std::string(c) : std::string();
+}
+
 // 读最近一次崩溃日志的头部，供下一次启动时弹窗展示（用户可以直接截图回报）。
 static NSString *SMLatestCrashSummary(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -184,6 +213,8 @@ void Start() {
 
     // 上次闪退停在哪一步（没有则为空）
     g_prevBreadcrumb = SMPlatform::TakeBreadcrumb();
+    // 上次崩溃日志头（没有则为空），菜单里也能看到
+    g_prevCrashHead = SMFirstCrashHead();
     SMPlatform::SetBreadcrumb("boot");
 
     SMCrash::Install();

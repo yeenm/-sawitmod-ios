@@ -729,3 +729,6 @@ extern std::string g_drawStatus;   // 自动绘画状态文本（定义在 Featu
 
 // 上次闪退前执行到的步骤（启动时从 NSUserDefaults 读出，显示在卡密页）
 extern std::string g_prevBreadcrumb;
+
+// 上次崩溃日志的头部（启动时从 Documents/mod_menu_crash_*.txt 读出）
+extern std::string g_prevCrashHead;
