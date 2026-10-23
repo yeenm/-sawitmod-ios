@@ -37,6 +37,7 @@
 #include "Global.h"
 #include "IL2CPP/Il2CppApi.h"
 #include "IL2CPP/MonoCompat.h"
+#include "IL2CPP/MonoHot.h"
 #include "Includes/Dobby/dobby.h"
 #include "Includes/Logger.h"
 #include "Includes/Utils.h"
@@ -195,6 +196,18 @@ void BootstrapThread() {
     SMMono::InstallPointers();
     SMMono::Probe();
     g_runtimeReady.store(true);
+
+    // 3.2) 真实 Mono（热更程序集）桥接层：
+    //   iOS 包同时静态链接了 mono 与 il2cpp。InstallPointers 之后 _monoXxx 已能
+    //   按句柄自动分发；这里做一次符号解析 + 首次自检（mono 运行时由
+    //   GameApp.StartMono 初始化，可能比 il2cpp 晚，SelfTest 失败不致命，
+    //   后续 shim 热路径的 Tick() 会补跑）。
+    //   实机验证：看这行日志 / 菜单「符号自检」页首行 MonoHot 的 img=x/y cls=x/y。
+    const bool monoHotOk = SMMonoHot::SelfTest();
+    NSString *monoHotStatus =
+            [NSString stringWithUTF8String:SMMonoHot::StatusString().c_str()];
+    NSLog(@"[SawitMod] MonoHot %@\n%@", monoHotOk ? @"ready" : @"waiting(dll/mono 稍后加载)",
+          monoHotStatus ?: @"(status nil)");
 
     // 3.5) 防封/过检测：按托管类名打补丁（Themis/日志/举报上报）+ 帧泵兜底。
     SMAntiBanInstall();

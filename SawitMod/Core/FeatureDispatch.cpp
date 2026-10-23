@@ -34,6 +34,7 @@
 #include "Includes/obfuscate.h"
 #include "MonoString.h"
 #include "VirboxTargets.h"
+#include "IL2CPP/MonoHot.h"
 
 // Clang/GCC 有内建指令缓存刷新；MSVC（只用于本地语法自检）没有，降级为空。
 #if !defined(__clang__) && !defined(__GNUC__)
@@ -597,7 +598,14 @@ static void Hooked_SendMessage(void* messageMonoStr, int32_t channelType) {
         _monoThreadAttach(domain);
     }
 
-    void* newMonoStr = (domain && _monoStringNew) ? _monoStringNew(domain, formatted.c_str()) : nullptr;
+    void* newMonoStr = nullptr;
+    // 这个 hook 的目标（XDTDataAndProtocol 的 ChatProtocolManager.SendMessage）
+    // 在 Mono 热更层，传进来的 messageMonoStr 一定是 Mono 字符串；显式走
+    // mono_string_new，避免按"线程最近运行时提示"误用 il2cpp_string_new 造出
+    // 跨堆指针（两套运行时字符串不能互传，见 ios-antiban-gap.md §2.3 第 3 条）。
+    if (SMMonoHot::Available()) newMonoStr = SMMonoHot::StringNew(formatted.c_str());
+    if (!newMonoStr && domain && _monoStringNew)
+        newMonoStr = _monoStringNew(domain, formatted.c_str());
     if (newMonoStr && g_origSendMessage) {
         g_origSendMessage(newMonoStr, channelType);
     } else if (g_origSendMessage) {

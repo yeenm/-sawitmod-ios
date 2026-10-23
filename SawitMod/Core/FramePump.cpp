@@ -31,6 +31,7 @@
 #include "Core/State.h"
 #include "ClientControlAgent.h"
 #include "Global.h"
+#include "IL2CPP/MonoHot.h"
 #include "Includes/Logger.h"
 #include "Includes/obfuscate.h"
 #include "StartupTrace.h"
@@ -52,6 +53,10 @@ void SwitchMapNative(int roomId, std::string dllName, std::string nameSpace, std
 void (*SMOldGameAppUpdate)(void *) = nullptr;
 void SMRunUnityFramePump() {
     if (!g_unityFramePumpReady.load(std::memory_order_acquire)) return;
+
+    // 内嵌 Mono（热更程序集）桥接层：mono 运行时通常比 il2cpp 晚 ready。
+    // Tick 内部节流（≥3s 一次）且探针全部命中后自停，每帧只是两次原子读。
+    SMMonoHot::Tick();
 
     static std::atomic<bool> firstActiveFrame{true};
     const bool traceFrame = firstActiveFrame.exchange(false, std::memory_order_acq_rel);

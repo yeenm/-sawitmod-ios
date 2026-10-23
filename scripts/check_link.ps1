@@ -34,6 +34,7 @@ $sources = @(
     "SawitMod\Core\FeatureDispatch.cpp",
     "SawitMod\IL2CPP\Il2CppApi.cpp",
     "SawitMod\IL2CPP\MonoCompat.cpp",
+    "SawitMod\IL2CPP\MonoHot.cpp",
     "SawitMod\ModUtils.cpp",
     "SawitMod\ModFeatures.cpp",
     "SawitMod\NetAuth.cpp",

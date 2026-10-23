@@ -22,6 +22,7 @@
 #include "ModFeatures.h"
 #include "ModUtils.h"
 #include "MonoGameApi.h"
+#include "IL2CPP/MonoHot.h"
 #include "Includes/Logger.h"
 #include "Includes/obfuscate.h"
 
@@ -71,6 +72,18 @@ struct Report {
     void Section(const std::string &title) {
         Line("");
         Line("==== " + title + " ====");
+    }
+
+    // 多行文本按行写入（MonoHot::StatusString() 带换行）。
+    void Block(const std::string &text) {
+        size_t begin = 0;
+        while (begin <= text.size()) {
+            size_t end = text.find('\n', begin);
+            if (end == std::string::npos) end = text.size();
+            Line(text.substr(begin, end - begin));
+            if (end == text.size()) break;
+            begin = end + 1;
+        }
     }
 };
 
@@ -257,6 +270,12 @@ void RunMonoSymbolProbeNative() {
         report.Line("SawitMod Mono symbol probe");
         report.Line("package=" + SMPlatform::BundleId());
 
+        // 先跑一次内嵌 Mono 桥接自检：确认 98 个热更程序集里哪些已经在进程内
+        // （这是"il2cpp 恒 null"根因的总探针，见 mono-bridge-impl.md）。
+        SMMonoHot::SelfTest();
+        report.Section("MonoHot 热更运行时（真实 mono）");
+        report.Block(SMMonoHot::StatusString());
+
         if (!_monoGetRootDomain || !_monoGetRootDomain()) {
             report.Line("Mono 域未就绪。");
         } else {
@@ -315,8 +334,18 @@ void RunMonoSymbolProbeNative() {
 }
 
 std::string GetMonoSymbolProbeReport() {
-    std::lock_guard<std::mutex> lock(g_symbolProbeMutex);
-    return g_symbolProbeReport;
+    std::string probe;
+    {
+        std::lock_guard<std::mutex> lock(g_symbolProbeMutex);
+        probe = g_symbolProbeReport;
+    }
+    // 菜单首行永远先显示 Mono 桥接命中数：不用点按钮就能判断
+    // "热更程序集到底有没有被真实 Mono 看到"（img=x/y cls=x/y）。
+    const std::string status = SMMonoHot::StatusString();
+    if (probe.empty()) {
+        return std::string("Mono 热更桥接状态（点「运行自检」看程序集/类明细）：\n") + status;
+    }
+    return status + "\n\n" + probe;
 }
 
 // ---------------------------------------------------------------------------
