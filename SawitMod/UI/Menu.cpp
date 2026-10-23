@@ -24,6 +24,7 @@
 #include "AndroidBrandConfig.h"
 #include "App/Alert.h"
 #include "Core/AntiBan.h"
+#include "Core/FramePump.h"
 #include "App/OverlayWindow.h"
 #include "App/Platform.h"
 #include "ModFeatures.h"
@@ -794,6 +795,18 @@ void DrawMenu() {
             ImGui::Spacing();
 
             ImGui::TextDisabled("%s", SMAntiBanStatus().c_str());
+            {
+                // 侧载 iOS 没有 hook，帧泵由主线程每帧轮询驱动；加载阶段跑会卡死，
+                // 所以默认关闭，让玩家进到世界以后手动打开。
+                bool pumpArmed = g_framePumpArmed;
+                if (ImGui::Checkbox(u8"启用每帧功能（进世界后再勾）##pump", &pumpArmed)) {
+                    g_framePumpArmed = pumpArmed;
+                }
+                bool antiBanArmed = SMAntiBanArmed();
+                if (ImGui::Checkbox(u8"启用防封拦截（进世界后再勾）##antiban", &antiBanArmed)) {
+                    if (antiBanArmed) SMAntiBanArm();
+                }
+            }
         if (ImGui::Checkbox(OBFUSCATE(u8"反作弊模式 - ANTI-CHEAT"), &g_isAntiCheatActive)) {
                 if (g_isAntiCheatActive) {
                     // iOS 版：托管层 Themis/上报拦截（幂等），原生 RVA 路子只作兜底。

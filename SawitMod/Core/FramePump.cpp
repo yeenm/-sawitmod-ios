@@ -51,8 +51,13 @@ void SwitchMapNative(int roomId, std::string dllName, std::string nameSpace, std
 
 // 由 Bootstrap 安装 hook 时写入的真函数指针。
 void (*SMOldGameAppUpdate)(void *) = nullptr;
+
+// 默认关闭：加载阶段跑每帧任务会卡死主进程（资源加载卡住）。
+bool g_framePumpArmed = false;
 void SMRunUnityFramePump() {
     if (!g_unityFramePumpReady.load(std::memory_order_acquire)) return;
+    // 默认不跑：等玩家进入世界后在菜单里手动启用，避免卡加载。
+    if (!g_framePumpArmed) return;
 
     // 内嵌 Mono（热更程序集）桥接层：mono 运行时通常比 il2cpp 晚 ready。
     // Tick 内部节流（≥3s 一次）且探针全部命中后自停，每帧只是两次原子读。

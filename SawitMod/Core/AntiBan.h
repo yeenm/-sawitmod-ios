@@ -27,6 +27,10 @@ int SMAntiBanInstall();
 // 仅安装 GameApp.Update 帧泵 hook（类名解析版，不需要 RVA）。
 bool SMAntiBanHookFramePump();
 
+// 启用防封（先建表、不写字段；玩家进世界后调用，避免干扰加载流程）。
+void SMAntiBanArm();
+bool SMAntiBanArmed();
+
 // 渲染线程每秒调用：重试启动时因程序集未加载而 miss 的补丁。
 void SMAntiBanTick();
 

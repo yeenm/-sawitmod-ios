@@ -95,6 +95,9 @@ int g_pendingLeft = 0;
 bool g_frameHookOk = false;
 int g_frameTries = 0;
 std::string g_status = "init";
+// 防封默认不启用：启动阶段改 Themis/日志字段会干扰游戏的初始化状态机,
+// 实测会把资源加载卡住。玩家进世界后从菜单手动启用。
+bool g_armed = false;
 
 constexpr int kMaxTries = 80;   // 每秒左右一次 → 约 1 分 20 秒窗口
 constexpr int kFrameMaxTries = 30;
@@ -307,10 +310,13 @@ bool TryOne(Pending &p) {
 }
 
 void ApplyPendingLocked() {
+    int budget = 4;   // 每轮最多 4 条，别让类名扫描把主线程卡住
     for (Pending &p : g_pending) {
+        if (budget <= 0) break;
         if (p.done) continue;
         if (p.tries >= kMaxTries) continue;
         ++p.tries;
+        --budget;
         if (TryOne(p)) {
             p.done = true;
             ++g_applied;
@@ -345,7 +351,8 @@ void TryFrameHookLocked() {
 
 void RefreshStatusLocked() {
     char buf[192];
-    snprintf(buf, sizeof(buf), "fields=%d pending=%d pump=%s", g_applied, g_pendingLeft,
+    snprintf(buf, sizeof(buf), "fields=%d pending=%d armed=%s pump=%s", g_applied, g_pendingLeft,
+             g_armed ? "on" : "off",
              g_unityFramePumpReady.load(std::memory_order_relaxed) ? "link" : "off");
     g_status = buf;
 }
@@ -357,12 +364,10 @@ void InstallOnce() {
         BuildPendingList();
         g_listsReady = true;
     }
+    // 只建表，不写任何字段（启动阶段写 Themis 开关会卡住资源加载）。
     AttachThread();
-    ApplyPendingLocked();
-    TryFrameHookLocked();
     RefreshStatusLocked();
-    g_isAntiCheatActive = true;
-    LOGI(OBFUSCATE("[AntiBan] first pass: %s"), g_status.c_str());
+    LOGI(OBFUSCATE("[AntiBan] armed table built: %s"), g_status.c_str());
 }
 
 }  // namespace
@@ -391,7 +396,7 @@ int SMAntiBanInstall() {
 // 渲染线程每秒调用：程序集是懒加载的，启动时没命中的补丁要等 image 上线再打。
 void SMAntiBanTick() {
     static std::atomic<long long> lastMs{0};
-    if (!g_listsReady) return;
+    if (!g_listsReady || !g_armed) return;
 
     const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -414,6 +419,21 @@ void SMAntiBanTick() {
     ApplyPendingLocked();
     TryFrameHookLocked();
     RefreshStatusLocked();
+}
+
+void SMAntiBanArm() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_armed = true;
+    g_isAntiCheatActive = true;
+    AttachThread();
+    ApplyPendingLocked();
+    RefreshStatusLocked();
+    LOGI(OBFUSCATE("[AntiBan] armed: %s"), g_status.c_str());
+}
+
+bool SMAntiBanArmed() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    return g_armed;
 }
 
 std::string SMAntiBanStatus() {
