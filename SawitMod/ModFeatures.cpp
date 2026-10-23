@@ -564,6 +564,7 @@ void ScanPotsNative() {
         return;
     }
     SMPlatform::SetBreadcrumbLight("scan:inflated");
+    _monoCompileMethod(closed);   // mono 解释器模式：膨胀泛型必须先编译
 
     SMPlatform::SetBreadcrumbLight("scan:compsys");
     // mono 下如果 GetComponentSystem 是实例方法，传 nullptr 会直接 SIGSEGV；
@@ -2152,6 +2153,36 @@ void FetchCookerNamesFromTable() {
     }
 }
 
+
+// 用 mono 原生 API 造一个 List<T> 实例（T = 传进来的 mono class）。
+// PC 权威路径 Entities.GetComponents<T>(ref List<T>) 需要先有 List<T>。
+static void *SMCreateMonoListForType(void *elementKlass) {
+    if (!SMMonoHot::Available() || !elementKlass) return nullptr;
+    void *elementType = SMMonoHot::ClassGetType(elementKlass);
+    if (!elementType) return nullptr;
+
+    void *corlib = SMMonoHot::ImageLoaded("mscorlib");
+    if (!corlib) corlib = SMMonoHot::ImageLoaded("System.Private.CoreLib");
+    if (!corlib) return nullptr;
+    void *listOpen = SMMonoHot::ClassFromName(corlib, "System.Collections.Generic", "List`1");
+    if (!listOpen) return nullptr;
+
+    void *typeArgs[1] = {elementType};
+    void *genInst = SMMonoHot::MetadataGetGenericInst(1, typeArgs);
+    if (!genInst) return nullptr;
+    MonoGenericContext ctx;
+    ctx.class_inst = genInst;      // 泛型类必须放 class_inst
+    ctx.method_inst = genInst;     // 两个槽都填，兼容不同 mono
+    void *listType = SMMonoHot::ClassInflateGenericType(SMMonoHot::ClassGetType(listOpen), &ctx);
+    if (!listType) return nullptr;
+    void *listKlass = SMMonoHot::ClassFromMonoType(listType);
+    if (!listKlass || listKlass == listOpen) return nullptr;   // 开放泛型会 abort
+    void *listObj = SMMonoHot::ObjectNew(listKlass);
+    if (!listObj) return nullptr;
+    SMMonoHot::RuntimeObjectInit(listObj);   // mono_object_new 不跑 .ctor
+    return listObj;
+}
+
 void ScanCookersNative() {
     if (g_cookPn.empty()) return;
     RunOnUnityThreadAsync([]() {
@@ -2195,53 +2226,71 @@ void ScanCookersNative() {
                                              (const char *) CookN("n_clsCookBuild").c_str());
         if (!cookKlass) return;
 
+        // ★ PC 权威路径：Entities.GetComponents<CookBuildComponent>(ref List<CookBuildComponent>)
+        //   （不再用 EntityWorld.GetComponentSystem + _components 字典：那条路是逆向猜的旁路）
+        SMPlatform::SetBreadcrumbLight("cook:begin");
+        void *entitiesImg = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity"));
+        if (!entitiesImg)
+            entitiesImg = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
+        void *entitiesCls = entitiesImg ? _monoClassFromName(entitiesImg,
+            (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"),
+            (const char *) OBFUSCATE("Entities")) : nullptr;
+        void *openGetComponents = entitiesCls
+            ? FindMethodInHierarchy(entitiesCls, (const char *) OBFUSCATE("GetComponents"), 1) : nullptr;
+        if (!openGetComponents) {
+            SMPlatform::SetBreadcrumbLight("cook:no-get");
+            return;
+        }
+
         void *cookMonoType = _monoClassGetType(cookKlass);
-        void *worldKlass = _monoClassFromName(imgData, (const char *) CookN("n_nsWorld").c_str(), (const char *) CookN("n_clsEntityWorld").c_str());
+        if (!cookMonoType) return;
+        void *gTypeArgs[1] = {cookMonoType};
+        void *gInst = _mono_metadata_get_generic_inst(1, gTypeArgs);
+        MonoGenericContext gctx;
+        gctx.class_inst = nullptr;
+        gctx.method_inst = gInst;
+        void *closedGet = _mono_class_inflate_generic_method(openGetComponents, &gctx);
+        if (!closedGet) {
+            SMPlatform::SetBreadcrumbLight("cook:no-inflate");
+            return;
+        }
+        _monoCompileMethod(closedGet);
 
-        void *openMethod = FindMethodInHierarchy(worldKlass,
-                                                 (const char *) CookN("n_getCompSys").c_str(), 0);
-        if (!openMethod) return;
-
-        void *typeArgs[1] = {cookMonoType};
-        void *methodInst = _mono_metadata_get_generic_inst(1, typeArgs);
-
-        MonoGenericContext context;
-        context.class_inst = nullptr;
-        context.method_inst = methodInst;
-
-        void *closedMethod = _mono_class_inflate_generic_method(openMethod, &context);
-        if (closedMethod) _monoCompileMethod(closedMethod);   // 解释器模式必须先编译
-
+        void *listObj = SMCreateMonoListForType(cookMonoType);
+        if (!listObj) {
+            SMPlatform::SetBreadcrumbLight("cook:no-list");
+            return;
+        }
+        void *listSlot = listObj;
+        void *getArgs[1] = {&listSlot};   // ref List<T>：必须是 List**
         void *exc = nullptr;
-        void *sysObj = _monoRuntimeInvoke(closedMethod, nullptr, nullptr, &exc);
-        if (exc || !sysObj) return;
+        _monoRuntimeInvoke(closedGet, nullptr, getArgs, &exc);
+        listObj = listSlot;               // ref 可能被改写，回读
+        if (!listObj) {
+            SMPlatform::SetBreadcrumbLight("cook:get-fail");
+            return;
+        }
 
-        void *sysKlass = _monoObjectGetClass(sysObj);
-        void *f_components = FindField(sysKlass, (const char *) CookN("n_fComponents").c_str());
-        if (!f_components) return;
-
-        void *dictObj = nullptr;
-        _monoFieldGetValue(sysObj, f_components, &dictObj);
-        if (!dictObj) return;
-
-        void *dictKlass = _monoObjectGetClass(dictObj);
-        void *f_entries = FindField(dictKlass, (const char *) CookN("n_entries").c_str());
-        if (!f_entries) f_entries = FindField(dictKlass, (const char *) CookN("n_entriesU").c_str());
-        if (!f_entries) return;
-
-        void *entriesArr = nullptr;
-        _monoFieldGetValue(dictObj, f_entries, &entriesArr);
-        if (!entriesArr) return;
-
-        int length = *(int *) ((uint8_t *) entriesArr + OFF_ARR_COUNT);
-        uint8_t *arrayDataStart = (uint8_t *) entriesArr + OFF_ARR_DATA;
+        void *listKlass = _monoObjectGetClass(listObj);
+        void *m_count = FindMethodInHierarchy(listKlass, (const char *) OBFUSCATE("get_Count"), 0);
+        void *m_item = FindMethodInHierarchy(listKlass, (const char *) OBFUSCATE("get_Item"), 1);
+        if (!m_count || !m_item) {
+            SMPlatform::SetBreadcrumbLight("cook:no-enum");
+            return;
+        }
+        exc = nullptr;
+        void *cntObj = _monoRuntimeInvoke(m_count, listObj, nullptr, &exc);
+        int length = (cntObj && !exc) ? *(int *) _monoObjectUnbox(cntObj) : 0;
+        SMPlatform::SetBreadcrumbLight("cook:list:" + std::to_string(length));
 
         for (int i = 0; i < length; i++) {
-            int hashCode = *(int *) (arrayDataStart + (i * SZ_DICT_ENTRY));
+            int hashCode = i;   // 兼容原循环的嵌套结构
             if (hashCode >= 0) {
-                void *cookObj = *(void **) (arrayDataStart + (i * SZ_DICT_ENTRY) + OFF_ENTRY_VALUE);
-
+                void *iArg[1] = {&i};
+                exc = nullptr;
+                void *cookObj = _monoRuntimeInvoke(m_item, listObj, iArg, &exc);
                 if (cookObj) {
+
                     void *m_getEntity = FindMethodInHierarchy(cookKlass, (const char *) OBFUSCATE(
                             "get_entity"), 0);
                     if (!m_getEntity)
