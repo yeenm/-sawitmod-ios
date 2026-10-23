@@ -186,21 +186,15 @@ static void SMRenderFrame(void) {
     // 防封补丁重试：il2cpp 程序集懒加载，启动时没命中的补丁在后续帧补上。
     SMAntiBanTick();
 
-    // 自动开启：加载阶段不能跑每帧逻辑/防封（会把主进程卡住），
-    // 所以启动后延时自动启用：约 90 秒开帧泵，110 秒开防封。
+    // 自动开启：悬浮窗成功后立即启用（用户要求“不要等待时间”）。
+    // 失败风险已通过“传送/防封都改成数据面/反射调用”降低。
     {
-        static const auto s_bootTime = std::chrono::steady_clock::now();
-        static bool s_autoPumpDone = false;
-        static bool s_autoAbDone = false;
-        const auto elapsedSec = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - s_bootTime).count();
-        if (!s_autoPumpDone && elapsedSec >= 90) {
+        static bool s_autoArmed = false;
+        if (!s_autoArmed) {
+            s_autoArmed = true;
             g_framePumpArmed = true;
-            s_autoPumpDone = true;
-        }
-        if (!s_autoAbDone && elapsedSec >= 110) {
             SMAntiBanArm();
-            s_autoAbDone = true;
+            NSLog(@"[SawitMod] auto-armed: frame pump + antiban");
         }
     }
 

@@ -279,9 +279,7 @@ void BuildPendingList() {
         P_SBOOL("TapTap.TapDB.Mobile", "ThemisUtil", "_autoQuitApplicationAfterReport", false),
         P_SBOOL("TapTap.TapDB.Mobile", "ThemisUtil", "enableDebug", false),
         P_SBOOL("TapTap.TapDB.Mobile", "ThemisUtil", "_uncaughtAutoReportOnce", false),
-        // ===== 日志系统：不上传、不附带截图（本地文件仍可写） =====
-        P_IBOOL("XDFramework.Core", "LogSystem", "get_Instance", "canSubmit", false),
-        P_IBOOL("XDFramework.Core", "LogSystem", "get_Instance", "captureScreenshot", false),
+        // 日志系统字段写在 iOS 上会崩（get_Instance 返回对象字段布局异常），已移除。
         // ===== Mono 程序集防篡改校验：直接标记通过 =====
         // CodeCheck.IsMD5Match：实测写这个静态字段会崩（类元数据归属异常），
         // 放弃这一条；Mono 程序集 MD5 校验交给下面的 TypeRegister 补丁。

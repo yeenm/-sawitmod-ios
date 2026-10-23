@@ -8251,6 +8251,7 @@ void AutoMoveTransferDirect(Vector3 pos) {
     }
 
     // Pastikan patch anti-crash aktif sebelum transfer
+    SMPlatform::SetBreadcrumbLight("tp:patch");
     EnsureTeleportAntiCrashPatched();
 
     // Cari EntityHelper.AutoMoveTransfer(Vector3) di XDTLevelAndEntity
@@ -8263,12 +8264,14 @@ void AutoMoveTransferDirect(Vector3 pos) {
         return;
     }
 
+    SMPlatform::SetBreadcrumbLight("tp:helper");
     void *helperClass = _monoClassFromName(img, (const char *) OBFUSCATE("XDTLevelAndEntity.Utils"), (const char *) OBFUSCATE("EntityHelper"));
     if (!helperClass) {
         LOGE("[TeleportFix] AutoMoveTransferDirect GAGAL: EntityHelper class tidak ditemukan.");
         return;
     }
 
+    SMPlatform::SetBreadcrumbLight("tp:method");
     void *autoMoveMethod = FindMethodInHierarchy(helperClass, (const char *) OBFUSCATE("AutoMoveTransfer"), 1);
     if (!autoMoveMethod) {
         LOGE("[TeleportFix] AutoMoveTransferDirect GAGAL: AutoMoveTransfer method tidak ditemukan.");
@@ -8278,8 +8281,10 @@ void AutoMoveTransferDirect(Vector3 pos) {
     // Panggil sebagai static method (instance = nullptr)
     Vector3 targetPos = pos;
     void *args[] = { &targetPos };
+    SMPlatform::SetBreadcrumbLight("tp:invoke");
     void *exc = nullptr;
     _monoRuntimeInvoke(autoMoveMethod, nullptr, args, &exc);
+    SMPlatform::SetBreadcrumbLight("tp:invoke-done");
 
     if (exc) {
         LOGE("[TeleportFix] Exception saat AutoMoveTransfer.");
@@ -8287,6 +8292,7 @@ void AutoMoveTransferDirect(Vector3 pos) {
         LOGI("[TeleportFix] AutoMoveTransfer sukses dipanggil ke (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
     }
 
+    SMPlatform::SetBreadcrumbLight("tp:camera");
     // SNAP KAMERA LENGKAP:
     // 1. Panggil EntityHelper.SetCameraLookAt() (untuk lock orientasi Euler)
     void *setCameraLookAtMethod = FindMethodInHierarchy(helperClass, (const char *) OBFUSCATE("SetCameraLookAt"), 0);
