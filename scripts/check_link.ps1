@@ -30,6 +30,7 @@ $sources = @(
     "SawitMod\Core\State.cpp",
     "SawitMod\Core\Crypto.cpp",
     "SawitMod\Core\FramePump.cpp",
+    "SawitMod\Core\AntiBan.cpp",
     "SawitMod\Core\FeatureDispatch.cpp",
     "SawitMod\IL2CPP\Il2CppApi.cpp",
     "SawitMod\IL2CPP\MonoCompat.cpp",

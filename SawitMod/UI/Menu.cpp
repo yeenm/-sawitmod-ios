@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 //  Menu.cpp — 菜单界面（从 Android 版 Main.cpp 的 DrawMenu 原样移植）
 // ----------------------------------------------------------------------------
 //  这段代码是原工程 Main.cpp 第 2451~5296 行，一行未改地搬过来：
@@ -23,6 +23,7 @@
 
 #include "AndroidBrandConfig.h"
 #include "App/Alert.h"
+#include "Core/AntiBan.h"
 #include "App/OverlayWindow.h"
 #include "App/Platform.h"
 #include "ModFeatures.h"
@@ -792,8 +793,11 @@ void DrawMenu() {
             ImGui::Separator();
             ImGui::Spacing();
 
-            if (ImGui::Checkbox(OBFUSCATE(u8"反作弊模式 - ANTI-CHEAT"), &g_isAntiCheatActive)) {
+            ImGui::TextDisabled("%s", SMAntiBanStatus().c_str());
+        if (ImGui::Checkbox(OBFUSCATE(u8"反作弊模式 - ANTI-CHEAT"), &g_isAntiCheatActive)) {
                 if (g_isAntiCheatActive) {
+                    // iOS 版：托管层 Themis/上报拦截（幂等），原生 RVA 路子只作兜底。
+                    SMAntiBanInstall();
                     std::thread(PatchAntiCheatNative).detach();
                 }
             }

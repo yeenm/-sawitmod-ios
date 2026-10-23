@@ -44,6 +44,7 @@
 #include "NetAuth.h"
 #include "Version.h"
 
+#include "Core/AntiBan.h"
 #include "Core/FramePump.h"
 
 namespace {
@@ -124,6 +125,12 @@ bool WaitForIl2Cpp(int timeoutSeconds) {
 // 安装 GameApp.Update 的帧泵 hook。偏移 0 表示还没按 iOS 包标定：
 // 此时不挂钩，菜单照样能开，只是"每帧逻辑"类功能（自动采集/雷达等）不会跑。
 bool InstallFramePumpHook() {
+    // 优先按类名解析（XD.Unity.Game.GameApp.Update）：不依赖 iOS RVA 标定，
+    // 这也是之前"每帧功能全都不生效"的根因。RVA 方式仅作退路。
+    if (SMAntiBanHookFramePump()) {
+        NSLog(@"[SawitMod] GameApp.Update hooked by class lookup");
+        return true;
+    }
     if (OFF_GAMEAPP_UPDATE == 0) {
         NSLog(@"[SawitMod] OFF_GAMEAPP_UPDATE 未标定，跳过 GameApp.Update hook");
         return false;
@@ -188,6 +195,9 @@ void BootstrapThread() {
     SMMono::InstallPointers();
     SMMono::Probe();
     g_runtimeReady.store(true);
+
+    // 3.5) 防封/过检测：按托管类名打补丁（Themis/日志/举报上报）+ 帧泵兜底。
+    SMAntiBanInstall();
 
     // 4) 帧泵 hook：失败不影响菜单。
     const bool pumpReady = InstallFramePumpHook();
