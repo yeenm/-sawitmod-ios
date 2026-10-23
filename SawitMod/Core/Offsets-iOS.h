@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // ============================================================================
 //  Offsets-iOS.h — iOS 版偏移表（RVA 相对 UnityFramework / 主可执行文件）
 // ----------------------------------------------------------------------------
@@ -48,7 +48,7 @@ static const uintptr_t OFF_BP_COUNT    = 0x14;
 // =====================================================================
 
 // --- Hook fungsi utama ---
-static const uintptr_t OFF_GAMEAPP_UPDATE = 0x0; // GameApp.Update (dipakai DobbyHook)
+static const uintptr_t OFF_GAMEAPP_UPDATE = 0x3B1F74C; // GameApp.Update —— 已用 0.5.4 IPA 逐字节校验（RVA 相对 UnityFramework __TEXT）
 
 static const uintptr_t OFF_THEMIS_P1  = 0x0;
 static const uintptr_t OFF_THEMIS_P2  = 0x0;

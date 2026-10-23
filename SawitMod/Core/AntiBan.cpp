@@ -209,6 +209,11 @@ void ApplyThemisBypass() {
         {"TapTap.Themis", "TapThemis", "U3d_ConfigAutoQuitApplication", 1, kPatchVoid},
         // 检测状态回调：不让游戏/模组层收到"环境不安全"的状态
         {"TapTap.Themis", "TapThemisAgentIOS", "_onThemisStateCB", 2, kPatchVoid},
+        // TapThemisAgentIOS 的 native 桥（ThemisSDK 真正的上报入口）
+        {"TapTap.Themis", "TapThemisAgentIOS", "_lib_report_exception_with_type", 5, kPatchVoid},
+        {"TapTap.Themis", "TapThemisAgentIOS", "_lib_report_custom_exception_ex", 6, kPatchVoid},
+        {"TapTap.Themis", "TapThemisAgentIOS", "_add_custom_field", 2, kPatchVoid},
+        {"TapTap.Themis", "TapThemisAgentIOS", "_lib_enable_debug_mode", 1, kPatchVoid},
         {"TapTap.Themis", "TapThemisCallBackImp", "onHandleThemisState", 2, kPatchVoid},
         // 2) 引擎侧 Themis 管理类（全局命名空间）
         {"", "ThemisSDKManager", "ReportException", 3, kPatchVoid},
@@ -250,6 +255,61 @@ void ApplyReportBlock() {
     // ---- 崩溃/异常上报 ----
     PatchOverloads("ScriptsRefactory.BaseService.BugReporter", "BugReporter", "ReportError", {3},
                    kPatchVoid);
+}
+
+
+// 通过 static get_Instance() 拿到单例，再写它的实例字段。
+void SetInstanceBool(const char *ns, const char *cls, const char *getter, int getterArgc,
+                     const char *fieldName, bool value) {
+    void *klass = FindClassByName(ns, cls);
+    if (!klass) {
+        LOGI(OBFUSCATE("[AntiBan] miss class %s.%s"), ns, cls);
+        return;
+    }
+    void *gm = FindMethodEx(klass, getter, getterArgc);
+    void *f = _monoClassGetFieldFromName(klass, fieldName);
+    if (!gm || !f || !_monoRuntimeInvoke || !_monoFieldSetValue) {
+        LOGI(OBFUSCATE("[AntiBan] miss %s.%s instance getter/field"), cls, fieldName);
+        return;
+    }
+    void *exc = nullptr;
+    void *inst = _monoRuntimeInvoke(gm, nullptr, nullptr, &exc);
+    if (!inst) {
+        LOGI(OBFUSCATE("[AntiBan] %s.get_Instance() null"), cls);
+        return;
+    }
+    bool v = value;
+    _monoFieldSetValue(inst, f, &v);
+    LOGI(OBFUSCATE("[AntiBan] %s.%s = %d (inst=%p)"), cls, fieldName, (int)value, inst);
+}
+
+// 性能/设备埋点（XDKWPerfSDK）：位置、UID、设备指纹、模拟器类型
+void ApplyTelemetryBlock() {
+    static const Target kPerfTargets[] = {
+        {"XDPlugin.XDKWPerf", "XDPerf", "PostPosition", 3, kPatchVoid},
+        {"XDPlugin.XDKWPerf", "XDPerf", "ReportUid", 1, kPatchVoid},
+        {"XDPlugin.XDKWPerf", "XDPerf", "ReportXDPerfInfos", 0, kPatchVoid},
+        {"XDPlugin.XDKWPerf", "XDPerf", "ReportQuality", 2, kPatchVoid},
+        {"XDPlugin.XDKWPerf", "XDPerf", "ReportCustomQuality", 1, kPatchVoid},
+        {"XDPlugin.XDKWPerf", "XDPerf", "ReportTargetFrameRate", 1, kPatchVoid},
+        {"XDPlugin.XDKWPerf", "XDPerf", "PostNetworkLatency", 1, kPatchVoid},
+        {"XDPlugin.XDKWPerf", "XDPerf", "ReportSceneName", 1, kPatchVoid},
+        {"XDPlugin.XDKWPerf", "XDPerf", "ReportChannel", 1, kPatchVoid},
+        {"XDPlugin.XDKWPerf", "XDPerf", "ReportServerId", 1, kPatchVoid},
+        {"XDPlugin.XDKWPerf", "XDPerf", "ReportLanguage", 1, kPatchVoid},
+        {"XDPlugin.XDKWPerf", "XDPerf", "GetEmulatorType", 0, kPatchIntZero},
+    };
+    for (const Target &t : kPerfTargets) {
+        if (PatchOne(t)) ++g_patched; else ++g_missed;
+    }
+
+    // 日志系统：关掉「提交日志」与「日志附带截图」
+    SetInstanceBool("XDFramework.Core", "LogSystem", "get_Instance", 0, "canSubmit", false);
+    SetInstanceBool("XDFramework.Core", "LogSystem", "get_Instance", 0, "captureScreenshot", false);
+
+    // Mono 程序集 MD5 校验：校验结果直接置 true，并让校验函数空转（防止覆盖）
+    SetStaticBool("MonoGame.ScriptFramework", "CodeCheck", "IsMD5Match", true);
+    PatchOverloads("MonoGame", "TypeRegister", "CheckMD5", {1}, kPatchVoid);
 }
 
 }  // namespace
@@ -295,6 +355,7 @@ int SMAntiBanInstall() {
 
         ApplyThemisBypass();
         ApplyReportBlock();
+        ApplyTelemetryBlock();
 
         // 帧泵：RVA 未标定时用它替代（Bootstrap 里优先调用）。
         SMAntiBanHookFramePump();
