@@ -228,6 +228,12 @@ bool InvokeStaticVoidBool(const char *ns, const char *cls, const char *method, b
     if (!klass) return false;
     void *m = FindMethodEx(klass, method, 1);
     if (!m) return false;
+    // mono 热更层的方法一律不主动调用：实测 TapThemis.U3d_ConfigAutoQuitApplication
+    // 在 mono 侧 invoke 会把进程带走；反正字段面已把相关开关关掉。
+    if (SMMonoHot::IsMonoMethod(m)) {
+        LOGI(OBFUSCATE("[AntiBan] skip mono invoke %s.%s"), cls, method);
+        return false;
+    }
     if (!_monoRuntimeInvoke) return false;
     bool v = arg;
     void *params[1] = {&v};
@@ -280,9 +286,6 @@ void BuildPendingList() {
         // ===== Mono 程序集防篡改校验：直接标记通过 =====
         P_SBOOL("MonoGame.ScriptFramework", "CodeCheck", "IsMD5Match", true),
         // ===== 主动调用类补丁（这些能真正执行代码，不依赖改指令）=====
-        P_INVOKE("", "ThemisSDKManager", "SetSwitch", false),
-        P_INVOKE("TapTap.Themis", "TapThemis", "U3d_ConfigAutoQuitApplication", false),
-        P_INVOKE("TapTap.TapDB.Mobile", "ThemisUtil", "U3d_ConfigAutoQuitApplication", false),
     };
     g_applied = 0;
     g_pendingLeft = (int)g_pending.size();
@@ -307,6 +310,8 @@ bool TryOne(Pending &p) {
             SetInstanceBool(p.ns, p.cls, p.extra, 0, p.name, p.bvalue);
             return true;
         case kKindInvokeBool:
+            // 保守：只在 il2cpp AOT 方法上调用；mono 热更方法不主动 invoke
+            // （跨运行时调用是崩溃高发点，字段面通常已经够用）。
             return InvokeStaticVoidBool(p.ns, p.cls, p.name, p.bvalue);
         case kKindStaticNull:
             if (!FindClassByName(p.ns, p.cls)) return false;
