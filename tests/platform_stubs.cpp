@@ -99,3 +99,14 @@ extern "C" unsigned int _dyld_image_count(void) { return 0; }
 extern "C" const char *_dyld_get_image_name(unsigned int) { return nullptr; }
 extern "C" const void *_dyld_get_image_header(unsigned int) { return nullptr; }
 extern "C" intptr_t _dyld_get_image_vmaddr_slide(unsigned int) { return 0; }
+
+// ---- SMAlert ----
+#include "App/Alert.h"
+namespace SMAlert {
+void Show(const std::string &, const std::string &, const std::string &) {}
+void Confirm(const std::string &, const std::string &, const std::string &, const std::string &,
+             std::function<void(bool)>) {}
+void ShowInput(const std::string &, const std::string &, const std::string &,
+               std::function<void(const std::string &)>) {}
+void Toast(const std::string &) {}
+}  // namespace SMAlert

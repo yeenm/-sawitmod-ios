@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "AndroidBrandConfig.h"
+#include "App/Alert.h"
 #include "App/Platform.h"
 #include "ModFeatures.h"
 #include "ModUtils.h"
@@ -362,6 +363,17 @@ void DrawMenu() {
             ActiveUI::KeyField(u8"在此输入卡密",
                              license_input, (int) sizeof(license_input),
                              field_min, ImVec2(ImGui::GetContentRegionAvail().x, ActiveUI::S(38)));
+            // iOS 上没有 ImGui 的文本输入后端，键盘敲不进这个框。
+            // 点一下输入框就弹系统 UIAlertController，用真键盘输入/粘贴。
+            if (ImGui::IsItemClicked()) {
+                std::string currentKey = license_input;
+                SMAlert::ShowInput(u8"输入卡密", u8"输入后点 OK 回填到菜单",
+                                   currentKey, [](const std::string &value) {
+                    memset(license_input, 0, sizeof(license_input));
+                    strncpy(license_input, value.c_str(), sizeof(license_input) - 1);
+                    license_input[sizeof(license_input) - 1] = 0;
+                });
+            }
             ImGui::Dummy(ActiveUI::S2(0, ActiveUI::S(46))); // tinggi field + gap
 
             const float half = (ImGui::GetContentRegionAvail().x - ActiveUI::S(6)) * 0.5f;

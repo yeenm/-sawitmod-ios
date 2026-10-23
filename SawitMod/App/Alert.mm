@@ -102,11 +102,9 @@ void ShowInput(const std::string &title, const std::string &hint, const std::str
         NSString *text = alert.textFields.firstObject.text ?: @"";
         const char *c = [text UTF8String];
         std::string value = c ? std::string(c) : std::string();
-        if (callback) {
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                callback(value);
-            });
-        }
+        // 回调在主线程（UIAlertAction 本来就在主线程）：调用方会直接写
+        // license_input 这类被渲染线程读取的缓冲，跨线程写会撕裂字符串。
+        if (callback) callback(value);
     }]];
     PresentOnMain(alert);
 }
