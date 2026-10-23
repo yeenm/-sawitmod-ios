@@ -223,7 +223,7 @@ void BootstrapThread() {
     // 5) 遥测/远程控制：必须在运行时就绪之后。
     ClientControlAgent::InitializeAfterMono();
 
-    NSLog(@"[SawitMod] bootstrap done (pump=%@)", pumpReady ? @"on" : @"off");
+    NSLog(@"[SawitMod] bootstrap done (pump=display-link, dobbyHook=%@)", hookReady ? @"on" : @"unavailable");
 }
 
 }  // namespace
