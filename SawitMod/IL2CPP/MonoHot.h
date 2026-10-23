@@ -159,6 +159,10 @@ void *RuntimeInvoke(void *method, void *obj, void **params, void **exc);
 void *RuntimeObjectInit(void *obj);
 void *StringNew(const char *text);
 void *ArrayNew(void *elementClass, uintptr_t count);
+// mono 数组：长度 / 指定元素大小后的首元素地址（il2cpp 数组用固定偏移，
+// mono 数组布局不同，取 entries 时必须走这两个）。
+int ArrayLength(void *array);
+void *ArrayAddrWithSize(void *array, int elementSize, uintptr_t index);
 void *TypeGetObject(void *type);
 int TypeGetType(void *type);
 

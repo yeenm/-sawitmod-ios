@@ -105,6 +105,8 @@ using MonoObjectNewFn = void *(*)(void *, void *);
 using MonoObjectUnboxFn = void *(*)(void *);
 using MonoStringNewFn = void *(*)(void *, const char *);
 using MonoArrayNewFn = void *(*)(void *, void *, uintptr_t);
+using MonoArrayLengthFn = int (*)(void *);
+using MonoArrayAddrWithSizeFn = void *(*)(void *, int, uintptr_t);
 using MonoRuntimeInvokeFn = void *(*)(void *, void *, void **, void **);
 using MonoRuntimeObjectInitFn = void (*)(void *);
 using MonoTypeGetObjectFn = void *(*)(void *, void *);
@@ -164,6 +166,8 @@ struct MonoApi {
     MonoObjectUnboxFn object_unbox = nullptr;
     MonoStringNewFn string_new = nullptr;
     MonoArrayNewFn array_new = nullptr;
+    MonoArrayLengthFn array_length = nullptr;
+    MonoArrayAddrWithSizeFn array_addr_with_size = nullptr;
     MonoRuntimeInvokeFn runtime_invoke = nullptr;
     MonoRuntimeObjectInitFn runtime_object_init = nullptr;
     MonoTypeGetObjectFn type_get_object = nullptr;
@@ -250,6 +254,8 @@ void ResolveSymbols() {
     Bind(g_api.object_unbox, "mono_object_unbox");
     Bind(g_api.string_new, "mono_string_new");
     Bind(g_api.array_new, "mono_array_new");
+    Bind(g_api.array_length, "mono_array_length");
+    Bind(g_api.array_addr_with_size, "mono_array_addr_with_size");
     Bind(g_api.runtime_invoke, "mono_runtime_invoke");
     Bind(g_api.runtime_object_init, "mono_runtime_object_init");
     Bind(g_api.type_get_object, "mono_type_get_object");
@@ -1250,6 +1256,19 @@ void *StringNew(const char *text) {
     void *domain = RootDomain();
     if (!domain) return nullptr;
     return g_api.string_new(domain, text);
+}
+
+
+int ArrayLength(void *array) {
+    if (!array || !Available() || !g_api.array_length) return 0;
+    EnsureAttached();
+    return g_api.array_length(array);
+}
+
+void *ArrayAddrWithSize(void *array, int elementSize, uintptr_t index) {
+    if (!array || !Available() || !g_api.array_addr_with_size) return nullptr;
+    EnsureAttached();
+    return g_api.array_addr_with_size(array, elementSize, index);
 }
 
 void *ArrayNew(void *elementClass, uintptr_t count) {

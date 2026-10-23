@@ -273,17 +273,12 @@ void BuildPendingList() {
         P_SBOOL("TapTap.Themis", "TapThemis", "Open", false),
         P_SBOOL("TapTap.Themis", "TapThemis", "_autoQuitApplicationAfterReport", false),
         P_SBOOL("TapTap.Themis", "TapThemis", "_debugMode", false),
-        P_SNULL("TapTap.Themis", "TapThemis", "_LogCallbackEventHandler"),
         // 摘掉 native -> 托管 的状态/消息回调对象
-        P_SNULL("TapTap.Themis", "TapThemisAgentIOS", "_callbackImp"),
-        P_SNULL("TapTap.Themis", "TapThemisCallBackImp", "_callback"),
         // 引擎侧 Themis 管理类：摘掉附加消息对象（心跳/额外上报数据）
-        P_SNULL("", "ThemisSDKManager", "unityextraMsg"),
         // TapDB 的 Themis 工具类：关自动退出/调试/日志回调
         P_SBOOL("TapTap.TapDB.Mobile", "ThemisUtil", "_autoQuitApplicationAfterReport", false),
         P_SBOOL("TapTap.TapDB.Mobile", "ThemisUtil", "enableDebug", false),
         P_SBOOL("TapTap.TapDB.Mobile", "ThemisUtil", "_uncaughtAutoReportOnce", false),
-        P_SNULL("TapTap.TapDB.Mobile", "ThemisUtil", "_LogCallbackEventHandler"),
         // ===== 日志系统：不上传、不附带截图（本地文件仍可写） =====
         P_IBOOL("XDFramework.Core", "LogSystem", "get_Instance", "canSubmit", false),
         P_IBOOL("XDFramework.Core", "LogSystem", "get_Instance", "captureScreenshot", false),

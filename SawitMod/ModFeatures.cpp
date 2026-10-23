@@ -1,5 +1,6 @@
 #include "ModFeatures.h"
 #include "ModUtils.h"
+#include "IL2CPP/MonoHot.h"
 #include "IL2CPP/MonoCompat.h"
 #include "App/Platform.h"
 #include "Includes/obfuscate.h"
@@ -496,6 +497,7 @@ void ScanPotsNative() {
 
     _monoThreadAttach(_monoGetRootDomain());
 
+    SMPlatform::SetBreadcrumbLight("scan:img");
     void *imgData     = _monoImageLoaded((const char *) OBFUSCATE("XDTDataAndProtocol"));
     if (!imgData) imgData = _monoImageLoaded((const char *) OBFUSCATE("XDTDataAndProtocol.dll"));
     void *imgGameplay = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity"));
@@ -511,6 +513,7 @@ void ScanPotsNative() {
     }
     if (!potKlass) return;
 
+    SMPlatform::SetBreadcrumbLight("scan:potclass");
     void *potType    = _monoClassGetType(potKlass);
     void *worldKlass = _monoClassFromName(imgData,
         (const char *) OBFUSCATE("XDTLevelAndEntity.Core.World"), (const char *) OBFUSCATE("EntityWorld"));
@@ -528,6 +531,7 @@ void ScanPotsNative() {
     void *closed = _mono_class_inflate_generic_method(openMethod, &ctx);
     if (!closed) return;
 
+    SMPlatform::SetBreadcrumbLight("scan:compsys");
     void *exc = nullptr;
     void *sysObj = _monoRuntimeInvoke(closed, nullptr, nullptr, &exc);
     if (exc || !sysObj) return;
@@ -547,9 +551,33 @@ void ScanPotsNative() {
     _monoFieldGetValue(dictObj, f_entries, &entriesArr);
     if (!entriesArr) return;
 
+    SMPlatform::SetBreadcrumbLight("scan:entries");
     uintptr_t arrAddr = (uintptr_t)entriesArr;
-    int length = *(int *)((uint8_t *) entriesArr + OFF_ARR_COUNT);
-    uintptr_t data = arrAddr + OFF_ARR_DATA;
+    int length = 0;
+    uintptr_t data = 0;
+    // 两套运行时的数组/字典布局不一样：
+    //   il2cpp: length @ +0x18, data @ +0x20（固定偏移）
+    //   mono  : 必须用 mono_array_length / mono_array_addr_with_size
+    // 原来一律按 il2cpp 偏移读 mono 数组 → length 变天文数字 → 越界读崩
+    // （“扫描灶台”崩溃的根因）。
+    // dictObj 是 mono 对象时，ClassifyObject 会给出 mono class；句柄表未必登记，
+    // 所以两个条件都试。
+    void *monoDictKlass = nullptr;
+    const bool monoDict = SMMonoHot::ClassifyObject(dictObj, &monoDictKlass) ||
+                          SMMonoHot::IsMonoClass(dictKlass);
+    if (monoDict && SMMonoHot::Available()) {
+        length = SMMonoHot::ArrayLength(entriesArr);
+        void *first = SMMonoHot::ArrayAddrWithSize(entriesArr, 24, 0);
+        data = (uintptr_t)first;
+        if (length <= 0 || length > 100000 || !first) {
+            SMPlatform::SetBreadcrumbLight("scan:badlen");
+            return;
+        }
+    } else {
+        length = *(int *)((uint8_t *) entriesArr + OFF_ARR_COUNT);
+        data = arrAddr + OFF_ARR_DATA;
+        if (length <= 0 || length > 100000) return;
+    }
 
     void *m_getEntity = FindMethodInHierarchy(potKlass, (const char *) OBFUSCATE("get_entity"), 0);
     if (!m_getEntity) m_getEntity = FindMethodInHierarchy(potKlass, (const char *) OBFUSCATE("get_Entity"), 0);
@@ -559,6 +587,7 @@ void ScanPotsNative() {
     void *m_getBuildComp = nullptr;
     void *m_getChild = nullptr;
 
+    SMPlatform::SetBreadcrumbLight("scan:loop");
     int foundPots = 0;
     for (int i = 0; i < length; i++) {
         int hash = *(int *)(data + (i * 24));

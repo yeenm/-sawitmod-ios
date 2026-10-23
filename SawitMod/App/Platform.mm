@@ -245,6 +245,16 @@ std::string TakeBreadcrumb() {
     NSString *v = [d stringForKey:@"sm_breadcrumb"];
     [d removeObjectForKey:@"sm_breadcrumb"];
     [d synchronize];
+    // 轻量打点（last_step.txt）比 NSUserDefaults 新：优先用它。
+    {
+        NSString *lp = [NSString stringWithUTF8String:(DataDir() + "/last_step.txt").c_str()];
+        NSString *lf = [NSString stringWithContentsOfFile:lp
+                                                encoding:NSUTF8StringEncoding
+                                                   error:nil];
+        lf = [lf stringByTrimmingCharactersInSet:
+                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (lf.length > 0) v = lf;
+    }
     if (v.length == 0) {
         // NSUserDefaults 没写进去（被 SIGKILL 打断）时，退回文件里的最后一步。
         NSString *path = [NSString stringWithUTF8String:(DataDir() + "/last_step.txt").c_str()];
