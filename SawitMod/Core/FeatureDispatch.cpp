@@ -29,6 +29,8 @@
 #include "Core/State.h"
 #include "Global.h"
 #include "Includes/Dobby/dobby.h"
+#include "App/Platform.h"
+#include "IL2CPP/MonoHot.h"
 #include "Includes/Logger.h"
 #include "Includes/OSCache.h"
 #include "Includes/obfuscate.h"
@@ -406,93 +408,153 @@ extern "C" VIRBOX_TARGET_ATTR void *Virbox_ExecuteDynamic(
         }
     }
 
-    std::vector<void *> args;
-    std::vector<void *> allocated;
+    // ---- 参数先解析成中间形式；等方法确定后再按“AOT / 热更 mono”造对象 ----
+    // 之前是先造 il2cpp/mono 字符串再找方法，命中热更 mono 方法时字符串会
+    // 造在错误的堆上（跨运行时指针）→ 一调用就崩（传送采集/自动做饭都踩这个）。
+    enum ArgKind { AK_V3 = 0, AK_FLOAT, AK_INT, AK_BOOL, AK_STR };
+    struct ParsedArg {
+        ArgKind kind;
+        float f;
+        uint32_t i;
+        bool b;
+        std::string s;
+        float v3[3];
+    };
+    std::vector<ParsedArg> parsed;
     if (!safeInput.empty()) {
         std::stringstream ss(safeInput);
         std::string token;
         while (std::getline(ss, token, ';')) {
             TrimString(token);
-            if (token.empty())
-                continue;
+            if (token.empty()) continue;
+
             if (token.rfind((const char *) OBFUSCATE("v3:"), 0) == 0) {
+                ParsedArg a{};
+                a.kind = AK_V3;
                 std::string coords = token.substr(3);
                 std::stringstream ss2(coords);
                 std::string num;
-                float *v3 = (float *) malloc(sizeof(float) * 3);
-                int i = 0;
-                while (std::getline(ss2, num, '|') && i < 3) {
+                int idx = 0;
+                while (std::getline(ss2, num, '|') && idx < 3) {
                     TrimString(num);
                     std::replace(num.begin(), num.end(), ',', '.');
-                    try {
-                        v3[i++] = std::stof(num);
-                    }
-                    catch (...) {
-                    }
+                    try { a.v3[idx++] = std::stof(num); } catch (...) {}
                 }
-                args.push_back(v3);
-                allocated.push_back(v3);
+                parsed.push_back(a);
                 continue;
             }
 
             if (token.back() == 'f' || token.back() == 'F' ||
                 token.find('.') != std::string::npos || token.find(',') != std::string::npos) {
-                float *val = (float *) malloc(sizeof(float));
+                ParsedArg a{};
+                a.kind = AK_FLOAT;
                 std::string cleanFloat = token;
-                if (cleanFloat.back() == 'f' || cleanFloat.back() == 'F')
+                if (!cleanFloat.empty() && (cleanFloat.back() == 'f' || cleanFloat.back() == 'F'))
                     cleanFloat.pop_back();
                 std::replace(cleanFloat.begin(), cleanFloat.end(), ',', '.');
-                try {
-                    *val = std::stof(cleanFloat);
-                }
-                catch (...) {
-                    *val = 0.0f;
-                }
-                args.push_back(val);
-                allocated.push_back(val);
+                try { a.f = std::stof(cleanFloat); } catch (...) { a.f = 0.0f; }
+                parsed.push_back(a);
                 continue;
             }
 
-            if (isdigit(token[0]) || (token[0] == '-' && isdigit(token[1]))) {
+            if (isdigit((unsigned char) token[0]) ||
+                (token.size() > 1 && token[0] == '-' && isdigit((unsigned char) token[1]))) {
+                ParsedArg a{};
+                a.kind = AK_INT;
                 std::string cleanInt = token;
-                if (cleanInt.back() == 'u' || cleanInt.back() == 'U')
+                if (!cleanInt.empty() && (cleanInt.back() == 'u' || cleanInt.back() == 'U'))
                     cleanInt.pop_back();
-                uint32_t *val = (uint32_t *) malloc(sizeof(uint32_t));
-                try {
-                    *val = (uint32_t) std::stoull(cleanInt);
-                }
-                catch (...) {
-                    *val = 0;
-                }
-                args.push_back(val);
-                allocated.push_back(val);
+                try { a.i = (uint32_t) std::stoull(cleanInt); } catch (...) { a.i = 0; }
+                parsed.push_back(a);
                 continue;
             }
 
             if (token == (const char *) OBFUSCATE("true") ||
                 token == (const char *) OBFUSCATE("false")) {
-                bool *val = (bool *) malloc(sizeof(bool));
-                *val = (token == (const char *) OBFUSCATE("true"));
-                args.push_back(val);
-                allocated.push_back(val);
+                ParsedArg a{};
+                a.kind = AK_BOOL;
+                a.b = (token == (const char *) OBFUSCATE("true"));
+                parsed.push_back(a);
                 continue;
             }
 
-            void *monoStr = _monoStringNew(domain, token.c_str());
-            args.push_back(monoStr);
+            ParsedArg a{};
+            a.kind = AK_STR;
+            a.s = token;
+            parsed.push_back(a);
         }
     }
 
-    int paramCount = args.size();
+    const int paramCount = (int) parsed.size();
+    SMPlatform::SetBreadcrumbLight(std::string("inv:m:") + className + "." + methodName + "#" +
+                       std::to_string(paramCount));
     void *method = FindMethodInHierarchy(targetClass, methodName.c_str(), paramCount);
     if (!method) {
         LOGE(OBFUSCATE("[INVOKE] Method '%s' dengan %d parameter tidak ditemukan"),
              methodName.c_str(), paramCount);
-        for (void *p: allocated)
-            free(p);
         return nullptr;
     }
 
+    // 目标方法属于哪套运行时：决定参数里的字符串用哪个堆分配。
+    const bool monoMethod = SMMonoHot::IsMonoMethod(method);
+
+    std::vector<void *> args;
+    std::vector<void *> allocated;
+    for (const ParsedArg &pa : parsed) {
+        switch (pa.kind) {
+            case AK_V3: {
+                float *v = (float *) malloc(sizeof(float) * 3);
+                if (!v) break;
+                memcpy(v, pa.v3, sizeof(float) * 3);
+                args.push_back(v);
+                allocated.push_back(v);
+                break;
+            }
+            case AK_FLOAT: {
+                float *v = (float *) malloc(sizeof(float));
+                if (!v) break;
+                *v = pa.f;
+                args.push_back(v);
+                allocated.push_back(v);
+                break;
+            }
+            case AK_INT: {
+                uint32_t *v = (uint32_t *) malloc(sizeof(uint32_t));
+                if (!v) break;
+                *v = pa.i;
+                args.push_back(v);
+                allocated.push_back(v);
+                break;
+            }
+            case AK_BOOL: {
+                bool *v = (bool *) malloc(sizeof(bool));
+                if (!v) break;
+                *v = pa.b;
+                args.push_back(v);
+                allocated.push_back(v);
+                break;
+            }
+            case AK_STR: {
+                void *ms = nullptr;
+                if (monoMethod && SMMonoHot::Available()) {
+                    ms = SMMonoHot::StringNew(pa.s.c_str());
+                }
+                if (!ms && !monoMethod) {
+                    ms = _monoStringNew(domain, pa.s.c_str());
+                }
+                if (!ms) {
+                    // 造不出来就别调用：宁可这次功能不生效，也不要跨堆指针崩游戏。
+                    LOGE(OBFUSCATE("[INVOKE] string alloc failed (%s)"), pa.s.c_str());
+                    for (void *p : allocated) free(p);
+                    return nullptr;
+                }
+                args.push_back(ms);
+                break;
+            }
+        }
+    }
+
+    SMPlatform::SetBreadcrumbLight(std::string("inv:run:") + className + "." + methodName);
     void **invokeArgs = args.empty() ? nullptr : args.data();
     void *objPtr = nullptr;
     if (!isStatic) {
@@ -508,6 +570,7 @@ extern "C" VIRBOX_TARGET_ATTR void *Virbox_ExecuteDynamic(
 
     void *exc = nullptr;
     void *finalResult = _monoRuntimeInvoke(method, objPtr, invokeArgs, &exc);
+    SMPlatform::SetBreadcrumbLight("inv:done");
 
     if (exc) {
         LOGE(OBFUSCATE("[INVOKE] Terjadi EXCEPTION dari dalam game saat mengeksekusi Method!"));

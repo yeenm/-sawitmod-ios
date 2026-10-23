@@ -32,6 +32,7 @@
 #include "ClientControlAgent.h"
 #include "Global.h"
 #include "IL2CPP/MonoHot.h"
+#include "App/Platform.h"
 #include "Includes/Logger.h"
 #include "Includes/obfuscate.h"
 #include "StartupTrace.h"
@@ -109,6 +110,7 @@ void SMRunUnityFramePump() {
             SetAutoFishHoverNative(autoFishHoverEnabled);
         }
         if (g_autoCookingActive && g_autoCookPayloadReady) {
+            SMPlatform::SetBreadcrumbLight("pump:autocook");
             g_autoCookFrameDelay++;
 
             if (g_autoCookFrameDelay >= 10) {

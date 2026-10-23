@@ -48,6 +48,9 @@ void RunWithAutoreleasePool(const std::function<void()> &body);
 
 // 崩溃现场定位：把“最后一步”写进 NSUserDefaults，闪退后下次启动可读回。
 void SetBreadcrumb(const std::string &step);
+// 轻量版：只更新内存缓冲（崩溃处理器会把它写进崩溃报告头），
+// 不做 fsync/NSUserDefaults，可放在每帧/功能热路径上。
+void SetBreadcrumbLight(const std::string &step);
 std::string TakeBreadcrumb();
 const char *BreadcrumbCStr();
 void SetClipboard(const std::string &text);

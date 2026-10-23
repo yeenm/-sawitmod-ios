@@ -219,6 +219,11 @@ void SetBreadcrumb(const std::string &step) {
     }
 }
 
+void SetBreadcrumbLight(const std::string &step) {
+    std::lock_guard<std::mutex> lk(g_bcMutex);
+    snprintf(g_bcBuf, sizeof(g_bcBuf), "%s", step.c_str());
+}
+
 std::string TakeBreadcrumb() {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     NSString *v = [d stringForKey:@"sm_breadcrumb"];

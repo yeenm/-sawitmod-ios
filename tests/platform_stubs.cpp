@@ -41,6 +41,7 @@ std::string Clipboard() { return std::string(); }
 void SetClipboard(const std::string &) {}
 void RunWithAutoreleasePool(const std::function<void()> &body) { if (body) body(); }
 void SetBreadcrumb(const std::string &) {}
+void SetBreadcrumbLight(const std::string &) {}
 std::string TakeBreadcrumb() { return std::string(); }
 const char *BreadcrumbCStr() { return ""; }
 bool IsDebuggerAttached() { return false; }

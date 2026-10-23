@@ -43,6 +43,7 @@
 #include "Includes/Logger.h"
 #include "Includes/OSCache.h"
 #include "Includes/obfuscate.h"
+#include "App/Platform.h"
 #include "ModUtils.h"
 
 namespace {
@@ -164,6 +165,7 @@ bool TryPatchMethod(const char *ns, const char *cls, const char *method, int arg
 }
 
 void SetStaticBool(const char *ns, const char *cls, const char *field, bool value) {
+    SMPlatform::SetBreadcrumb(("ab:" + std::string(cls) + "." + field).c_str());
     void *klass = FindClassByName(ns, cls);
     if (!klass || !field) return;
     void *f = _monoClassGetFieldFromName(klass, field);
@@ -199,6 +201,7 @@ void SetStaticInt(const char *ns, const char *cls, const char *field, long long 
 // 通过 static get_Instance() 拿到单例，再写它的实例字段。
 void SetInstanceBool(const char *ns, const char *cls, const char *getter, int getterArgc,
                      const char *fieldName, bool value) {
+    SMPlatform::SetBreadcrumb(("ab:" + std::string(cls) + "." + fieldName).c_str());
     void *klass = FindClassByName(ns, cls);
     if (!klass) return;
     void *gm = FindMethodEx(klass, getter, getterArgc);
@@ -212,6 +215,7 @@ void SetInstanceBool(const char *ns, const char *cls, const char *getter, int ge
 }
 
 bool InvokeStaticVoidBool(const char *ns, const char *cls, const char *method, bool arg) {
+    SMPlatform::SetBreadcrumb(("ab:invoke:" + std::string(cls) + "." + method).c_str());
     void *klass = FindClassByName(ns, cls);
     if (!klass) return false;
     void *m = FindMethodEx(klass, method, 1);
