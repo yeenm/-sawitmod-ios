@@ -2062,10 +2062,53 @@ void PickAllOwnedMaturePlants(
     } catch (...) {}
 }
 
-static inline std::string CookN(const char* k) { return extractJsonString(g_cookPn, k); }
+static inline std::string CookN(const char* k) {
+    std::string v = extractJsonString(g_cookPn, k);
+    if (!v.empty()) return v;
+    // 离线/服务端 payload 缺字段时的内置回退（名字来自 PC 模组权威调用链）。
+    struct CookDefault { const char* key; const char* value; };
+    static const CookDefault kDefaults[] = {
+        {"n_imgData", "XDTDataAndProtocol"},
+        {"n_imgLevel", "XDTLevelAndEntity"},
+        {"n_imgLevelDll", "XDTLevelAndEntity.dll"},
+        {"n_nsHomeland", "XDTLevelAndEntity.Gameplay.Component.Homeland"},
+        {"n_clsCookBuild", "CookBuildComponent"},
+        {"n_nsWorld", "XDTLevelAndEntity.Core.World"},
+        {"n_clsEntityWorld", "EntityWorld"},
+        {"n_getCompSys", "GetComponentSystem"},
+        {"n_fComponents", "_components"},
+        {"n_entries", "entries"},
+        {"n_entriesU", "_entries"},
+        {"n_getCompData", "ComponentData"},
+        {"n_fStaticId", "staticId"},
+        {"n_getCooing", "GetCooingComponent"},
+        {"n_getCooing2", "GetCookingComponent"},
+        {"n_imgGameSys", "XDTGameSystem"},
+        {"n_nsCooking", "XDTGameSystem.GameplaySystem.Cooking"},
+        {"n_clsCookingSys", "CookingSystem"},
+        {"n_getInstance", "get_Instance"},
+        {"n_getInstance2", "get_Instance"},
+        {"n_getAllRecipes", "GetAllRecipes"},
+        {"n_fItems", "items"},
+        {"n_fSize", "size"},
+        {"n_nsProtoCook", "XDTDataAndProtocol.ProtocolService.Cooking"},
+        {"n_clsProtoMgr", "CookingProtocolManager"},
+        {"n_initRecipe", "InitCookingRecipeDetail"},
+        {"n_prepCook", "PrepareCooking"},
+        {"n_prepCook2", "PrepareCooking"},
+        {"n_startCook", "StartCooking"},
+        {"n_interact", "InteractWithCooker"},
+        {"n_continueCook", "ContinueCooking"},
+        {"n_clsPlayerData", "PlayerDataCenter"},
+        {"n_getSelfNetId", "GetSelfNetPlayerId"},
+    };
+    for (const CookDefault &d : kDefaults) {
+        if (strcmp(k, d.key) == 0) return d.value;
+    }
+    return std::string();
+}
 
 void FetchCookerNamesFromTable() {
-    if (g_cookPn.empty()) return;
     if (!g_cookerNamesCache.empty())
         return; // Jika sudah terisi, tidak usah sedot lagi
 
@@ -2184,271 +2227,184 @@ static void *SMCreateMonoListForType(void *elementKlass) {
 }
 
 void ScanCookersNative() {
-    if (g_cookPn.empty()) return;
+    // 按 PC 模组权威调用链重写：
+    //   Entities.GetComponents<CookBuildComponent>(ref List<T>)
+    //   → comp._cookerStaticId / comp.entity / comp._cookBurnerMap
+    //   → (cookerNetId, levelObjectNetId=(1<<32)|key, staticId, cookType)
+    // 不再依赖 EntityWorld.GetComponentSystem 旁路，也不再要求 g_cookPn 非空。
     RunOnUnityThreadAsync([]() {
         _monoThreadAttach(_monoGetRootDomain());
-        FetchCookerNamesFromTable();
-        void *imgData = _monoImageLoaded((const char *) CookN("n_imgData").c_str());
+        if (!g_cookPn.empty()) FetchCookerNamesFromTable();
 
-        if (g_gardenPlayerNetId == 0) {
-            void *klassData = _monoClassFromName(imgData,
-                                                 (const char *) CookN("n_imgData").c_str(),
-                                                 (const char *) CookN("n_clsPlayerData").c_str());
-            void *methodData = FindMethodInHierarchy(klassData,
-                                                     (const char *) CookN("n_getSelfNetId").c_str(),
-                                                     0);
-            if (methodData) {
-                void *exc = nullptr;
-                void *res = _monoRuntimeInvoke(methodData, nullptr, nullptr, &exc);
-                if (res && !exc) g_gardenPlayerNetId = *(uint32_t *) _monoObjectUnbox(res);
-            }
-        }
-        if (g_gardenPlayerNetId == 0) return;
+        void *imgGameplay = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity"));
+        if (!imgGameplay) imgGameplay = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
+        if (!imgGameplay) { SMPlatform::SetBreadcrumbLight("cook:no-img"); return; }
 
-        std::vector<CookerTarget> tempCookers;
+        void *cookKlass = _monoClassFromName(imgGameplay,
+            (const char *) OBFUSCATE("XDTLevelAndEntity.Gameplay.Component.Homeland"),
+            (const char *) OBFUSCATE("CookBuildComponent"));
+        if (!cookKlass) { SMPlatform::SetBreadcrumbLight("cook:no-cls"); return; }
 
-        auto FindField = [](void *klass, const char *name) -> void * {
-            void *current = klass;
-            while (current != nullptr) {
-                void *field = _monoClassGetFieldFromName(current, name);
-                if (field != nullptr) return field;
-                current = _monoClassGetParent(current);
-            }
-            return nullptr;
-        };
-
-        void *imgGameplay = _monoImageLoaded((const char *) CookN("n_imgLevel").c_str());
-        if (!imgGameplay)
-            imgGameplay = _monoImageLoaded((const char *) CookN("n_imgLevelDll").c_str());
-        if (!imgGameplay) return;
-
-        void *cookKlass = _monoClassFromName(imgGameplay, (const char *) CookN("n_nsHomeland").c_str(),
-                                             (const char *) CookN("n_clsCookBuild").c_str());
-        if (!cookKlass) return;
-
-        // ★ PC 权威路径：Entities.GetComponents<CookBuildComponent>(ref List<CookBuildComponent>)
-        //   （不再用 EntityWorld.GetComponentSystem + _components 字典：那条路是逆向猜的旁路）
-        SMPlatform::SetBreadcrumbLight("cook:begin");
-        void *entitiesImg = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity"));
-        if (!entitiesImg)
-            entitiesImg = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
-        void *entitiesCls = entitiesImg ? _monoClassFromName(entitiesImg,
+        void *entitiesCls = _monoClassFromName(imgGameplay,
             (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"),
-            (const char *) OBFUSCATE("Entities")) : nullptr;
-        void *openGetComponents = entitiesCls
-            ? FindMethodInHierarchy(entitiesCls, (const char *) OBFUSCATE("GetComponents"), 1) : nullptr;
-        if (!openGetComponents) {
-            SMPlatform::SetBreadcrumbLight("cook:no-get");
-            return;
-        }
+            (const char *) OBFUSCATE("Entities"));
+        if (!entitiesCls) { SMPlatform::SetBreadcrumbLight("cook:no-entities"); return; }
+        void *openGet = FindMethodInHierarchy(entitiesCls, (const char *) OBFUSCATE("GetComponents"), 1);
+        if (!openGet) { SMPlatform::SetBreadcrumbLight("cook:no-get"); return; }
 
-        void *cookMonoType = _monoClassGetType(cookKlass);
-        if (!cookMonoType) return;
-        void *gTypeArgs[1] = {cookMonoType};
-        void *gInst = _mono_metadata_get_generic_inst(1, gTypeArgs);
-        MonoGenericContext gctx;
-        gctx.class_inst = nullptr;
-        gctx.method_inst = gInst;
-        void *closedGet = _mono_class_inflate_generic_method(openGetComponents, &gctx);
-        if (!closedGet) {
-            SMPlatform::SetBreadcrumbLight("cook:no-inflate");
-            return;
-        }
-        _monoCompileMethod(closedGet);
+        void *cookType = _monoClassGetType(cookKlass);
+        if (!cookType) return;
+        void *typeArgs[1] = {cookType};
+        void *genInst = _mono_metadata_get_generic_inst(1, typeArgs);
+        if (!genInst) { SMPlatform::SetBreadcrumbLight("cook:no-gen"); return; }
+        MonoGenericContext ctx;
+        ctx.class_inst = nullptr;
+        ctx.method_inst = genInst;
+        void *closed = _mono_class_inflate_generic_method(openGet, &ctx);
+        if (!closed) { SMPlatform::SetBreadcrumbLight("cook:no-inflate"); return; }
+        _monoCompileMethod(closed);
 
-        void *listObj = SMCreateMonoListForType(cookMonoType);
-        if (!listObj) {
-            SMPlatform::SetBreadcrumbLight("cook:no-list");
-            return;
-        }
+        void *listObj = SMCreateMonoListForType(cookType);
+        if (!listObj) { SMPlatform::SetBreadcrumbLight("cook:no-list"); return; }
         void *listSlot = listObj;
-        void *getArgs[1] = {&listSlot};   // ref List<T>：必须是 List**
+        void *getArgs[1] = {&listSlot};
         void *exc = nullptr;
-        _monoRuntimeInvoke(closedGet, nullptr, getArgs, &exc);
-        listObj = listSlot;               // ref 可能被改写，回读
-        if (!listObj) {
-            SMPlatform::SetBreadcrumbLight("cook:get-fail");
-            return;
-        }
+        _monoRuntimeInvoke(closed, nullptr, getArgs, &exc);
+        listObj = listSlot;
+        if (!listObj) { SMPlatform::SetBreadcrumbLight("cook:get-fail"); return; }
 
         void *listKlass = _monoObjectGetClass(listObj);
         void *m_count = FindMethodInHierarchy(listKlass, (const char *) OBFUSCATE("get_Count"), 0);
         void *m_item = FindMethodInHierarchy(listKlass, (const char *) OBFUSCATE("get_Item"), 1);
-        if (!m_count || !m_item) {
-            SMPlatform::SetBreadcrumbLight("cook:no-enum");
-            return;
-        }
+        if (!m_count || !m_item) { SMPlatform::SetBreadcrumbLight("cook:no-enum"); return; }
         exc = nullptr;
         void *cntObj = _monoRuntimeInvoke(m_count, listObj, nullptr, &exc);
-        int length = (cntObj && !exc) ? *(int *) _monoObjectUnbox(cntObj) : 0;
-        SMPlatform::SetBreadcrumbLight("cook:list:" + std::to_string(length));
+        int count = (cntObj && !exc) ? *(int *) _monoObjectUnbox(cntObj) : 0;
+        SMPlatform::SetBreadcrumbLight("cook:list:" + std::to_string(count));
+        if (count <= 0) return;
 
-        for (int i = 0; i < length; i++) {
-            int hashCode = i;   // 兼容原循环的嵌套结构
-            if (hashCode >= 0) {
-                void *iArg[1] = {&i};
+        void *f_entity = FindFieldInHierarchy(cookKlass, (const char *) OBFUSCATE("entity"));
+        if (!f_entity) f_entity = FindFieldInHierarchy(cookKlass, (const char *) OBFUSCATE("_entity"));
+        void *f_staticId = FindFieldInHierarchy(cookKlass, (const char *) OBFUSCATE("_cookerStaticId"));
+        if (!f_staticId) f_staticId = FindFieldInHierarchy(cookKlass, (const char *) OBFUSCATE("cookerStaticId"));
+        void *f_burnerMap = FindFieldInHierarchy(cookKlass, (const char *) OBFUSCATE("_cookBurnerMap"));
+        if (!f_burnerMap) f_burnerMap = FindFieldInHierarchy(cookKlass, (const char *) OBFUSCATE("cookBurnerMap"));
+
+        std::vector<CookerTarget> found;
+        for (int i = 0; i < count; ++i) {
+            void *iArg[1] = {&i};
+            exc = nullptr;
+            void *comp = _monoRuntimeInvoke(m_item, listObj, iArg, &exc);
+            if (!comp || exc) continue;
+
+            int staticIdVal = 0;
+            if (f_staticId) _monoFieldGetValue(comp, f_staticId, &staticIdVal);
+            if (staticIdVal <= 0) continue;   // 没有炉子型号 → 不是灶台
+
+            void *entityObj = nullptr;
+            if (f_entity) _monoFieldGetValue(comp, f_entity, &entityObj);
+            if (!entityObj) continue;
+
+            void *entKlass = _monoObjectGetClass(entityObj);
+            void *m_net = FindMethodInHierarchy(entKlass, (const char *) OBFUSCATE("get_netId"), 0);
+            exc = nullptr;
+            void *netObj = m_net ? _monoRuntimeInvoke(m_net, entityObj, nullptr, &exc) : nullptr;
+            uint32_t cookerNetId = (netObj && !exc) ? *(uint32_t *) _monoObjectUnbox(netObj) : 0;
+            if (cookerNetId == 0) continue;
+
+            int pureId = 0;
+            void *m_iid = FindMethodInHierarchy(entKlass, (const char *) OBFUSCATE("get_InstanceID"), 0);
+            if (m_iid) {
                 exc = nullptr;
-                void *cookObj = _monoRuntimeInvoke(m_item, listObj, iArg, &exc);
-                if (cookObj) {
+                void *r = _monoRuntimeInvoke(m_iid, entityObj, nullptr, &exc);
+                if (r && !exc) pureId = *(int *) _monoObjectUnbox(r);
+            }
 
-                    void *m_getEntity = FindMethodInHierarchy(cookKlass, (const char *) OBFUSCATE(
-                            "get_entity"), 0);
-                    if (!m_getEntity)
-                        m_getEntity = FindMethodInHierarchy(cookKlass, (const char *) OBFUSCATE(
-                                "get_Entity"), 0);
-
-                    void *entityObj = nullptr;
-                    if (m_getEntity) {
-                        exc = nullptr;
-                        entityObj = _monoRuntimeInvoke(m_getEntity, cookObj, nullptr, &exc);
-                    }
-
-                    if (entityObj && !exc) {
-                        void *entityKlass = _monoObjectGetClass(entityObj);
-
-                        void *m_getInstanceID = FindMethodInHierarchy(entityKlass,
-                                                                      (const char *) OBFUSCATE(
-                                                                              "get_InstanceID"), 0);
-                        exc = nullptr;
-                        void *pureIdObj = _monoRuntimeInvoke(m_getInstanceID, entityObj, nullptr,
-                                                             &exc);
-                        int pureIdVal = pureIdObj ? *(int *) _monoObjectUnbox(pureIdObj) : 0;
-
-                        void *m_getNetId = FindMethodInHierarchy(entityKlass,
-                                                                 (const char *) OBFUSCATE(
-                                                                         "get_netId"), 0);
-                        exc = nullptr;
-                        void *potNetObj = _monoRuntimeInvoke(m_getNetId, entityObj, nullptr, &exc);
-                        uint32_t potNetId = potNetObj ? *(uint32_t *) _monoObjectUnbox(potNetObj)
-                                                      : 0;
-
-                        uint64_t
-                                correctServerId = ((uint64_t)(uint32_t)
-                                pureIdVal & 0xFFFFFFFFULL) | (2ULL << 32);
-                        uint64_t
-                                baseBurnerId = ((uint64_t)(uint32_t)
-                                pureIdVal & 0xFFFFFFFFULL);
-                        uint64_t correctBurnerId = baseBurnerId | (1ULL << 32); // Fallback bawaan
-
-                        int staticIdVal = 0;
-
-                        // 1. Ekstrak ID Kompor Paling Akurat (Langsung dari ComponentData)
-                        void *m_getCompData = FindMethodInHierarchy(cookKlass,
-                                                                    (const char *) CookN("n_getCompData").c_str(),
-                                                                    0);
-                        if (m_getCompData) {
-                            exc = nullptr;
-                            void *compData = _monoRuntimeInvoke(m_getCompData, cookObj, nullptr,
-                                                                &exc);
-                            if (compData && !exc) {
-                                void *compDataKlass = _monoObjectGetClass(compData);
-                                void *f_staticId = FindField(compDataKlass,
-                                                             (const char *) CookN("n_fStaticId").c_str());
-                                if (!f_staticId)
-                                    f_staticId = FindField(compDataKlass, (const char *) OBFUSCATE(
-                                            "Id"));
-                                if (f_staticId) {
-                                    _monoFieldGetValue(compData, f_staticId, &staticIdVal);
-                                }
-                            }
-                        }
-
-                        // 2. Fallback jika ComponentData gagal ditembus
-                        if (staticIdVal == 0 || staticIdVal == 370001) {
-                            void *utilKlass = _monoClassFromName(imgGameplay,
-                                                                 (const char *) OBFUSCATE(
-                                                                         "XDTLevelAndEntity.BaseSystem.EntitiesManager"),
-                                                                 (const char *) OBFUSCATE(
-                                                                         "EntityUtil"));
-                            if (utilKlass) {
-                                void *getResIdMeth = FindMethodInHierarchy(utilKlass,
-                                                                           (const char *) OBFUSCATE(
-                                                                                   "GetEntityResId"),
-                                                                           1);
-                                if (getResIdMeth) {
-                                    void *resArgs[1] = {&potNetId};
-                                    exc = nullptr;
-                                    void *resIdObj = _monoRuntimeInvoke(getResIdMeth, nullptr,
-                                                                        resArgs, &exc);
-                                    if (resIdObj && !exc) {
-                                        int resId = *(int *) _monoObjectUnbox(resIdObj);
-                                        if (resId > 0) staticIdVal = resId;
-                                    } else {
-                                        void *resArgs2[1] = {&pureIdVal}; // Coba pakai pureId
-                                        exc = nullptr;
-                                        resIdObj = _monoRuntimeInvoke(getResIdMeth, nullptr,
-                                                                      resArgs2, &exc);
-                                        if (resIdObj && !exc) {
-                                            int resId = *(int *) _monoObjectUnbox(resIdObj);
-                                            if (resId > 0) staticIdVal = resId;
+            bool haveBurner = false;
+            if (f_burnerMap) {
+                void *mapObj = nullptr;
+                _monoFieldGetValue(comp, f_burnerMap, &mapObj);
+                if (mapObj) {
+                    void *mapKlass = _monoObjectGetClass(mapObj);
+                    void *f_entries = FindFieldInHierarchy(mapKlass, (const char *) OBFUSCATE("entries"));
+                    if (!f_entries) f_entries = FindFieldInHierarchy(mapKlass, (const char *) OBFUSCATE("_entries"));
+                    if (f_entries) {
+                        void *arr = nullptr;
+                        _monoFieldGetValue(mapObj, f_entries, &arr);
+                        if (arr) {
+                            int len = SMMonoHot::ArrayLength(arr);
+                            if (len > 0 && len <= 100000) {
+                                uint8_t *base = (uint8_t *) SMMonoHot::ArrayAddrWithSize(arr, 24, 0);
+                                if (base) {
+                                    void *f_cookEntity = nullptr;
+                                    void *f_cookType = nullptr;
+                                    for (int k = 0; k < len; ++k) {
+                                        int hashCode = *(int *) (base + k * 24);
+                                        if (hashCode < 0) continue;
+                                        uint64_t key = *(uint64_t *) (base + k * 24 + 8);
+                                        void *cookingComp = *(void **) (base + k * 24 + 16);
+                                        if (!cookingComp) continue;
+                                        if (!f_cookEntity) {
+                                            void *ck = _monoObjectGetClass(cookingComp);
+                                            f_cookEntity = FindFieldInHierarchy(ck, (const char *) OBFUSCATE("entity"));
+                                            if (!f_cookEntity) f_cookEntity = FindFieldInHierarchy(ck, (const char *) OBFUSCATE("_entity"));
+                                            f_cookType = FindFieldInHierarchy(ck, (const char *) OBFUSCATE("cookerwareType"));
+                                            if (!f_cookType) f_cookType = FindFieldInHierarchy(ck, (const char *) OBFUSCATE("_cookerwareType"));
                                         }
+                                        int cookTypeVal = 0;
+                                        if (f_cookType) _monoFieldGetValue(cookingComp, f_cookType, &cookTypeVal);
+                                        void *burnerEntity = nullptr;
+                                        if (f_cookEntity) _monoFieldGetValue(cookingComp, f_cookEntity, &burnerEntity);
+                                        uint32_t burnerNetId = 0;
+                                        if (burnerEntity) {
+                                            void *bk = _monoObjectGetClass(burnerEntity);
+                                            void *m_bnet = FindMethodInHierarchy(bk, (const char *) OBFUSCATE("get_netId"), 0);
+                                            if (m_bnet) {
+                                                exc = nullptr;
+                                                void *r = _monoRuntimeInvoke(m_bnet, burnerEntity, nullptr, &exc);
+                                                if (r && !exc) burnerNetId = *(uint32_t *) _monoObjectUnbox(r);
+                                            }
+                                        }
+                                        if (burnerNetId == 0) burnerNetId = cookerNetId;
+                                        uint64_t levelObjectNetId = key;
+                                        if (levelObjectNetId <= 0xFFFFFFFFULL) levelObjectNetId |= (1ULL << 32);
+                                        uint64_t serverId = ((uint64_t) burnerNetId & 0xFFFFFFFFULL) | (2ULL << 32);
+                                        CookerTarget ct = {burnerNetId, serverId, levelObjectNetId,
+                                                           entityObj, pureId, staticIdVal, cookTypeVal};
+                                        bool exists = false;
+                                        for (const auto &c : found) {
+                                            if (c.netId == ct.netId && c.burnerId == ct.burnerId) { exists = true; break; }
+                                        }
+                                        if (!exists) found.push_back(ct);
+                                        haveBurner = true;
                                     }
                                 }
                             }
-                        }
-
-                        if (staticIdVal == 0) staticIdVal = 370001; // Final safeguard
-
-                        // 3. Cari Valid Burner ID secara Dinamis (Tungku yang sedang aktif)
-                        int cookTypeVal = 0;
-                        void *m_GetCooing = FindMethodInHierarchy(cookKlass,
-                                                                  (const char *) CookN("n_getCooing").c_str(), 1);
-                        if (!m_GetCooing)
-                            m_GetCooing = FindMethodInHierarchy(cookKlass, (const char *) CookN("n_getCooing2").c_str(), 1);
-
-                        if (m_GetCooing) {
-                            for (uint64_t idx = 1; idx <= 5; idx++) {
-                                uint64_t testBurnerId = baseBurnerId | (idx << 32);
-                                void *cooingArgs[1] = {&testBurnerId};
-                                exc = nullptr;
-                                void *cookingCompInst = _monoRuntimeInvoke(m_GetCooing, cookObj,
-                                                                           cooingArgs, &exc);
-
-                                if (cookingCompInst && !exc) {
-                                    correctBurnerId = testBurnerId; // Tungku yang valid ditemukan!
-
-                                    void *cookingCompKlass = _monoObjectGetClass(cookingCompInst);
-                                    void *m_getCookType = FindMethodInHierarchy(cookingCompKlass,
-                                                                                (const char *) OBFUSCATE(
-                                                                                        "get_cookType"),
-                                                                                0);
-                                    if (m_getCookType) {
-                                        void *typeObj = _monoRuntimeInvoke(m_getCookType,
-                                                                           cookingCompInst, nullptr,
-                                                                           &exc);
-                                        if (typeObj && !exc) {
-                                            cookTypeVal = *(int *) _monoObjectUnbox(typeObj);
-                                        }
-                                    }
-                                    break; // Setop pencarian jika tungku pertama ditemukan
-                                }
-                            }
-                        }
-
-                        bool exists = false;
-                        for (const auto &c: tempCookers) {
-                            if (c.netId == potNetId) {
-                                exists = true;
-                                break;
-                            }
-                        }
-
-                        if (!exists) {
-                            CookerTarget ct = {potNetId, correctServerId, correctBurnerId,
-                                               entityObj, pureIdVal, staticIdVal, cookTypeVal};
-                            tempCookers.push_back(ct);
                         }
                     }
                 }
             }
+
+            if (!haveBurner) {
+                // 没有 _cookBurnerMap 的单锅灶台：按 (2<<32)|pureId 惯例兜底
+                uint64_t levelObjectNetId = (1ULL << 32) | (uint64_t) (uint32_t) pureId;
+                uint64_t serverId = ((uint64_t) (uint32_t) pureId) | (2ULL << 32);
+                CookerTarget ct = {cookerNetId, serverId, levelObjectNetId, entityObj, pureId, staticIdVal, 0};
+                bool exists = false;
+                for (const auto &c : found) {
+                    if (c.netId == ct.netId) { exists = true; break; }
+                }
+                if (!exists) found.push_back(ct);
+            }
+            (void) haveBurner;
         }
 
-        g_availableCookers = tempCookers;
+        g_availableCookers = found;
+        SMPlatform::SetBreadcrumbLight("cook:found:" + std::to_string((int) found.size()));
     });
 }
 
 void GetRecipesNative(int targetCookerId) {
-    if (g_cookPn.empty()) return;
     RunOnUnityThreadAsync([targetCookerId]() {
         _monoThreadAttach(_monoGetRootDomain());
 
@@ -2498,7 +2454,6 @@ void GetRecipesNative(int targetCookerId) {
 }
 
 void ExecChefAction(std::string methodName, uint32_t netId, uint64_t targetId) {
-    if (g_cookPn.empty()) return;
     RunOnUnityThreadAsync([methodName, netId, targetId]() mutable {
         _monoThreadAttach(_monoGetRootDomain());
         void *img = _monoImageLoaded(CookN("n_imgData").c_str());
@@ -2517,7 +2472,7 @@ void ExecChefAction(std::string methodName, uint32_t netId, uint64_t targetId) {
 }
 
 int GetCookerStatusNative(CookerTarget cooker) {
-    if (g_cookPn.empty()) return 0;
+
     int statusResult = 0;
     RunOnUnityThreadSync([&]() {
         auto FindField = [](void *klass, const char *name) -> void * {
@@ -3013,6 +2968,7 @@ void ProcessBirdWatchingNative() {
             ResetBirdTarget("STANDBY", 0);
         return;
     }
+    SMPlatform::SetBreadcrumbLight("bird:on");
     if (g_birdRequestPending.load(std::memory_order_acquire)) {
         int currentCount = -1;
         int continuousCount = -1;
@@ -3059,6 +3015,29 @@ void ProcessBirdWatchingNative() {
 
     if (now < g_birdNextActionAt) return;
 
+    // 观鸟需要手持鸟镜（toolId 4）；没有就尝试切换一次。
+    {
+        static bool s_birdToolTried = false;
+        if (!s_birdToolTried) {
+            s_birdToolTried = true;
+            SMPlatform::SetBreadcrumbLight("bird:tool");
+            void *imgTool = _monoImageLoaded((const char *) OBFUSCATE("XDTGameSystem"));
+            void *toolCls = imgTool ? _monoClassFromName(imgTool,
+                (const char *) OBFUSCATE("XDTGameSystem.GameplaySystem.Tool"),
+                (const char *) OBFUSCATE("ToolSystem")) : nullptr;
+            void *getInst = toolCls ? FindMethodInHierarchy(toolCls, (const char *) OBFUSCATE("get_Instance"), 0) : nullptr;
+            void *inst = getInst ? _monoRuntimeInvoke(getInst, nullptr, nullptr, nullptr) : nullptr;
+            void *setHand = toolCls ? FindMethodInHierarchy(toolCls, (const char *) OBFUSCATE("SetHandhold"), 1) : nullptr;
+            if (inst && setHand) {
+                int toolId = 4;
+                void *a[1] = {&toolId};
+                void *e = nullptr;
+                _monoRuntimeInvoke(setHand, inst, a, &e);
+            }
+        }
+    }
+
+    SMPlatform::SetBreadcrumbLight("bird:resolve");
     if (g_birdCurrentTarget.birdNetId == 0) {
         BirdTarget target{};
         if (!ResolveBirdTarget(target)) {
@@ -3111,10 +3090,13 @@ void ProcessBirdWatchingNative() {
              counterReady ? 1 : 0);
     }
 
+    SMPlatform::SetBreadcrumbLight("bird:send");
     if (!SendBirdPhotoRequest(g_birdCurrentTarget)) {
+        SMPlatform::SetBreadcrumbLight("bird:sendfail");
         ResetBirdTarget("SEND FAILED", 1000);
         return;
     }
+    SMPlatform::SetBreadcrumbLight("bird:sent");
 
     if (!g_birdCounterAvailable) {
         if (g_birdLocalPhotoAttempts >= g_birdTargetPhotoMaxCount) {
@@ -3138,7 +3120,7 @@ static uint64_t CookingNowMs();
 // apakah semua slot bahan terisi (mendukung multi-stack dengan NetID berbeda).
 // Mengembalikan true jika seluruh bahan resep lengkap dan siap dimasak, false jika bahan benar-benar habis.
 static bool RefreshCookingRecipeSlots(int recipeId) {
-    if (recipeId <= 0 || g_cookPn.empty()) return false;
+    if (recipeId <= 0) return false;
     void *img = _monoImageLoaded(CookN("n_imgGameSys").c_str());
     if (!img) return false;
     void *k = _monoClassFromName(img, CookN("n_nsCooking").c_str(), CookN("n_clsCookingSys").c_str());
@@ -3206,7 +3188,7 @@ static std::vector<int> GetCookerStatusesBatch(
         bool *dangerObserved = nullptr) {
     std::vector<int> statuses(cookers.size(), -1);
     if (dangerObserved) *dangerObserved = false;
-    if (cookers.empty() || g_cookPn.empty()) return statuses;
+    if (cookers.empty()) return statuses;
 
     RunOnUnityThreadSync([&]() {
         _monoThreadAttach(_monoGetRootDomain());
@@ -3365,7 +3347,7 @@ struct CookBatchAction {
 };
 
 static void ExecChefActionsBatch(const std::vector<CookBatchAction> &actions) {
-    if (actions.empty() || g_cookPn.empty()) return;
+    if (actions.empty()) return;
     RunOnUnityThreadAsync([actions]() {
         _monoThreadAttach(_monoGetRootDomain());
         void *img = _monoImageLoaded(CookN("n_imgData").c_str());
@@ -3400,7 +3382,6 @@ static uint64_t CookingNowMs() {
 }
 
 void AutoCookBatchRoutine(int recipeId) {
-    if (g_cookPn.empty()) { g_isChefActive = false; return; }
     std::unordered_map<uint64_t, uint64_t> cooldown;
     std::unordered_map<uint64_t, uint64_t> dangerPending;
     uint64_t lastRescan = CookingNowMs();
@@ -3551,7 +3532,6 @@ void AutoCookBatchRoutine(int recipeId) {
 }
 
 void AutoCookRoutine(CookerTarget cooker, int recipeId) {
-    if (g_cookPn.empty()) return;
     auto waitStatus = [&](std::function<bool(int)> ok, int timeoutMs) -> int {
         int waited = 0, s = GetCookerStatusNative(cooker);
         while (g_isChefActive && !ok(s) && waited < timeoutMs) {
@@ -3633,7 +3613,6 @@ void AutoCookRoutine(CookerTarget cooker, int recipeId) {
 }
 
 void FailedCookRoutine() {
-    if (g_cookPn.empty()) return;   // tujuan: bikin masakan GOSONG (Failed)
     while (g_isFailedCookActive) {
         std::vector<CookerTarget> cookers = g_availableCookers;
 
@@ -3662,7 +3641,6 @@ void FailedCookRoutine() {
 }
 
 void HelperCookRoutine() {
-    if (g_cookPn.empty()) { g_isHelperCookActive = false; return; }
     std::unordered_map<uint64_t, uint64_t> cooldown;
     std::unordered_set<uint64_t> dangerHandled;
     uint64_t lastRescan = CookingNowMs();
