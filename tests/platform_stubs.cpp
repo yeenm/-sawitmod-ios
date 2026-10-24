@@ -43,6 +43,9 @@ void SetClipboard(const std::string &) {}
 void RunWithAutoreleasePool(const std::function<void()> &body) { if (body) body(); }
 void SetBreadcrumb(const std::string &) {}
 void SetBreadcrumbLight(const std::string &) {}
+// 菜单主页/崩溃报告都会读「最近 N 条面包屑」：真实实现只存在于 App/Platform.mm，
+// 自检里给一个空环形缓冲（菜单显示「（无）」）即可。
+int BreadcrumbRingDump(std::string *, int) { return 0; }
 std::string TakeBreadcrumb() { return std::string(); }
 const char *BreadcrumbCStr() { return ""; }
 bool IsDebuggerAttached() { return false; }
