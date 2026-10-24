@@ -111,6 +111,7 @@ using MonoRuntimeInvokeFn = void *(*)(void *, void *, void **, void **);
 using MonoRuntimeObjectInitFn = void (*)(void *);
 using MonoTypeGetObjectFn = void *(*)(void *, void *);
 using MonoTypeGetTypeFn = int (*)(void *);
+using MonoTypeGetUnderlyingFn = void *(*)(void *);
 using MonoGcHandleNewFn = uint32_t (*)(void *, int);
 using MonoGcHandleFreeFn = void (*)(uint32_t);
 using MonoMetadataGetGenericInstFn = void *(*)(int, void **);
@@ -172,6 +173,7 @@ struct MonoApi {
     MonoRuntimeObjectInitFn runtime_object_init = nullptr;
     MonoTypeGetObjectFn type_get_object = nullptr;
     MonoTypeGetTypeFn type_get_type = nullptr;
+    MonoTypeGetUnderlyingFn type_get_underlying_type = nullptr;
     MonoGcHandleNewFn gchandle_new = nullptr;
     MonoGcHandleFreeFn gchandle_free = nullptr;
     MonoMetadataGetGenericInstFn metadata_get_generic_inst = nullptr;
@@ -260,6 +262,8 @@ void ResolveSymbols() {
     Bind(g_api.runtime_object_init, "mono_runtime_object_init");
     Bind(g_api.type_get_object, "mono_type_get_object");
     Bind(g_api.type_get_type, "mono_type_get_type");
+    // 缺这个符号不影响任何既有路径：只在 byref/枚举解包时当额外一次机会。
+    Bind(g_api.type_get_underlying_type, "mono_type_get_underlying_type");
     Bind(g_api.gchandle_new, "mono_gchandle_new");
     Bind(g_api.gchandle_free, "mono_gchandle_free");
     Bind(g_api.metadata_get_generic_inst, "mono_metadata_get_generic_inst");
@@ -1293,6 +1297,54 @@ void *TypeGetObject(void *type) {
 int TypeGetType(void *type) {
     if (!IsMonoType(type) || !g_api.type_get_type) return -1;
     return g_api.type_get_type(type);
+}
+
+// ---------------------------------------------------------------------------
+//  类型细节：byref / 底层类型
+// ---------------------------------------------------------------------------
+//  mono 的方法签名里 `ref T` 有两种可能表示：
+//    ① type 字段直接是 MONO_TYPE_BYREF(0x10)，元素类型挂在 union 的 data 上；
+//    ② type 字段是元素类型本身，byref 只体现在标志位里（新 mono 的解析路径）。
+//  ① 能解包成元素 MonoType，拿去 mono_class_from_mono_type 就能拿到真类；
+//  ② 没有可解包的指针，调用方直接用"已知的元素类"另造实例（见 ModFeatures 的
+//    SMCreateMonoListForType）。所以这里只报 ①，绝不猜标志位（猜错会把普通
+//    类型当 byref 解引用，读到垃圾指针）。
+bool TypeIsByRef(void *type) {
+    if (!IsMonoType(type) || !g_api.type_get_type) return false;
+    return g_api.type_get_type(type) == 0x10;   // MONO_TYPE_BYREF
+}
+
+void *TypeGetByRefElement(void *type) {
+    if (!TypeIsByRef(type) || !Available()) return nullptr;
+    EnsureAttached();
+    void *element = nullptr;
+    const bool readOk = GuardCall([type, &element]() {
+        element = *reinterpret_cast<void **>(type);   // union data.byref
+        return element != nullptr;
+    });
+    if (!readOk || !element || element == type) return nullptr;
+    // 形状校验：元素类型的类型码必须落在合法 ELEMENT_TYPE 区间（0x01..0x1e），
+    // 否则当解包失败 —— 宁可不造 List，也不要拿野指针去问 mono。
+    int elementTypeCode = -1;
+    if (!g_api.type_get_type) return nullptr;
+    if (!GuardCall([element, &elementTypeCode]() {
+            elementTypeCode = g_api.type_get_type(element);
+            return true;
+        })) {
+        return nullptr;
+    }
+    if (elementTypeCode <= 0 || elementTypeCode > 0x1e) return nullptr;
+    TagMonoType(element);
+    return element;
+}
+
+void *TypeGetUnderlyingType(void *type) {
+    if (!IsMonoType(type) || !Available() || !g_api.type_get_underlying_type)
+        return nullptr;
+    EnsureAttached();
+    void *underlying = g_api.type_get_underlying_type(type);
+    if (underlying) TagMonoType(underlying);
+    return underlying;
 }
 
 void *AssemblyOpen(const char *name, int *status) {

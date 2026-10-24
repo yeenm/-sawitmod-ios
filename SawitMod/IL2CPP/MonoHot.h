@@ -166,6 +166,13 @@ void *ArrayAddrWithSize(void *array, int elementSize, uintptr_t index);
 void *TypeGetObject(void *type);
 int TypeGetType(void *type);
 
+// 类型细节（造 List<T> 需要）：方法签名里 `ref T` 参数的 MonoType 是
+// MONO_TYPE_BYREF(0x10) 包一层，mono_class_from_mono_type 对它返回 null，
+// 必须先解包拿元素类型。TypeGetUnderlyingType 只在符号存在时可用。
+bool TypeIsByRef(void *type);
+void *TypeGetByRefElement(void *type);
+void *TypeGetUnderlyingType(void *type);
+
 void *AssemblyOpen(const char *name, int *status);
 void *AssemblyGetImage(void *assembly);
 void AssemblyForeach(void (*callback)(void *assembly, void *user), void *user);
