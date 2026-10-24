@@ -49,175 +49,6 @@ static void *AndroidMonoArrayNew(void *domain, void *byteKlass, size_t count);
 static int CountBackpackItemTotalByStaticId(int targetStaticId);
 static void *GetLocalPlayerInstance();
 
-// ===========================================================================
-//  传送 / 瞬间采集链路（传送采集物资）的 mono 安全守卫
-// ---------------------------------------------------------------------------
-//  背景：这一整条链路是从 Android 版（纯 il2cpp）逐行照搬到 iOS 的。il2cpp 上
-//  「实例方法传 nullptr」通常只是把 0 当 this 送进去、方法体不碰 this 就侥幸不炸；
-//  侧载 iOS 是 il2cpp AOT + 加密 mono 双运行时，热更层的游戏类（EntityWorld /
-//  CollectableComponent / ResourceProtocolManager / EntityHelper）全在 mono 里，
-//  mono_runtime_invoke(method, NULL, ...) 会把 NULL 当 this 交给 IL，
-//  方法体一碰 this 就是 SIGSEGV —— 没有 C++ 异常、没有堆栈，表现就是"点一下闪退"。
-//
-//  这里的三个守卫覆盖了链路上全部「已知会崩」的调用形态：
-//    ① SmFarmMethodIsStatic / SmFarmInvoke —— 实例方法传 nullptr 的通用拦截
-//    ② SmFarmResolveSingleton            —— 需要实例时取单例，取不到安全 return
-//    ③ SmFarmDictEntries                 —— mono 数组长度/首元素地址（il2cpp 偏移禁读）
-// ===========================================================================
-
-// mono 方法是否 static。非 mono（AOT/il2cpp）方法返回 true = 保持旧行为（按静态传）。
-static bool SmFarmMethodIsStatic(void *method) {
-    if (!method) return true;
-    if (!SMMonoHot::IsMonoMethod(method)) return true;
-    return (SMMonoHot::MethodGetFlags(method, nullptr) & 0x10u) != 0u;  // METHOD_ATTRIBUTE_STATIC
-}
-
-// 统一 invoke 入口：mono 实例方法缺 this 时直接返回 nullptr，绝不带死调用。
-static void *SmFarmInvoke(void *method, void *instance, void **params, void **outExc) {
-    void *dummyExc = nullptr;
-    if (outExc) *outExc = nullptr;
-    if (!method) return nullptr;
-    if (!SMMonoHot::IsMonoMethod(method))
-        return _monoRuntimeInvoke(method, instance, params, outExc ? outExc : &dummyExc);
-    if (SmFarmMethodIsStatic(method))
-        return _monoRuntimeInvoke(method, nullptr, params, outExc ? outExc : &dummyExc);
-    if (!instance) return nullptr;   // 实例方法 + 空 this = SIGSEGV，直接放弃
-    return _monoRuntimeInvoke(method, instance, params, outExc ? outExc : &dummyExc);
-}
-
-// 只接受"确实是目标类的实例"：取到对象类后沿继承链比对。
-// 静态字段读串类型（比如字段其实是实例字段，static get 会读到垃圾）时把结果挡掉，
-// 否则拿一个错误对象当 this 去 invoke，照样是随机 SIGSEGV。
-static bool SmFarmObjectIsA(void *obj, void *klass) {
-    if (!obj || !klass) return false;
-    void *cls = _monoObjectGetClass(obj);
-    for (int depth = 0; cls && depth < 12; ++depth) {
-        if (cls == klass) return true;
-        cls = _monoClassGetParent(cls);
-    }
-    return false;
-}
-
-// 取单例/全局实例：静态访问器（get_Instance/get_Current/…）→ 静态字段（_instance/…）。
-// 只调用静态访问器；实例 accessor 传 nullptr 一样会崩，直接跳过。
-static void *SmFarmResolveSingleton(void *klass) {
-    if (!klass) return nullptr;
-    static const char *kAccessors[] = {
-            "get_Instance", "get_instance", "get_Current", "get_CurrentWorld",
-            "get_CurWorld", "get_World", "get_LogicWorld", "get_Default",
-            "get_Main", "GetInstance", "GetWorld", "get_Singleton",
-    };
-    for (const char *name : kAccessors) {
-        void *m = FindMethodInHierarchy(klass, name, 0);
-        if (!m || !SmFarmMethodIsStatic(m)) continue;
-        void *exc = nullptr;
-        void *inst = _monoRuntimeInvoke(m, nullptr, nullptr, &exc);
-        if (inst && !exc && SmFarmObjectIsA(inst, klass)) return inst;
-    }
-    static const char *kFields[] = {
-            "_instance", "instance", "s_instance", "m_instance", "Instance",
-            "<Instance>k__BackingField", "_current", "Current",
-    };
-    void *vtable = _monoClassGetVTable ? _monoClassGetVTable(_monoGetRootDomain(), klass) : nullptr;
-    if (!vtable) return nullptr;
-    for (const char *name : kFields) {
-        void *field = FindFieldInHierarchy(klass, name);
-        if (!field) continue;
-        void *inst = nullptr;
-        _monoFieldStaticGetValue(vtable, field, &inst);
-        if (inst && SmFarmObjectIsA(inst, klass)) return inst;
-    }
-    return nullptr;
-}
-
-// Dictionary.entries（T[]）→ 长度 + 首元素地址。
-//   il2cpp：length@+0x18、data@+0x20（固定偏移，旧行为）
-//   mono  ：必须走 mono_array_length / mono_array_addr_with_size；直接按 il2cpp
-//           偏移读会拿到天文长度 → 循环越界读 → SIGSEGV（报告 §9.2 / G07）
-// 返回 false 表示长度或数据地址不可信，调用方必须直接 return。
-static bool SmFarmDictEntries(void *dictObj, void *entriesArr, int *outLength,
-                              uint8_t **outData) {
-    if (outLength) *outLength = 0;
-    if (outData) *outData = nullptr;
-    if (!entriesArr) return false;
-    void *arrMonoKlass = nullptr;
-    void *dictKlass = dictObj ? _monoObjectGetClass(dictObj) : nullptr;
-    const bool monoArray = SMMonoHot::ClassifyObject(entriesArr, &arrMonoKlass) ||
-                           (dictKlass && SMMonoHot::IsMonoClass(dictKlass));
-    if (monoArray && SMMonoHot::Available()) {
-        const int length = SMMonoHot::ArrayLength(entriesArr);
-        void *first = SMMonoHot::ArrayAddrWithSize(entriesArr, SZ_DICT_ENTRY, 0);
-        if (length <= 0 || length > 200000 || !first) return false;
-        if (outLength) *outLength = length;
-        if (outData) *outData = (uint8_t *) first;
-        return true;
-    }
-    const uintptr_t addr = (uintptr_t) entriesArr;
-    const int length = SafeRead<int>(addr + OFF_ARR_COUNT, 0);
-    if (length <= 0 || length > 200000) return false;
-    if (outLength) *outLength = length;
-    if (outData) *outData = (uint8_t *) (addr + OFF_ARR_DATA);
-    return true;
-}
-
-// EntityWorld.GetComponentSystem<T>()：三件事必须同时成立才调用，否则安全返回 nullptr。
-//   ① 膨胀泛型后先 _monoCompileMethod（iOS mono 是 IL 解释器，不编译取不到入口）
-//   ② 方法是实例方法时必须给真实 EntityWorld 实例（nullptr this = SIGSEGV）
-//   ③ 拿不到实例就 return（宁可这次采集空转，也不要闪退）
-static void *SmFarmGetComponentSystem(void *worldKlass, void *componentKlass,
-                                      const std::string &stagePrefix) {
-    if (!worldKlass || !componentKlass) return nullptr;
-    void *componentType = _monoClassGetType(componentKlass);
-    if (!componentType) return nullptr;
-    void *openMethod = FindMethodInHierarchy(worldKlass, OBFUSCATE("GetComponentSystem"), 0);
-    if (!openMethod) {
-        SMPlatform::SetBreadcrumbLight(stagePrefix + ":no-open");
-        return nullptr;
-    }
-    void *typeArgs[] = {componentType};
-    void *methodInst = _mono_metadata_get_generic_inst(1, typeArgs);
-    if (!methodInst) {
-        SMPlatform::SetBreadcrumbLight(stagePrefix + ":no-inflate");
-        return nullptr;
-    }
-    MonoGenericContext ctx = {nullptr, methodInst};
-    void *closed = _mono_class_inflate_generic_method(openMethod, &ctx);
-    if (!closed) {
-        SMPlatform::SetBreadcrumbLight(stagePrefix + ":no-inflate");
-        return nullptr;
-    }
-    const bool monoClosed = SMMonoHot::IsMonoMethod(closed);
-    if (monoClosed) _monoCompileMethod(closed);   // 解释器模式：膨胀泛型必须先编译
-    const bool needInstance = monoClosed && !SmFarmMethodIsStatic(closed);
-    SMPlatform::SetBreadcrumbLight(stagePrefix + (needInstance ? ":csig:i" : ":csig:s"));
-    void *worldInst = nullptr;
-    if (needInstance) {
-        worldInst = SmFarmResolveSingleton(worldKlass);
-        if (!worldInst) {
-            SMPlatform::SetBreadcrumbLight(stagePrefix + ":no-inst");
-            return nullptr;
-        }
-        SMPlatform::SetBreadcrumbLight(stagePrefix + ":inst");
-    }
-    void *exc = nullptr;
-    void *sysObj = _monoRuntimeInvoke(closed, worldInst, nullptr, &exc);
-    if (exc || !sysObj) {
-        SMPlatform::SetBreadcrumbLight(stagePrefix + ":compsys-fail");
-        return nullptr;
-    }
-    return sysObj;
-}
-
-// unbox 判空：mono_object_unbox 对 null/错型返回 null，直接解引用就是 SIGSEGV。
-static inline void *SmFarmUnbox(const void *boxed) {
-    if (!boxed) return nullptr;
-    return _monoObjectUnbox(const_cast<void *>(boxed));
-}
-
-// 传送/采集链路里"这一次传送是否真的发出去了"（AutoMoveTransferNative 用它回报）。
-//   0 = 还没结论，1 = 已调用，2 = 被安全跳过（实例方法缺 this / 找不到方法）
-static std::atomic<int> g_smTeleportResult{0};
-
 struct ESPCachedMethods {
     bool isInitialized = false;
     void *m_GetPlayer = nullptr;
@@ -2101,25 +1932,24 @@ void ExecuteAutoPlantFlower() {
     }
 }
 
-// ---------------------------------------------------------------------------
-//  「收获所有自有成熟植物」的 mono 侧实现。
-//  ★ 只能在 Unity 主线程调用：整段都是 mono 反射 + 游戏方法调用。
-//  ★ 里面出现的每个 mono 对象（plant / furniture / entity / data / 协议单例）都是
-//    本函数的局部变量，出函数即丢 —— 不跨帧、不跨线程保存，出函数后一律失效。
-// ---------------------------------------------------------------------------
-static void PickAllOwnedMaturePlantsOnUnityThread(
+void PickAllOwnedMaturePlants(
                               const std::string& dllName,
                               const std::string& protocolNamespace,
                               const std::string& protocolClass,
                               const std::string& payloadRaw) {
+    SMPlatform::SetBreadcrumbLight("pickall:enter");
+    if (g_pickAllPlantsBusy.exchange(true, std::memory_order_acq_rel)) return;
+    struct BusyReset { ~BusyReset() { g_pickAllPlantsBusy.store(false, std::memory_order_release); } } reset;
+
     try {
         auto PN = [&](const char* key) { return extractJsonString(payloadRaw, key); };
         _monoThreadAttach(_monoGetRootDomain());
 
-        // Panen sayuran pot kebun yang sudah matang（已经在 Unity 线程上，直接调，
-        // 不再套 RunOnUnityThreadSync：那层封送由外层 PickAllOwnedMaturePlants 做一次）
-        ScanPotsNative();
-        ExecuteAutoHarvest();
+        // Panen sayuran pot kebun yang sudah matang
+        RunOnUnityThreadSync([]() {
+            ScanPotsNative();
+            ExecuteAutoHarvest();
+        });
 
         void* imgData = _monoImageLoaded(dllName.c_str());
         if (!imgData && dllName.find(".dll") == std::string::npos)
@@ -2128,32 +1958,21 @@ static void PickAllOwnedMaturePlantsOnUnityThread(
         void* imgGameplay = _monoImageLoaded(imgGameplayName.c_str());
         if (!imgGameplay && imgGameplayName.find(".dll") == std::string::npos)
             imgGameplay = _monoImageLoaded((imgGameplayName + ".dll").c_str());
-        if (!imgData || !imgGameplay) {
-            SMPlatform::SetBreadcrumbLight("pickall:no-img");
-            return;
-        }
+        if (!imgData || !imgGameplay) return;
 
-        SMPlatform::SetBreadcrumbLight("pickall:player");
         void* playerClass = _monoClassFromName(imgData, PN("n_nsPlayerData").c_str(), PN("n_clsPlayerData").c_str());
         void* gameplayApi = _monoClassFromName(imgGameplay, PN("n_nsGameplayApi").c_str(), PN("n_clsGameplayApi").c_str());
         void* getSelf = playerClass ? FindMethodInHierarchy(playerClass, PN("n_getSelfId").c_str(), 0) : nullptr;
         void* getOwner = gameplayApi ? FindMethodInHierarchy(gameplayApi, PN("n_getFieldOwner").c_str(), 0) : nullptr;
-        if (!getSelf || !getOwner) {
-            SMPlatform::SetBreadcrumbLight("pickall:no-player-method");
-            return;
-        }
+        if (!getSelf || !getOwner) return;
         void* exc = nullptr;
-        void* selfObj = SmFarmInvoke(getSelf, nullptr, nullptr, &exc);
+        void* selfObj = _monoRuntimeInvoke(getSelf, nullptr, nullptr, &exc);
         if (!selfObj || exc) return;
-        void* selfRaw = SmFarmUnbox(selfObj);
-        if (!selfRaw) return;
-        uint32_t selfId = *(uint32_t*)selfRaw;
+        uint32_t selfId = *(uint32_t*)_monoObjectUnbox(selfObj);
         exc = nullptr;
-        void* ownerObj = SmFarmInvoke(getOwner, nullptr, nullptr, &exc);
+        void* ownerObj = _monoRuntimeInvoke(getOwner, nullptr, nullptr, &exc);
         if (!ownerObj || exc) return;
-        void* ownerRaw = SmFarmUnbox(ownerObj);
-        if (!ownerRaw) return;
-        uint32_t fieldOwner = *(uint32_t*)ownerRaw;
+        uint32_t fieldOwner = *(uint32_t*)_monoObjectUnbox(ownerObj);
         if (!selfId || fieldOwner != selfId) return;
 
         void* plantClass = _monoClassFromName(imgGameplay, PN("n_nsHomeland").c_str(), PN("n_clsPlant").c_str());
@@ -2163,27 +1982,24 @@ static void PickAllOwnedMaturePlantsOnUnityThread(
         if (!worldClass) worldClass = _monoClassFromName(imgGameplay, OBFUSCATE("XDTLevelAndEntity.Core.World"), PN("n_clsWorld").c_str());
         if (!worldClass) worldClass = _monoClassFromName(imgData, OBFUSCATE("XDTLevelAndEntity.Core.World"), PN("n_clsWorld").c_str());
         if (!plantClass || !furnitureClass || !worldClass) return;
-        // mono 上 GetComponentSystem<T> 是实例方法：膨胀后必须 mono_compile_method
-        // 并给真实 EntityWorld 实例，否则 nullptr this = SIGSEGV。
-        SMPlatform::SetBreadcrumbLight("pickall:compsys");
-        void* system = SmFarmGetComponentSystem(worldClass, plantClass, "pickall");
-        if (!system) return;
+        void* open = FindMethodInHierarchy(worldClass, PN("n_getComponentSystem").c_str(), 0);
+        if (!open) return;
+        void* typeArgs[] = {_monoClassGetType(plantClass)};
+        void* inst = _mono_metadata_get_generic_inst(1, typeArgs);
+        MonoGenericContext ctx = {nullptr, inst};
+        void* closed = _mono_class_inflate_generic_method(open, &ctx);
+        exc = nullptr;
+        void* system = _monoRuntimeInvoke(closed, nullptr, nullptr, &exc);
+        if (!system || exc) return;
         void* componentsField = FindFieldInHierarchy(_monoObjectGetClass(system), PN("n_components").c_str());
         void* dictionary = nullptr;
         if (componentsField) _monoFieldGetValue(system, componentsField, &dictionary);
-        if (!dictionary) {
-            SMPlatform::SetBreadcrumbLight("pickall:no-dict");
-            return;
-        }
+        if (!dictionary) return;
         void* entriesField = FindFieldInHierarchy(_monoObjectGetClass(dictionary), PN("n_entries").c_str());
         if (!entriesField) entriesField = FindFieldInHierarchy(_monoObjectGetClass(dictionary), OBFUSCATE("entries"));
         void* entries = nullptr;
         if (entriesField) _monoFieldGetValue(dictionary, entriesField, &entries);
-        if (!entries) {
-            SMPlatform::SetBreadcrumbLight("pickall:no-entries");
-            return;
-        }
-        SMPlatform::SetBreadcrumbLight("pickall:entries");
+        if (!entries) return;
 
         void* getEntity = FindMethodInHierarchy(plantClass, PN("n_getEntity").c_str(), 0);
         void* getData = FindMethodInHierarchy(plantClass, PN("n_getComponentData").c_str(), 0);
@@ -2192,50 +2008,34 @@ static void PickAllOwnedMaturePlantsOnUnityThread(
         void* protocol = _monoClassFromName(imgData, protocolNamespace.c_str(), protocolClass.c_str());
         void* mature = protocol ? FindMethodInHierarchy(protocol, PN("n_tryGetMatureTime").c_str(), 3) : nullptr;
         void* pick = protocol ? FindMethodInHierarchy(protocol, PN("n_pickPlant").c_str(), 1) : nullptr;
-        if (!getEntity || !getData || !furnitureField || !getOwnerId || !mature || !pick) {
-            SMPlatform::SetBreadcrumbLight("pickall:no-method");
-            return;
-        }
-        // 协议管理层若是实例方法，mono 上必须给单例实例（拿不到就让 SmFarmInvoke 跳过）。
-        void* protocolInst = (SmFarmMethodIsStatic(mature) && SmFarmMethodIsStatic(pick))
-                                 ? nullptr : SmFarmResolveSingleton(protocol);
-        SMPlatform::SetBreadcrumbLight(protocolInst ? "pickall:proto-inst" : "pickall:proto-static");
+        if (!getEntity || !getData || !furnitureField || !getOwnerId || !mature || !pick) return;
 
-        int length = 0;
-        uint8_t *data = nullptr;
-        // mono 数组不能按 il2cpp 的 0x18/0x20 读（长度会变成天文数字 → 越界崩）。
-        if (!SmFarmDictEntries(dictionary, entries, &length, &data)) {
-            SMPlatform::SetBreadcrumbLight("pickall:badlen");
-            return;
-        }
-        constexpr int stride = SZ_DICT_ENTRY;
-        SMPlatform::SetBreadcrumbLight("pickall:loop:" + std::to_string(length));
-        int pickedCount = 0;
+        const uintptr_t addr = (uintptr_t)entries;
+        const int length = SafeRead<int>(addr + OFF_ARR_COUNT, 0);
+        if (length <= 0 || length > 200000) return;
+        const uintptr_t data = addr + OFF_ARR_DATA;
+        constexpr int stride = 24;
         for (int i = 0; i < length; ++i) {
-            const uintptr_t entry = (uintptr_t)data + (uintptr_t)i * stride;
+            const uintptr_t entry = data + (uintptr_t)i * stride;
             if (SafeRead<int>(entry, -1) < 0) continue;
             void* plant = SafeRead<void*>(entry + OFF_ENTRY_VALUE, nullptr);
             if (!plant) continue;
             exc = nullptr;
-            void* entity = SmFarmInvoke(getEntity, plant, nullptr, &exc);
+            void* entity = _monoRuntimeInvoke(getEntity, plant, nullptr, &exc);
             if (!entity || exc) continue;
             void* netMethod = FindMethodInHierarchy(_monoObjectGetClass(entity), PN("n_getNetId").c_str(), 0);
-            void* netObj = netMethod ? SmFarmInvoke(netMethod, entity, nullptr, &exc) : nullptr;
+            void* netObj = netMethod ? _monoRuntimeInvoke(netMethod, entity, nullptr, &exc) : nullptr;
             if (!netObj || exc) continue;
-            void* netRaw = SmFarmUnbox(netObj);
-            if (!netRaw) continue;
-            uint32_t netId = *(uint32_t*)netRaw;
+            uint32_t netId = *(uint32_t*)_monoObjectUnbox(netObj);
             if (!netId) continue;
             void* furniture = nullptr;
             _monoFieldGetValue(plant, furnitureField, &furniture);
             if (!furniture) continue;
             exc = nullptr;
-            void* plantOwnerObj = SmFarmInvoke(getOwnerId, furniture, nullptr, &exc);
-            if (!plantOwnerObj || exc) continue;
-            void* ownerRaw = SmFarmUnbox(plantOwnerObj);
-            if (!ownerRaw || *(uint32_t*)ownerRaw != selfId) continue;
+            void* plantOwnerObj = _monoRuntimeInvoke(getOwnerId, furniture, nullptr, &exc);
+            if (!plantOwnerObj || exc || *(uint32_t*)_monoObjectUnbox(plantOwnerObj) != selfId) continue;
             exc = nullptr;
-            void* dataObj = SmFarmInvoke(getData, plant, nullptr, &exc);
+            void* dataObj = _monoRuntimeInvoke(getData, plant, nullptr, &exc);
             if (!dataObj || exc) continue;
             void* dataClass = _monoObjectGetClass(dataObj);
             void* stageField = FindFieldInHierarchy(dataClass, PN("n_stage").c_str());
@@ -2248,51 +2048,18 @@ static void PickAllOwnedMaturePlantsOnUnityThread(
             float coldTime = 0.0f;
             void* matureArgs[] = {&netId, &matureMs, &coldTime};
             exc = nullptr;
-            // TryGetMatureTime/PickPlant 是协议管理层方法：mono 上实例方法必须给实例，
-            // 拿不到就跳过（SmFarmInvoke 内部拦截 nullptr this）。
-            void* matureObj = SmFarmInvoke(mature, protocolInst, matureArgs, &exc);
-            if (!matureObj || exc) continue;
-            void* matureRaw = SmFarmUnbox(matureObj);
-            if (!matureRaw || !*(uint8_t*)matureRaw) continue;
-            SMPlatform::SetBreadcrumbLight("pickall:pick:" + std::to_string(netId));
+            void* matureObj = _monoRuntimeInvoke(mature, nullptr, matureArgs, &exc);
+            if (!matureObj || exc || !*(uint8_t*)_monoObjectUnbox(matureObj)) continue;
             void* pickArgs[] = {&netId};
             exc = nullptr;
-            SmFarmInvoke(pick, protocolInst, pickArgs, &exc);
-            if (!exc) ++pickedCount;
+            _monoRuntimeInvoke(pick, nullptr, pickArgs, &exc);
         }
-        SMPlatform::SetBreadcrumbLight("pickall:done:" + std::to_string(pickedCount));
 
-        // 重新扫一遍菜盆（同上：已经在 Unity 线程，直接调）
-        ScanPotsNative();
-        ExecuteAutoHarvest();
+        RunOnUnityThreadSync([]() {
+            ScanPotsNative();
+            ExecuteAutoHarvest();
+        });
     } catch (...) {}
-}
-
-// 对外入口：worker 侧到这里为止。
-// ★ 本函数里没有任何 _mono* / SMMonoHot:: 调用，也不持有任何 mono 指针。
-// ★ 整段 mono 工作一次性封送到 Unity 线程执行；参数按值捕获，任务被放弃时
-//   也不会去碰一个已经返回的调用方栈帧。
-void PickAllOwnedMaturePlants(
-        const std::string& dllName,
-        const std::string& protocolNamespace,
-        const std::string& protocolClass,
-        const std::string& payloadRaw) {
-    SMPlatform::SetBreadcrumbLight("pickall:enter");
-    if (g_pickAllPlantsBusy.exchange(true, std::memory_order_acq_rel)) return;
-    auto ran = std::make_shared<std::atomic<bool>>(false);
-    RunOnUnityThreadSync([dllName, protocolNamespace, protocolClass, payloadRaw, ran]() {
-        ran->store(true, std::memory_order_release);
-        struct BusyReset {
-            ~BusyReset() { g_pickAllPlantsBusy.store(false, std::memory_order_release); }
-        } reset;
-        try {
-            PickAllOwnedMaturePlantsOnUnityThread(dllName, protocolNamespace, protocolClass, payloadRaw);
-        } catch (...) {}
-    });
-    if (!ran->load(std::memory_order_acquire)) {
-        // 任务没被启动（pump 未运行 / 已放弃）：别让 busy 标志卡死后续调用。
-        g_pickAllPlantsBusy.store(false, std::memory_order_release);
-    }
 }
 
 static inline std::string CookN(const char* k) {
@@ -5709,18 +5476,14 @@ void PatchGatherConfigNative() {
         void *gatherKlass = _monoObjectGetClass(gatherConfigInst);
 
         // Helper untuk memanipulasi Float langsung ke Offset Memori
-        //  ⚠️ mono_field_get_offset 对静态字段/装箱字段可能返回 -1，直接写
-        //     inst+(-1) 会踩到对象头前的内存 → 随机 SIGSEGV。这里只接受
-        //     看起来像"合法实例字段偏移"的值，其余一律跳过。
         auto setFloat = [&](const char *fName, float val) {
             void *field = _monoClassGetFieldFromName(gatherKlass, fName);
-            if (!field) return;
-            int offset = _monoFieldGetOffset(field);
-            if (offset < 0x10 || offset > 0x1000) return;
-            *(float *) ((uint8_t *) gatherConfigInst + offset) = val;
+            if (field) {
+                int offset = _monoFieldGetOffset(field);
+                *(float *) ((uint8_t *) gatherConfigInst + offset) = val;
+            }
         };
 
-        SMPlatform::SetBreadcrumbLight("farm:gather:write");
         // EKSEKUSI VACUUM MAGNET
         setFloat(OBFUSCATE("AutoCollectingDistance"), 999.0f);
         setFloat(OBFUSCATE("WaitingForCollectingTime"), 0.0f);
@@ -5963,11 +5726,7 @@ static uint64_t InstantFarmNowMs() {
 
 static bool InstantFarmMoveToSearchPoint(const std::string& dllName, const Vector3& point) {
     (void)dllName;
-    // AutoMoveTransferNative 现在会回报"这次传送到底发出去没有"：被安全跳过
-    // （实例方法缺 this / 方法不存在）或抛异常时返回 false，worker 不会在原地空转。
-    const bool moved = AutoMoveTransferNative(point);
-    if (!moved) SMPlatform::SetBreadcrumbLight("farm:tp-skip");
-    return moved;
+    return AutoMoveTransferNative(point);
 }
 
 static bool InstantFarmUsesAreaScanner(int resourceIndex) {
@@ -5990,957 +5749,697 @@ static std::vector<InstantFarmWaypoint> BuildResourceSearchPoints() {
     return points;
 }
 
-// ===========================================================================
-//  传送采集（Instant Farm）：主线程状态机
-// ---------------------------------------------------------------------------
-//  旧实现把整条采集流程塞进一个 detached worker 线程的常驻循环里：
-//    * 跨传送、跨 interruptibleWait 一直持有 mono 对象裸指针；
-//    * 一部分 mono 调用在 RunOnUnityThreadSync 之外（worker 线程直接开跑）；
-//    * 每轮循环排队多个 sync 任务，主线程继续跑。
-//  主线程继续跑时 mono 的 SGen（moving GC）会把对象搬走，worker 手上的裸指针
-//  立刻变成悬垂指针 → SIGSEGV。崩溃面包屑落在 farm:wait（等 streaming）之后
-//  的扫描段，正是这个原因。
-//
-//  新实现拆成两半：
-//    ① ExecuteInstantFarmThread()（worker 线程侧）：纯原子去重 + 把 dll / ns /
-//       class 这些**值类型**参数投递给状态机，随即返回。worker 里没有任何
-//       _mono* / SMMonoHot:: 调用，也不持有任何 mono 指针。
-//    ② SMInstantFarmTick()（Unity 主线程侧，由 SMRunUnityFramePump 每帧调用）：
-//       一次只推进一步（MOVE → WAIT → SCAN → COMMAND → NEXT），
-//       所有 mono 反射调用与对象使用都发生在**同一帧、同一个函数体**内；
-//       跨帧只保留 netId / resType / Vector3 这类值，下一帧按 netId 重新解析。
-// ===========================================================================
-
-// 一次扫描的结果：只装值类型（netId / dictionaryKey / Vector3 / int）。
-// 出参生命周期 = 当前帧；下一帧重新扫，不跨帧保存任何 mono 对象。
-struct InstantFarmScanResult {
-    std::vector<InstantFarmTarget> targets;
-    std::unordered_set<uint32_t> cooldownNetIds;
-    int scanned = 0;
-    int classified = 0;
-    int selectedActive = 0;
-    int selectedCooldown = 0;
-    int unknown = 0;
-    int incompatible = 0;
-    int notSelected = 0;
-    int coldReadFailed = 0;
-    int duplicate = 0;
-};
-
-enum class InstantFarmStage {
-    Idle = 0,
-    Cycle,
-    MoveWaypoint,
-    Wait,
-};
-
-static const char *InstantFarmStageName(InstantFarmStage stage) {
-    switch (stage) {
-        case InstantFarmStage::Idle:         return "idle";
-        case InstantFarmStage::Cycle:        return "cycle";
-        case InstantFarmStage::MoveWaypoint: return "move";
-        case InstantFarmStage::Wait:         return "wait";
-    }
-    return "?";
-}
-
-// 状态机状态：**只在 Unity 主线程读写**。里面没有一个 mono 指针。
-struct InstantFarmRunState {
-    InstantFarmStage stage = InstantFarmStage::Idle;
-    InstantFarmStage afterWait = InstantFarmStage::Cycle;
-    InstantFarmStage lastBreadcrumbStage = InstantFarmStage::Idle;
-    uint64_t generation = 0;
-    uint64_t deadlineMs = 0;
-    uint64_t lastScanMs = 0;
-    std::string dllName;
-    std::string nameSpace;
-    std::string className;
-    std::vector<InstantFarmWaypoint> searchPoints;
-    size_t searchPointIndex = 0;
-    size_t waypointNumber = 0;
-    InstantFarmWaypoint waypoint{};
-    std::vector<InstantFarmTarget> targetQueue;
-    size_t targetQueueIndex = 0;
-    uint32_t currentNetId = 0;
-    int currentAttempts = 0;
-    uint64_t currentStartedAt = 0;
-    bool currentTeleported = false;
-    std::unordered_set<uint32_t> failedAtWaypoint;
-    int consecutiveEmptyScans = 0;
-    bool mustMoveWaypoint = true;
-};
-
-static InstantFarmRunState g_instantFarmRun;
-
-// worker → Unity 线程的交接区：只有字符串与整数，没有 mono 指针，也没有 lambda。
-static std::mutex g_instantFarmArmMutex;
-static bool g_instantFarmArmPending = false;
-static uint64_t g_instantFarmArmGeneration = 0;
-static std::string g_instantFarmArmDll;
-static std::string g_instantFarmArmNs;
-static std::string g_instantFarmArmCls;
-
-// 相邻两次扫描的最小间隔：状态机每帧都推进，但扫描要按节奏来，
-// 否则主线程会被"每帧一遍实体字典 + 每实体若干次 mono 反射"拖住。
-static constexpr uint64_t kInstantFarmMinScanIntervalMs = 300;
-
-static void InstantFarmArmWait(InstantFarmRunState &run, InstantFarmStage after, int milliseconds) {
-    run.stage = InstantFarmStage::Wait;
-    run.afterWait = after;
-    run.deadlineMs = InstantFarmNowMs() + (uint64_t) (milliseconds < 0 ? 0 : milliseconds);
-}
-
-static int InstantFarmCooldownMilliseconds(const std::atomic<float> &value) {
-    float seconds = value.load(std::memory_order_relaxed);
-    // 0.30s 下限：采集是"对服务器发指令"，不是本地循环。0.1s 那种节奏等于连点，
-    // 服务端开始判无效之后全是无效请求，也更容易被反作弊盯上。
-    if (seconds < 0.30f) seconds = 0.30f;
-    if (seconds > 5.0f) seconds = 5.0f;
-    return (int) (seconds * 1000.0f + 0.5f);
-}
-
-static const InstantFarmTarget *InstantFarmFindLive(const std::vector<InstantFarmTarget> &route,
-                                                    uint32_t netId) {
-    for (const auto &candidate : route) {
-        if (candidate.entityId == netId) return &candidate;
-    }
-    return nullptr;
-}
-
-// ---------------------------------------------------------------------------
-//  扫描：一次完整的世界实体遍历。
-//  入参全是值（字符串 / Vector3 / 尺寸），出参只有 netId 等值类型。
-//  函数体内的 mono 对象（CollectableComponent / Entity / LevelObject …）全部是
-//  局部变量，出函数即丢 —— 绝不返回给调用方保存。
-// ---------------------------------------------------------------------------
-static void InstantFarmScanOnUnityThread(const std::string &dllName, const std::string &nameSpace,
-                                         const std::string &className,
-                                         const InstantFarmWaypoint &waypoint,
-                                         size_t waypointNumber, size_t waypointTotal,
-                                         InstantFarmScanResult &out) {
-    _monoThreadAttach(_monoGetRootDomain());
-    SMPlatform::SetBreadcrumbLight("farm:scan:img");
-    void *imgGameplay = _monoImageLoaded(dllName.c_str());
-    if (!imgGameplay) {
-        SMPlatform::SetBreadcrumbLight("farm:no-img");
-        return;
-    }
-
-    void *collectKlass = _monoClassFromName(imgGameplay, nameSpace.c_str(), className.c_str());
-    if (!collectKlass) {
-        SMPlatform::SetBreadcrumbLight("farm:no-class");
-        return;
-    }
-
-    SMPlatform::SetBreadcrumbLight("farm:world");
-    void *imgData = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol"));
-    void *worldKlass = imgData ? _monoClassFromName(imgData, OBFUSCATE("XDTGame.GAS.Client"),
-                                                    OBFUSCATE("EntityWorld")) : nullptr;
-    if (!worldKlass && imgData) worldKlass = _monoClassFromName(
-            imgData, OBFUSCATE("XDTLevelAndEntity.Core.World"), OBFUSCATE("EntityWorld"));
-    if (!worldKlass) worldKlass = _monoClassFromName(
-            imgGameplay, OBFUSCATE("XDTLevelAndEntity.Core.World"), OBFUSCATE("EntityWorld"));
-    if (!worldKlass) {
-        SMPlatform::SetBreadcrumbLight("farm:no-world");
-        return;
-    }
-
-    // mono 上 GetComponentSystem<T>()：膨胀 → compile → 实例判定 → 单例。
-    // 旧代码直接 _monoRuntimeInvoke(closed, nullptr, ...)，实例方法传 nullptr
-    // 当 this ⇒ 第一次扫描就 SIGSEGV（"点传送采集就闪退"的根因之一）。
-    SMPlatform::SetBreadcrumbLight("farm:compsys");
-    void *sysObj = SmFarmGetComponentSystem(worldKlass, collectKlass, "farm");
-    if (!sysObj) return;
-
-    void *f_components = _monoClassGetFieldFromName(_monoObjectGetClass(sysObj), OBFUSCATE("_components"));
-    void *dictObj = nullptr;
-    if (!f_components) {
-        SMPlatform::SetBreadcrumbLight("farm:no-fcomp");
-        return;
-    }
-    _monoFieldGetValue(sysObj, f_components, &dictObj);
-    if (!dictObj) {
-        SMPlatform::SetBreadcrumbLight("farm:no-dict");
-        return;
-    }
-
-    void *dictKlass = _monoObjectGetClass(dictObj);
-    void *f_entries = _monoClassGetFieldFromName(dictKlass, OBFUSCATE("entries"));
-    if (!f_entries) f_entries = _monoClassGetFieldFromName(dictKlass, OBFUSCATE("_entries"));
-    if (!f_entries) {
-        SMPlatform::SetBreadcrumbLight("farm:no-entries-field");
-        return;
-    }
-
-    void *entriesArr = nullptr;
-    _monoFieldGetValue(dictObj, f_entries, &entriesArr);
-    if (!entriesArr) {
-        SMPlatform::SetBreadcrumbLight("farm:no-entries");
-        return;
-    }
-
-    // Dictionary.entries：mono 数组必须走 mono_array_length/addr（旧代码用 il2cpp 的
-    // 0x18/0x20 固定偏移 → 长度变天文数字 → 越界读崩）。
-    int length = 0;
-    uint8_t *arrayStart = nullptr;
-    if (!SmFarmDictEntries(dictObj, entriesArr, &length, &arrayStart)) {
-        SMPlatform::SetBreadcrumbLight("farm:badlen");
-        return;
-    }
-    const int elemSize = SZ_DICT_ENTRY;
-    const int valueOffset = (int) OFF_ENTRY_VALUE;
-    SMPlatform::SetBreadcrumbLight("farm:entries:" + std::to_string(length));
-
-    void *m_getResType = FindMethodInHierarchy(collectKlass, OBFUSCATE("get_resType"), 0);
-    void *m_getInCold = FindMethodInHierarchy(collectKlass, OBFUSCATE("get_inCold"), 0);
-    void *m_getEntity = FindMethodInHierarchy(collectKlass, OBFUSCATE("get_entity"), 0);
-    void *entityKlass = imgData ? _monoClassFromName(imgData, OBFUSCATE("XDTGame.GAS.Client"),
-                                                     OBFUSCATE("Entity")) : nullptr;
-    if (!entityKlass && imgData) entityKlass = _monoClassFromName(
-            imgData, OBFUSCATE("XDTLevelAndEntity.Core.World"), OBFUSCATE("Entity"));
-    if (!entityKlass) entityKlass = _monoClassFromName(
-            imgGameplay, OBFUSCATE("XDTLevelAndEntity.Core.World"), OBFUSCATE("Entity"));
-    void *m_getPos = entityKlass ? FindMethodInHierarchy(entityKlass, OBFUSCATE("get_position"), 0) : nullptr;
-    void *m_getNetId = entityKlass ? FindMethodInHierarchy(entityKlass, OBFUSCATE("get_netId"), 0) : nullptr;
-    if (!m_getNetId && entityKlass) m_getNetId = FindMethodInHierarchy(entityKlass, OBFUSCATE("GetNetId"), 0);
-
-    const int activeWaypointResourceIndex = waypoint.resourceIndex;
-    const bool useAreaScanner = waypoint.useAreaScanner;
-    constexpr float kSpawnAreaRadius = 45.0f;
-    const float fixedCoordRadius = GetInstantFarmFixedRadius(activeWaypointResourceIndex);
-
-    // Jalur identity seperti helper referensi: entity -> LevelObject -> resourceID/label.
-    void *imgLevelIdentity = _monoImageLoaded(OBFUSCATE("XDTLevelAndEntity"));
-    if (!imgLevelIdentity) imgLevelIdentity = _monoImageLoaded(dllName.c_str());
-    void *entityHelperKlass = imgLevelIdentity
-        ? _monoClassFromName(imgLevelIdentity, OBFUSCATE("XDTLevelAndEntity.Utils"), OBFUSCATE("EntityHelper"))
-        : nullptr;
-    void *m_getLevelObject = entityHelperKlass
-        ? FindMethodInHierarchy(entityHelperKlass, OBFUSCATE("GetLevelObject"), 1)
-        : nullptr;
-
-    const char *collectIdGetterName = nullptr;
-    const char *entityIdGetterName = nullptr;
-    void *m_getCollectResourceId = FindFirstInstantFarmIdGetter(collectKlass, &collectIdGetterName);
-    void *m_getEntityResourceId = FindFirstInstantFarmIdGetter(entityKlass, &entityIdGetterName);
-    static std::mutex inspectLogMutex;
-    static std::unordered_set<uint64_t> inspectedEntities;
-    static std::unordered_map<int, int> resourceIdToIndex;
-
-    if (!m_getResType || !m_getInCold || !m_getEntity || !m_getPos) {
-        return;
-    }
-
-    int scannedCount = 0;
-    int classifiedCount = 0;
-    int selectedCount = 0;
-    std::unordered_set<uint32_t> queuedNetIds;
-    std::unordered_map<uint32_t, uint32_t> dictionaryKeyByNetId;
-    for (int i = 0; i < length; i++) {
-        int hash = *(int *) (arrayStart + (i * elemSize));
-        if (hash < 0) continue;
-
-        uint32_t entityId = *(uint32_t *) (arrayStart + (i * elemSize) + 8);
-        void *collectObj = *(void **) (arrayStart + (i * elemSize) + valueOffset);
-        if (entityId == 0 || !collectObj) continue;
-
-        void *resTypeObj = _monoRuntimeInvoke(m_getResType, collectObj, nullptr, nullptr);
-        if (!resTypeObj) continue;
-        // mono_object_unbox 对 null/错型返回 null：不判空直接解引用 = SIGSEGV。
-        void *resTypeRaw = SmFarmUnbox(resTypeObj);
-        if (!resTypeRaw) continue;
-        int resType = *(int *) resTypeRaw;
-
-        ++scannedCount;
-        void *entityObj = _monoRuntimeInvoke(m_getEntity, collectObj, nullptr, nullptr);
-        if (!entityObj) continue;
-
-        // Key Dictionary bukan selalu NetID protocol. Gunakan hanya getter
-        // get_netId/GetNetId yang semantik-nya pasti network ID; get_Id sengaja
-        // tidak dipakai karena dapat berupa local/config ID.
-        uint32_t actualNetId = 0;
-        if (m_getNetId) {
-            void *netExc = nullptr;
-            void *netObj = _monoRuntimeInvoke(m_getNetId, entityObj, nullptr, &netExc);
-            if (netObj && !netExc) {
-                void *netRaw = SmFarmUnbox(netObj);
-                if (netRaw) actualNetId = *(uint32_t *) netRaw;
-            }
-        }
-        const uint32_t commandEntityId = actualNetId != 0 ? actualNetId : entityId;
-        dictionaryKeyByNetId[commandEntityId] = entityId;
-
-        void *posObj = _monoRuntimeInvoke(m_getPos, entityObj, nullptr, nullptr);
-        if (!posObj) continue;
-
-        Vector3 pos{};
-        void *posRaw = SmFarmUnbox(posObj);
-        if (!posRaw) continue;
-        memcpy(&pos, posRaw, sizeof(Vector3));
-
-        int resourceId = 0;
-        const char *idSource = "NONE";
-        std::string identityText;
-        const char *identitySource = "NONE";
-        void *levelObject = nullptr;
-
-        // EntityHelper.GetLevelObject menerima ulong entity id pada build game ini。
-        // 这里以 static 方式调用；若热更层把它改成实例方法，SmFarmInvoke 会直接
-        // 返回 null（不会再送 nullptr this 进去崩）。
-        if (m_getLevelObject) {
-            uint64_t longEntityId = (uint64_t) entityId;
-            void *levelArgs[] = {&longEntityId};
-            void *levelExc = nullptr;
-            levelObject = SmFarmInvoke(m_getLevelObject, nullptr, levelArgs, &levelExc);
-            if (levelExc) levelObject = nullptr;
-        }
-
-        if (levelObject) {
-            void *levelKlass = _monoObjectGetClass(levelObject);
-            const char *levelGetterName = nullptr;
-            void *levelIdGetter = FindFirstInstantFarmIdGetter(levelKlass, &levelGetterName);
-            resourceId = InvokeInstantFarmIdGetter(levelIdGetter, levelObject);
-            if (resourceId != 0) idSource = levelGetterName ? levelGetterName : "LevelObject";
-            identityText = InstantFarmObjectText(levelObject);
-            if (!identityText.empty()) identitySource = "LevelObject.ToString";
-        }
-
-        if (resourceId == 0) {
-            resourceId = InvokeInstantFarmIdGetter(m_getCollectResourceId, collectObj);
-            if (resourceId != 0) idSource = collectIdGetterName ? collectIdGetterName : "Collectable";
-        }
-        if (resourceId == 0) {
-            resourceId = InvokeInstantFarmIdGetter(m_getEntityResourceId, entityObj);
-            if (resourceId != 0) idSource = entityIdGetterName ? entityIdGetterName : "Entity";
-        }
-        if (identityText.empty()) {
-            identityText = InstantFarmObjectText(collectObj);
-            if (!identityText.empty()) identitySource = "Collectable.ToString";
-        }
-
-        float nearestDistance = FLT_MAX;
-        const float waypointDistance = InstantFarmHorizontalDistance(pos, waypoint.position);
-        int resourceIndex = ClassifyInstantFarmIdentityText(identityText);
-        if (resourceIndex >= 0) {
-            identitySource = "managed-label/icon";
-            if (resourceId > 0) {
-                std::lock_guard<std::mutex> logLock(inspectLogMutex);
-                auto old = resourceIdToIndex.find(resourceId);
-                if (old == resourceIdToIndex.end()) {
-                    resourceIdToIndex[resourceId] = resourceIndex;
-                } else if (old->second != resourceIndex) {
-                    resourceIndex = -1; // Jangan panen identity yang bertentangan.
-                }
-            }
-        } else if (resourceId > 0) {
-            std::lock_guard<std::mutex> logLock(inspectLogMutex);
-            auto known = resourceIdToIndex.find(resourceId);
-            if (known != resourceIdToIndex.end()) {
-                resourceIndex = known->second;
-                identitySource = "resourceID-cache";
-            }
-        }
-
-        // Bootstrap presisi memakai anchor lama bila tersedia.
-        if (resourceIndex < 0) {
-            const int positionIndex = ClassifyInstantFarmResource(pos, resType, &nearestDistance);
-            if (positionIndex >= 0) {
-                resourceIndex = positionIndex;
-                identitySource = "position-bootstrap";
-                if (resourceId > 0) {
-                    std::lock_guard<std::mutex> logLock(inspectLogMutex);
-                    auto old = resourceIdToIndex.find(resourceId);
-                    if (old == resourceIdToIndex.end()) resourceIdToIndex[resourceId] = resourceIndex;
-                    else if (old->second != resourceIndex) resourceIndex = -1;
-                }
-            }
-        }
-
-        // Hanya Oyster sampai Mustard Greens yang memakai fallback area.
-        if (resourceIndex < 0 && useAreaScanner &&
-            activeWaypointResourceIndex >= 0 &&
-            waypointDistance <= kSpawnAreaRadius &&
-            IsInstantFarmTypeCompatible(activeWaypointResourceIndex, resType)) {
-            resourceIndex = activeWaypointResourceIndex;
-            identitySource = "waypoint-area";
-        }
-
-        // Untuk waypoint FIXED, gunakan fallback lokal yang tetap terkunci pada resource
-        // aktif. Radius pohon/ore lebih besar karena koordinat teleport adalah posisi
-        // karakter, bukan selalu pivot entity.
-        if (resourceIndex < 0 && !useAreaScanner &&
-            activeWaypointResourceIndex >= 0 &&
-            waypointDistance <= fixedCoordRadius &&
-            IsInstantFarmTypeCompatible(activeWaypointResourceIndex, resType)) {
-            resourceIndex = activeWaypointResourceIndex;
-            identitySource = "waypoint-fixed";
-        }
-
-        // Satu waypoint hanya boleh memanen resource pemiliknya.
-        const bool belongsToActiveWaypoint = resourceIndex == activeWaypointResourceIndex;
-        const bool insideWaypointRange = useAreaScanner
-            ? waypointDistance <= kSpawnAreaRadius
-            : waypointDistance <= fixedCoordRadius;
-        const bool indexValid = resourceIndex >= 0 && resourceIndex < NUM_RESOURCES;
-        if (indexValid) ++classifiedCount;
-        else ++out.unknown;
-
-        const bool typeCompatible = indexValid && IsInstantFarmTypeCompatible(resourceIndex, resType);
-        const bool checkboxSelected = indexValid && g_farmSelections[resourceIndex];
-        const char *classifiedName = indexValid ? farmNames[resourceIndex] : "UNKNOWN";
-        const char *iconKey = indexValid ? GetInstantFarmIconSpriteKey(resourceIndex) : "";
-        // iconKey adalah mapping lokal dari hasil classified, bukan metadata independen
-        // dari entity. Round-trip ini hanya mendeteksi mapping yang tidak konsisten;
-        // identitas utama tetap classifier + resType + area.
-        const bool iconMapped = iconKey && *iconKey;
-        const bool iconConsistent = !iconMapped || ClassifyInstantFarmIdentityText(iconKey) == resourceIndex;
-
-        bool coldReadOk = false;
-        bool inCold = false;
-        void *coldExc = nullptr;
-        void *inColdObj = _monoRuntimeInvoke(m_getInCold, collectObj, nullptr, &coldExc);
-        if (inColdObj && !coldExc) {
-            void *coldRaw = SmFarmUnbox(inColdObj);
-            if (coldRaw) {
-                inCold = *(uint8_t *) coldRaw != 0;
-                coldReadOk = true;
-            }
-        }
-
-        const char *rejectReason = "ACTIVE_QUEUE";
-        if (!indexValid) {
-            rejectReason = "UNKNOWN_CLASSIFICATION";
-        } else if (!iconConsistent) {
-            rejectReason = "ICON_CLASS_MISMATCH";
-            ++out.incompatible;
-        } else if (!belongsToActiveWaypoint) {
-            rejectReason = "OTHER_WAYPOINT_RESOURCE";
-            ++out.notSelected;
-        } else if (!insideWaypointRange) {
-            rejectReason = useAreaScanner ? "OUTSIDE_AREA_RADIUS" : "OUTSIDE_FIXED_RADIUS";
-            ++out.notSelected;
-        } else if (!typeCompatible) {
-            rejectReason = "INCOMPATIBLE_RESTYPE";
-            ++out.incompatible;
-        } else if (!checkboxSelected) {
-            rejectReason = "CHECKBOX_NOT_SELECTED";
-            ++out.notSelected;
-        } else if (!coldReadOk) {
-            rejectReason = "COLD_READ_FAILED";
-            ++out.coldReadFailed;
-        } else if (inCold) {
-            rejectReason = "COOLDOWN";
-        }
-
-        // Log per-entity hanya untuk kategori yang dipilih agar file tidak dipenuhi
-        // ratusan entity dunia yang tidak relevan.
-        const uint64_t inspectKey = (uint64_t(entityId) << 16) ^ uint64_t(uint32_t(resType));
-        bool shouldLog = false;
-        if (indexValid && checkboxSelected) {
-            std::lock_guard<std::mutex> logLock(inspectLogMutex);
-            shouldLog = inspectedEntities.insert(inspectKey).second;
-        }
-        if (shouldLog) {
-            LOGI("[InstantFarm] CANDIDATE netId=%u resource='%s' iconKey='%s' source='%s' "
-                 "resType=%d distance=%.2f inCold=%d decision=%s.\n",
-                 commandEntityId, classifiedName, iconKey, identitySource,
-                 resType, waypointDistance, inCold ? 1 : 0, rejectReason);
-        }
-        (void) idSource;
-
-        if (!indexValid || !iconConsistent || !belongsToActiveWaypoint ||
-            !insideWaypointRange || !typeCompatible || !checkboxSelected || !coldReadOk)
-            continue;
-
-        if (inCold) {
-            out.cooldownNetIds.insert(commandEntityId);
-            ++out.selectedCooldown;
-            continue;
-        }
-
-        if (!queuedNetIds.insert(commandEntityId).second) {
-            ++out.duplicate;
-            continue;
-        }
-
-        InstantFarmTarget target;
-        target.entityId = commandEntityId;
-        target.dictionaryKey = entityId;
-        target.position = pos;
-        target.resType = resType;
-        target.resourceId = resourceId;
-        target.resourceIndex = resourceIndex;
-        out.targets.push_back(target);
-        ++selectedCount;
-        ++out.selectedActive;
-    }
-    static int scanSerial = 0;
-    static int lastScanned = -1;
-    static int lastClassified = -1;
-    static int lastSelected = -1;
-    ++scanSerial;
-    out.scanned = scannedCount;
-    out.classified = classifiedCount;
-    if (scannedCount != lastScanned || classifiedCount != lastClassified ||
-        selectedCount != lastSelected || (scanSerial % 10) == 0) {
-        lastScanned = scannedCount;
-        lastClassified = classifiedCount;
-        lastSelected = selectedCount;
-        LOGI("[InstantFarm] SCAN waypoint=%zu/%zu scanned=%d classified=%d active=%d cooldown=%d "
-             "unknown=%d incompatible=%d notSelected=%d coldReadFailed=%d duplicate=%d queueSnapshot=%zu.\n",
-             waypointNumber, waypointTotal, out.scanned, out.classified, out.selectedActive,
-             out.selectedCooldown, out.unknown, out.incompatible, out.notSelected,
-             out.coldReadFailed, out.duplicate, out.targets.size());
-    }
-}
-
-// ---------------------------------------------------------------------------
-//  发一条采集指令。同样的原则：所有 mono 对象都是本函数的局部变量，出函数即丢。
-//  ⚠️ 旧版本把 ResourceProtocolManager 的实例缓存在 static（cachedProtocolInst）
-//  里跨帧复用 —— 那是 GC 堆上的对象，SGen 移动后就是悬垂 this，正是本功能
-//  "扫描一切正常、发指令随机 SIGSEGV" 的来源。现在每帧重新解析实例，不缓存。
-//  （MonoClass* / MethodInfo* 不走 GC 堆，跨帧缓存是安全的，继续缓存。）
-// ---------------------------------------------------------------------------
-static bool InstantFarmSendCommandOnce(const InstantFarmTarget &target, int attemptsBefore) {
-    SMPlatform::SetBreadcrumbLight("farm:cmd:resolve");
-    static void *cachedProtocolKlass = nullptr;
-    static void *cachedPickBush = nullptr;
-    static void *cachedHitStone = nullptr;
-    static void *cachedAttackTree = nullptr;
-    if (!cachedProtocolKlass || !cachedPickBush || !cachedHitStone || !cachedAttackTree) {
-        void *imgProtocol = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol"));
-        if (!imgProtocol) imgProtocol = _monoImageLoaded(OBFUSCATE("Assembly-CSharp"));
-        if (!imgProtocol) {
-            SMPlatform::SetBreadcrumbLight("farm:cmd:no-img");
-            return false;
-        }
-        cachedProtocolKlass = _monoClassFromName(
-            imgProtocol, OBFUSCATE("XDTDataAndProtocol.ProtocolService.Resource"),
-            OBFUSCATE("ResourceProtocolManager"));
-        if (!cachedProtocolKlass) {
-            SMPlatform::SetBreadcrumbLight("farm:cmd:no-class");
-            return false;
-        }
-        cachedPickBush = FindMethodInHierarchy(cachedProtocolKlass, OBFUSCATE("SendPickBushCommand"), 1);
-        cachedHitStone = FindMethodInHierarchy(cachedProtocolKlass, OBFUSCATE("SendHitStoneCommand"), 2);
-        cachedAttackTree = FindMethodInHierarchy(cachedProtocolKlass, OBFUSCATE("SendAttackTreeCommand"), 2);
-    }
-    void *protocolKlass = cachedProtocolKlass;
-    void *sendPickBush = cachedPickBush;
-    void *sendHitStone = cachedHitStone;
-    void *sendAttackTree = cachedAttackTree;
-
-    // Send*Command 在 Android(il2cpp) 上一律按静态调用，mono 侧若被编译成实例方法，
-    // 传 nullptr this 会直接 SIGSEGV。这里按需取单例：只有真的存在实例方法时
-    // 才去找 ResourceProtocolManager 的 Instance，且**只在本次调用内有效**。
-    const bool needProtocolInst =
-        (sendPickBush && !SmFarmMethodIsStatic(sendPickBush)) ||
-        (sendHitStone && !SmFarmMethodIsStatic(sendHitStone)) ||
-        (sendAttackTree && !SmFarmMethodIsStatic(sendAttackTree));
-    void *protocolInst = nullptr;
-    if (needProtocolInst) {
-        protocolInst = SmFarmResolveSingleton(protocolKlass);
-        if (!protocolInst) {
-            SMPlatform::SetBreadcrumbLight("farm:cmd:no-inst");
-            return false;   // 实例方法拿不到实例：宁可不发，也不能崩
-        }
-    }
-
-    // Khusus Mandarin: sebagian CollectableComponent memakai key dictionary sebagai ID
-    // command, bukan Entity.get_netId(). NetID utama tetap dicoba dahulu; fallback baru
-    // aktif setelah tiga hit tidak pernah mengubah target menjadi cooldown.
-    const bool mandarinTarget = target.resourceIndex == 2;
-    const bool useDictionaryId = mandarinTarget && attemptsBefore >= 3 &&
-        target.dictionaryKey != 0 && target.dictionaryKey != target.entityId;
-    uint32_t netId = useDictionaryId ? target.dictionaryKey : target.entityId;
-    uint8_t isCombo = 0;
-    void *commandExc = nullptr;
-    const bool underwater = target.resourceIndex >= 14 && target.resourceIndex <= 16;
-    if (mandarinTarget) {
-        // Identitas resource lebih dapat dipercaya daripada resType pada Mandarin
-        // Android; beberapa spawn melaporkannya sebagai type 10.
-        if (!sendAttackTree) return false;
-        SMPlatform::SetBreadcrumbLight("farm:cmd:tree");
-        void *args[] = {&netId, &isCombo};
-        SmFarmInvoke(sendAttackTree, protocolInst, args, &commandExc);
-    } else if (underwater || target.resType == 3 || target.resType == 10) {
-        if (!sendPickBush) return false;
-        SMPlatform::SetBreadcrumbLight("farm:cmd:bush");
-        void *args[] = {&netId};
-        SmFarmInvoke(sendPickBush, protocolInst, args, &commandExc);
-    } else if (target.resType == 1) {
-        if (!sendAttackTree) return false;
-        SMPlatform::SetBreadcrumbLight("farm:cmd:tree");
-        void *args[] = {&netId, &isCombo};
-        SmFarmInvoke(sendAttackTree, protocolInst, args, &commandExc);
-    } else if (target.resType == 2 || target.resType == 9) {
-        if (!sendHitStone) return false;
-        SMPlatform::SetBreadcrumbLight("farm:cmd:stone");
-        void *args[] = {&netId, &isCombo};
-        SmFarmInvoke(sendHitStone, protocolInst, args, &commandExc);
-    } else {
-        return false;
-    }
-    const bool commandOk = commandExc == nullptr;
-    SMPlatform::SetBreadcrumbLight(commandOk ? "farm:cmd:ok" : "farm:cmd:exc");
-    return commandOk;
-}
-
-// ---------------------------------------------------------------------------
-//  推进一个状态。整段都在 Unity 线程且在同一帧内完成：
-//  这里出现过的每一个 mono 对象都随本函数返回而失效，不会留到下一帧。
-// ---------------------------------------------------------------------------
-static void InstantFarmAdvance() {
-    InstantFarmRunState &run = g_instantFarmRun;
-
-    if (run.stage == InstantFarmStage::MoveWaypoint) {
-        if (run.searchPoints.empty()) {
-            InstantFarmArmWait(run, InstantFarmStage::MoveWaypoint, 1000);
-            return;
-        }
-        if (run.searchPointIndex >= run.searchPoints.size()) run.searchPointIndex = 0;
-        run.waypointNumber = run.searchPointIndex + 1;
-        run.waypoint = run.searchPoints[run.searchPointIndex++];
-        SMPlatform::SetBreadcrumbLight("farm:move:" + std::to_string(run.waypointNumber) +
-                                       "/" + std::to_string(run.searchPoints.size()));
-        LOGI("[InstantFarm] WAYPOINT move %zu/%zu resource='%s' mode=%s pos=(%.2f, %.2f, %.2f).\n",
-             run.waypointNumber, run.searchPoints.size(),
-             (run.waypoint.resourceIndex >= 0 && run.waypoint.resourceIndex < NUM_RESOURCES)
-                 ? farmNames[run.waypoint.resourceIndex] : "UNKNOWN",
-             run.waypoint.useAreaScanner ? "AREA_SCAN" : "FIXED",
-             run.waypoint.position.x, run.waypoint.position.y, run.waypoint.position.z);
-        // AutoMoveTransferNative 会回报"这次传送到底发出去没有"：被安全跳过（实例方法
-        // 缺 this / 方法不存在）或抛异常时返回 false，状态机不会在原地空转。
-        if (!InstantFarmMoveToSearchPoint(run.dllName, run.waypoint.position)) {
-            SMPlatform::SetBreadcrumbLight("farm:move-fail");
-            LOGI("[InstantFarm] WAYPOINT move FAILED %zu/%zu.\n",
-                 run.waypointNumber, run.searchPoints.size());
-            InstantFarmArmWait(run, InstantFarmStage::MoveWaypoint, 1000);
-            return;
-        }
-
-        run.targetQueue.clear();
-        run.targetQueueIndex = 0;
-        run.currentNetId = 0;
-        run.currentAttempts = 0;
-        run.currentStartedAt = 0;
-        run.currentTeleported = false;
-        run.failedAtWaypoint.clear();
-        run.consecutiveEmptyScans = 0;
-        run.mustMoveWaypoint = false;
-        run.lastScanMs = 0;
-
-        // Tunggu streaming area/component system， tetapi STOP tetap responsif
-        // （Wait 阶段每帧只看表，不碰 mono；STOP/换代在 tick 入口就丢弃状态机）。
-        SMPlatform::SetBreadcrumbLight("farm:wait");
-        InstantFarmArmWait(run, InstantFarmStage::Cycle, 2500);
-        return;
-    }
-
-    if (run.stage != InstantFarmStage::Cycle) return;
-
-    if (run.searchPoints.empty()) {
-        InstantFarmArmWait(run, InstantFarmStage::Cycle, 1000);
-        return;
-    }
-    if (run.mustMoveWaypoint) {
-        run.stage = InstantFarmStage::MoveWaypoint;
-        return;
-    }
-
-    // ---- SCAN：一次完整扫描（mono 全部在本帧内用完就丢）----
-    run.lastScanMs = InstantFarmNowMs();
-    InstantFarmScanResult scan;
-    InstantFarmScanOnUnityThread(run.dllName, run.nameSpace, run.className, run.waypoint,
-                                 run.waypointNumber, run.searchPoints.size(), scan);
-    SMPlatform::SetBreadcrumbLight("farm:scan:" + std::to_string(scan.scanned) + "/" +
-                                   std::to_string(scan.targets.size()));
-
-    // Scanner hanya memasukkan target terpilih yang get_inCold() == false. Entity
-    // cooldown dengan demikian tidak pernah masuk antrean.
-    // Setiap scan (termasuk scan setelah teleport) digabungkan ke antrean pending.
-    // NetID yang sedang diproses, sudah pending, atau gagal pada waypoint ini tidak
-    // dimasukkan dua kali.
-    std::unordered_set<uint32_t> pendingNetIds;
-    if (run.currentNetId != 0) pendingNetIds.insert(run.currentNetId);
-    for (size_t i = run.targetQueueIndex; i < run.targetQueue.size(); ++i)
-        pendingNetIds.insert(run.targetQueue[i].entityId);
-
-    size_t newlyQueued = 0;
-    for (const auto &candidate : scan.targets) {
-        if (run.failedAtWaypoint.count(candidate.entityId)) continue;
-        if (!pendingNetIds.insert(candidate.entityId).second) continue;
-        run.targetQueue.push_back(candidate);
-        ++newlyQueued;
-    }
-    if (newlyQueued > 0) {
-        LOGI("[InstantFarm] QUEUE MERGE added=%zu pending=%zu waypoint=%zu/%zu.\n",
-             newlyQueued, run.targetQueue.size() - run.targetQueueIndex,
-             run.waypointNumber, run.searchPoints.size());
-        run.consecutiveEmptyScans = 0;
-    }
-
-    // ---- 有当前目标：验证 → 传送 → 指令（全部同一帧）----
-    if (run.currentNetId != 0) {
-        const InstantFarmTarget *liveTarget = InstantFarmFindLive(scan.targets, run.currentNetId);
-        if (!liveTarget) {
-            const bool becameCooldown = scan.cooldownNetIds.count(run.currentNetId) != 0;
-            const int nextTargetWaitMs = InstantFarmCooldownMilliseconds(g_instantFarmNextTargetCooldown);
-            LOGI("[InstantFarm] TARGET DONE netId=%u reason=%s attempts=%d; nextTargetWait=%dms.\n",
-                 run.currentNetId, becameCooldown ? "COOLDOWN" : "MISSING",
-                 run.currentAttempts, nextTargetWaitMs);
-            run.currentNetId = 0;
-            run.currentAttempts = 0;
-            run.currentStartedAt = 0;
-            run.currentTeleported = false;
-            run.consecutiveEmptyScans = 0;
-            InstantFarmArmWait(run, InstantFarmStage::Cycle, nextTargetWaitMs);
-            return;
-        }
-
-        const uint64_t now = InstantFarmNowMs();
-        if (run.currentAttempts >= 20 ||
-            (run.currentStartedAt && now - run.currentStartedAt >= 15000ULL)) {
-            LOGI("[InstantFarm] TARGET TIMEOUT netId=%u attempts=%d elapsed=%llu; skip at this waypoint.\n",
-                 run.currentNetId, run.currentAttempts,
-                 (unsigned long long) (now - run.currentStartedAt));
-            run.failedAtWaypoint.insert(run.currentNetId);
-            run.currentNetId = 0;
-            run.currentAttempts = 0;
-            run.currentStartedAt = 0;
-            run.currentTeleported = false;
-            InstantFarmArmWait(run, InstantFarmStage::Cycle,
-                               InstantFarmCooldownMilliseconds(g_instantFarmNextTargetCooldown));
-            return;
-        }
-
-        if (!run.currentTeleported) {
-            SMPlatform::SetBreadcrumbLight("farm:tp:" + std::to_string(liveTarget->entityId));
-            LOGI("[InstantFarm] TARGET move netId=%u resource='%s' type=%d pos=(%.2f, %.2f, %.2f).\n",
-                 liveTarget->entityId,
-                 (liveTarget->resourceIndex >= 0 && liveTarget->resourceIndex < NUM_RESOURCES)
-                     ? farmNames[liveTarget->resourceIndex] : "UNKNOWN",
-                 liveTarget->resType,
-                 liveTarget->position.x, liveTarget->position.y, liveTarget->position.z);
-            if (!InstantFarmMoveToSearchPoint(run.dllName, liveTarget->position)) {
-                SMPlatform::SetBreadcrumbLight("farm:tp-fail");
-                LOGI("[InstantFarm] TARGET move FAILED netId=%u.\n", liveTarget->entityId);
-                ++run.currentAttempts;
-                InstantFarmArmWait(run, InstantFarmStage::Cycle, 500);
-                return;
-            }
-            run.currentTeleported = true;
-            // Entity dan NetID sudah diperoleh dari scan waypoint aktif, sehingga
-            // command dapat dikirim langsung setelah teleport.
-        }
-
-        SMPlatform::SetBreadcrumbLight("farm:hit:" + std::to_string(liveTarget->entityId));
-        const bool commandOk = InstantFarmSendCommandOnce(*liveTarget, run.currentAttempts);
-        ++run.currentAttempts;
-        const bool usedMandarinDictionaryId = liveTarget->resourceIndex == 2 &&
-            run.currentAttempts > 3 && liveTarget->dictionaryKey != 0 &&
-            liveTarget->dictionaryKey != liveTarget->entityId;
-        const uint32_t sentCommandId = usedMandarinDictionaryId
-            ? liveTarget->dictionaryKey : liveTarget->entityId;
-        LOGI("[InstantFarm] COMMAND targetNetId=%u sentId=%u idSource=%s attempt=%d ok=%d; verify by rescan.\n",
-             liveTarget->entityId, sentCommandId,
-             usedMandarinDictionaryId ? "dictionary-fallback" : "entity-netId",
-             run.currentAttempts, commandOk ? 1 : 0);
-        // Scan berikutnya menjadi bukti keberhasilan sebenarnya. Interval pengiriman
-        // command dibaca live dari slider Tab Game (下限 0.30s，见 InstantFarmCooldown*）。
-        InstantFarmArmWait(run, InstantFarmStage::Cycle,
-                           InstantFarmCooldownMilliseconds(g_instantFarmPickupCooldown));
-        return;
-    }
-
-    // ---- 无当前目标：从本帧扫描结果里取队列中的下一个 ----
-    while (run.targetQueueIndex < run.targetQueue.size()) {
-        const InstantFarmTarget queued = run.targetQueue[run.targetQueueIndex++];
-        if (run.failedAtWaypoint.count(queued.entityId)) continue;
-        if (!InstantFarmFindLive(scan.targets, queued.entityId)) continue;
-        run.currentNetId = queued.entityId;
-        LOGI("[InstantFarm] QUEUE NEXT netId=%u index=%zu/%zu.\n",
-             run.currentNetId, run.targetQueueIndex, run.targetQueue.size());
-        run.currentAttempts = 0;
-        run.currentStartedAt = InstantFarmNowMs();
-        run.currentTeleported = false;
-        break;
-    }
-    if (run.currentNetId != 0) return;   // 下一帧接着处理（扫描节流会限速）
-
-    // Semua entry pending sudah dikonsumsi atau tidak lagi aktif. Buang snapshot lama;
-    // scan berikutnya dapat memasukkan NetID baru kembali.
-    run.targetQueue.clear();
-    run.targetQueueIndex = 0;
-
-    // Dua rescan tanpa target aktif/pending sebelum pindah waypoint.
-    ++run.consecutiveEmptyScans;
-    SMPlatform::SetBreadcrumbLight("farm:empty:" + std::to_string(run.consecutiveEmptyScans));
-    LOGI("[InstantFarm] RESCAN EMPTY waypoint=%zu/%zu pass=%d/2 cooldownSeen=%d.\n",
-         run.waypointNumber, run.searchPoints.size(), run.consecutiveEmptyScans,
-         scan.selectedCooldown);
-    if (run.consecutiveEmptyScans >= 2) {
-        LOGI("[InstantFarm] WAYPOINT EXHAUSTED %zu/%zu; moving to next preset coordinate.\n",
-             run.waypointNumber, run.searchPoints.size());
-        SMPlatform::SetBreadcrumbLight("farm:wp-next");
-        run.mustMoveWaypoint = true;
-        run.consecutiveEmptyScans = 0;
-        run.stage = InstantFarmStage::MoveWaypoint;
-        return;
-    }
-    InstantFarmArmWait(run, InstantFarmStage::Cycle, 750);
-}
-
-// ---------------------------------------------------------------------------
-//  每帧由 SMRunUnityFramePump() 调用一次：推进传送采集状态机。
-//  不在 Unity 线程上的调用会被忽略（只有帧泵会调，防御性判断）。
-// ---------------------------------------------------------------------------
-void SMInstantFarmTick() {
-    if (std::this_thread::get_id() != g_unityThreadId.load()) return;
-
-    InstantFarmRunState &run = g_instantFarmRun;
-
-    // ---- ① 接手 worker 投递（worker 只给字符串，没有任何 mono 指针）----
-    bool armPending = false;
-    uint64_t armGeneration = 0;
-    std::string armDll, armNs, armCls;
-    {
-        std::lock_guard<std::mutex> lock(g_instantFarmArmMutex);
-        if (g_instantFarmArmPending) {
-            armPending = true;
-            armGeneration = g_instantFarmArmGeneration;
-            armDll = g_instantFarmArmDll;
-            armNs = g_instantFarmArmNs;
-            armCls = g_instantFarmArmCls;
-            g_instantFarmArmPending = false;
-            g_instantFarmArmDll.clear();
-            g_instantFarmArmNs.clear();
-            g_instantFarmArmCls.clear();
-        }
-    }
-    if (armPending) {
-        if (!g_instantFarmingActive ||
-            g_instantFarmGeneration.load(std::memory_order_acquire) != armGeneration) {
-            // 过期投递（STOP 之后才到 / 换代之前留下的）：丢弃即可。
-            // 不清空 g_instantFarmRun —— 那可能是另一代正在跑的状态机，
-            // 由下面的 ② 生命周期判定按 generation 决定是否丢弃。
-            SMPlatform::SetBreadcrumbLight("farm:arm-stale");
-        } else {
-            SMPlatform::SetBreadcrumbLight("farm:arm");
-            // PatchGatherConfigNative 内部也用 RunOnUnityThreadSync 封送；这里已经在
-            // Unity 线程上，自调用短路 → 直接就地执行。
-            PatchGatherConfigNative();
-            const std::vector<InstantFarmWaypoint> points = BuildResourceSearchPoints();
-            run = InstantFarmRunState{};
-            run.generation = armGeneration;
-            run.dllName = armDll;
-            run.nameSpace = armNs;
-            run.className = armCls;
-            run.searchPoints = points;
-            run.stage = InstantFarmStage::MoveWaypoint;
-            run.mustMoveWaypoint = true;
-            SMPlatform::SetBreadcrumbLight("farm:wp:" + std::to_string(run.searchPoints.size()));
-            std::string selectedNames;
-            for (int i = 0; i < NUM_RESOURCES; ++i) {
-                if (!g_farmSelections[i]) continue;
-                if (!selectedNames.empty()) selectedNames += ",";
-                selectedNames += farmNames[i];
-            }
-            LOGI("[InstantFarm] ===== STATE MACHINE START generation=%llu =====\n",
-                 (unsigned long long) armGeneration);
-            LOGI("[InstantFarm] Selected='%s' waypoints=%zu.\n",
-                 selectedNames.c_str(), run.searchPoints.size());
-            if (run.searchPoints.empty()) SMPlatform::SetBreadcrumbLight("farm:no-wp");
-        }
-    }
-
-    if (run.stage == InstantFarmStage::Idle) return;
-
-    // ---- ② 生命周期：STOP / 换代 立刻丢弃状态机（无裸指针，直接清零）----
-    const uint64_t generation = g_instantFarmGeneration.load(std::memory_order_acquire);
-    if (!g_instantFarmingActive || generation == 0 || generation != run.generation) {
-        run = InstantFarmRunState{};
-        SMPlatform::SetBreadcrumbLight("farm:idle");
-        return;
-    }
-
-    // Auto Restore Tool 正在补耐久：整体暂停（旧版是 worker 里 sleep 300ms）。
-    if (g_toolRestoring.load(std::memory_order_relaxed)) return;
-
-    // ---- ③ 节奏门：Wait 阶段只看表，不做任何 mono 工作 ----
-    if (run.stage == InstantFarmStage::Wait) {
-        if (InstantFarmNowMs() < run.deadlineMs) return;
-        run.stage = run.afterWait;
-        run.afterWait = InstantFarmStage::Cycle;
-        if (run.stage != InstantFarmStage::Cycle) {
-            // 回到 MOVE 等阶段时也要刷新阶段打点
-            run.lastBreadcrumbStage = InstantFarmStage::Idle;
-        }
-    }
-
-    // 扫描节流：Cycle 阶段（且不需要传送）两次扫描之间至少隔 kInstantFarmMinScanIntervalMs。
-    if (run.stage == InstantFarmStage::Cycle && !run.mustMoveWaypoint &&
-        run.lastScanMs != 0 &&
-        InstantFarmNowMs() - run.lastScanMs < kInstantFarmMinScanIntervalMs) {
-        return;
-    }
-
-    const InstantFarmStage stage = run.stage;
-    if (stage != run.lastBreadcrumbStage) {
-        run.lastBreadcrumbStage = stage;
-        SMPlatform::SetBreadcrumbLight(std::string("farm:tick:") + InstantFarmStageName(stage));
-    }
-    SMPlatform::SetBreadcrumbLight("farm:sync-in");
-    InstantFarmAdvance();
-    SMPlatform::SetBreadcrumbLight("farm:sync-out");
-}
-
-// ---------------------------------------------------------------------------
-//  worker 侧入口：只做纯原子去重 + 值类型参数投递，然后立刻返回。
-//  ★ 本函数里没有任何 _mono* / SMMonoHot:: 调用，也不持有任何 mono 指针。
-//  ★ 所有 mono 工作由 SMInstantFarmTick() 在 Unity 线程上分帧推进。
-// ---------------------------------------------------------------------------
 void ExecuteInstantFarmThread(
-        std::string dllName, const std::string &nameSpace, const std::string &className) {
+        std::string dllName, const std::string& nameSpace, const std::string& className) {
     SMPlatform::SetBreadcrumbLight("farm:instant");
-    const uint64_t workerGeneration = g_instantFarmGeneration.load(std::memory_order_acquire);
-    if (!g_instantFarmingActive || workerGeneration == 0) return;
+        const uint64_t workerGeneration = g_instantFarmGeneration.load(std::memory_order_acquire);
+        if (!g_instantFarmingActive || workerGeneration == 0) return;
 
-    uint64_t expectedLease = g_instantFarmWorkerLease.load(std::memory_order_acquire);
-    while (expectedLease != workerGeneration) {
-        if (g_instantFarmGeneration.load(std::memory_order_acquire) != workerGeneration) return;
-        if (g_instantFarmWorkerLease.compare_exchange_weak(
-                expectedLease, workerGeneration, std::memory_order_acq_rel)) break;
-    }
-    if (expectedLease == workerGeneration) {
-        SMPlatform::SetBreadcrumbLight("farm:dup");
-        return; // Trigger duplikat untuk start yang sama.
-    }
-
-    if (dllName.length() >= 4 && dllName.substr(dllName.length() - 4) == ".dll") {
-        dllName = dllName.substr(0, dllName.length() - 4);
-    }
-
-    // 投递值类型参数给主线程状态机。这里**不**解析任何 mono 元数据：
-    // mono 侧一切都推迟到 SMInstantFarmTick() 的同一帧内完成。
-    //
-    // 单调守卫：START→STOP→START 这种快速连按时，旧 generation 的 worker 可能比
-    // 新 generation 的 worker 后一步才走到这里。若让它覆盖新请求，新的一轮就会
-    // 因为 generation 不匹配被判成 stale，功能表现为"点了没反应"。
-    {
-        std::lock_guard<std::mutex> lock(g_instantFarmArmMutex);
-        if (!g_instantFarmArmPending || workerGeneration >= g_instantFarmArmGeneration) {
-            g_instantFarmArmPending = true;
-            g_instantFarmArmGeneration = workerGeneration;
-            g_instantFarmArmDll = dllName;
-            g_instantFarmArmNs = nameSpace;
-            g_instantFarmArmCls = className;
+        uint64_t expectedLease = g_instantFarmWorkerLease.load(std::memory_order_acquire);
+        while (expectedLease != workerGeneration) {
+            if (g_instantFarmGeneration.load(std::memory_order_acquire) != workerGeneration) return;
+            if (g_instantFarmWorkerLease.compare_exchange_weak(
+                    expectedLease, workerGeneration, std::memory_order_acq_rel)) break;
         }
+        if (expectedLease == workerGeneration) return; // Trigger duplikat untuk start yang sama.
+
+        const auto workerActive = [&]() {
+            return g_instantFarmingActive &&
+                g_instantFarmGeneration.load(std::memory_order_acquire) == workerGeneration;
+        };
+
+        if (dllName.length() >= 4 && dllName.substr(dllName.length() - 4) == ".dll") {
+            dllName = dllName.substr(0, dllName.length() - 4);
+        }
+        PatchGatherConfigNative();
+
+        std::string selectedNames;
+        for (int i = 0; i < NUM_RESOURCES; ++i) {
+            if (!g_farmSelections[i]) continue;
+            if (!selectedNames.empty()) selectedNames += ",";
+            selectedNames += farmNames[i];
+        }
+        // BuildInstantFarmSearchPoints mempertahankan urutan kategori (Opsi A):
+        // seluruh waypoint kategori terpilih pertama, lalu kategori berikutnya.
+        const std::vector<InstantFarmWaypoint> searchPoints = BuildResourceSearchPoints();
+        size_t searchPointIndex = 0;
+        size_t currentWaypointNumber = 0;
+        InstantFarmWaypoint currentWaypoint{};
+        int consecutiveEmptyScans = 0;
+        bool mustMoveToWaypoint = true;
+
+        LOGI("[InstantFarm] ===== WORKER START generation=%llu =====\n",
+            (unsigned long long)workerGeneration);
+        LOGI("[InstantFarm] Selected='%s' waypoints=%zu.\n",
+            selectedNames.c_str(), searchPoints.size());
+
+        // Antrean hanya menyimpan snapshot ID/data sederhana. Pointer Mono tidak
+        // disimpan karena entity dapat unload setelah teleport atau cooldown.
+        std::vector<InstantFarmTarget> targetQueue;
+        size_t targetQueueIndex = 0;
+        uint32_t currentTargetNetId = 0;
+        int currentTargetAttempts = 0;
+        uint64_t currentTargetStartedAt = 0;
+        bool currentTargetTeleported = false;
+        std::unordered_set<uint32_t> failedTargetsAtWaypoint;
+
+        auto interruptibleWait = [&](int milliseconds) {
+            for (int waited = 0; waited < milliseconds && workerActive(); waited += 50) {
+                if (g_toolRestoring) return false;
+                const int slice = (milliseconds - waited < 50) ? (milliseconds - waited) : 50;
+                usleep((useconds_t)slice * 1000u);
+            }
+            return workerActive() && !g_toolRestoring;
+        };
+        const auto cooldownMilliseconds = [](const std::atomic<float>& value) {
+            float seconds = value.load(std::memory_order_relaxed);
+            // 0.30s 下限：采集是"对服务器发指令"，不是本地循环。0.1s 那种节奏
+            // 等于连点，服务端开始判无效之后全是无效请求，也更容易被反作弊盯上。
+            if (seconds < 0.30f) seconds = 0.30f;
+            if (seconds > 5.0f) seconds = 5.0f;
+            return (int)(seconds * 1000.0f + 0.5f);
+        };
+
+        while (workerActive()) {
+            // JEDA saat Auto Restore Tool sedang mengisi durability. Lanjut lagi begitu tool FULL kembali.
+            if (g_toolRestoring) { usleep(300 * 1000u); continue; }
+
+            if (searchPoints.empty()) {
+                usleep(1000 * 1000u);
+                continue;
+            }
+
+            // Koordinat preset hanya menjadi titik pembuka streaming. Target panen
+            // selalu berasal dari hasil scan entity runtime setelah tiba di area.
+            if (mustMoveToWaypoint) {
+                if (searchPointIndex >= searchPoints.size()) searchPointIndex = 0;
+                currentWaypointNumber = searchPointIndex + 1;
+                currentWaypoint = searchPoints[searchPointIndex++];
+                LOGI("[InstantFarm] WAYPOINT move %zu/%zu resource='%s' mode=%s pos=(%.2f, %.2f, %.2f).\n",
+                    currentWaypointNumber, searchPoints.size(),
+                    (currentWaypoint.resourceIndex >= 0 && currentWaypoint.resourceIndex < NUM_RESOURCES)
+                        ? farmNames[currentWaypoint.resourceIndex] : "UNKNOWN",
+                    currentWaypoint.useAreaScanner ? "AREA_SCAN" : "FIXED",
+                    currentWaypoint.position.x, currentWaypoint.position.y, currentWaypoint.position.z);
+                if (!InstantFarmMoveToSearchPoint(dllName, currentWaypoint.position)) {
+                    LOGI("[InstantFarm] WAYPOINT move FAILED %zu/%zu.\n",
+                        currentWaypointNumber, searchPoints.size());
+                    usleep(1000 * 1000u);
+                    continue;
+                }
+
+                targetQueue.clear();
+                targetQueueIndex = 0;
+                currentTargetNetId = 0;
+                currentTargetAttempts = 0;
+                currentTargetStartedAt = 0;
+                currentTargetTeleported = false;
+                failedTargetsAtWaypoint.clear();
+                consecutiveEmptyScans = 0;
+                mustMoveToWaypoint = false;
+
+                // Tunggu streaming area/component system, tetapi STOP tetap responsif.
+                if (!interruptibleWait(2500)) continue;
+            }
+
+            std::vector<InstantFarmTarget> routeList;
+            std::unordered_set<uint32_t> cooldownNetIds;
+            int scanScanned = 0;
+            int scanClassified = 0;
+            int scanSelectedActive = 0;
+            int scanSelectedCooldown = 0;
+            int scanUnknown = 0;
+            int scanIncompatible = 0;
+            int scanNotSelected = 0;
+            int scanColdReadFailed = 0;
+            int scanDuplicate = 0;
+
+            RunOnUnityThreadSync([&]() {
+                _monoThreadAttach(_monoGetRootDomain());
+                void* imgGameplay = _monoImageLoaded(dllName.c_str());
+                if (!imgGameplay) return;
+
+                void* collectKlass = _monoClassFromName(imgGameplay, nameSpace.c_str(), className.c_str());
+                if (!collectKlass) return;
+                void* collectMonoType = _monoClassGetType(collectKlass);
+
+                void* imgData = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol"));
+                void* worldKlass = imgData ? _monoClassFromName(imgData, OBFUSCATE("XDTGame.GAS.Client"), OBFUSCATE("EntityWorld")) : nullptr;
+                if (!worldKlass && imgData) worldKlass = _monoClassFromName(imgData, OBFUSCATE("XDTLevelAndEntity.Core.World"), OBFUSCATE("EntityWorld"));
+                if (!worldKlass) worldKlass = _monoClassFromName(imgGameplay, OBFUSCATE("XDTLevelAndEntity.Core.World"), OBFUSCATE("EntityWorld"));
+                if (!worldKlass) return;
+                void* openMethod = FindMethodInHierarchy(worldKlass, OBFUSCATE("GetComponentSystem"), 0);
+                if (!openMethod) return;
+
+                void* typeArgs[] = { collectMonoType };
+                void* methodInst = _mono_metadata_get_generic_inst(1, typeArgs);
+                MonoGenericContext ctx = { nullptr, methodInst };
+                void* closedMethod = _mono_class_inflate_generic_method(openMethod, &ctx);
+
+                void* exc = nullptr;
+                void* sysObj = _monoRuntimeInvoke(closedMethod, nullptr, nullptr, &exc);
+                if (!sysObj || exc) return;
+
+                void* f_components = _monoClassGetFieldFromName(_monoObjectGetClass(sysObj), OBFUSCATE("_components"));
+                void* dictObj = nullptr;
+                _monoFieldGetValue(sysObj, f_components, &dictObj);
+                if (!dictObj) return;
+
+                void* dictKlass = _monoObjectGetClass(dictObj);
+                void* f_entries = _monoClassGetFieldFromName(dictKlass, OBFUSCATE("entries"));
+                if (!f_entries) f_entries = _monoClassGetFieldFromName(dictKlass, OBFUSCATE("_entries"));
+                if (!f_entries) return;
+
+                void* entriesArr = nullptr;
+                _monoFieldGetValue(dictObj, f_entries, &entriesArr);
+                if (!entriesArr) return;
+
+                uintptr_t arrAddr = (uintptr_t)entriesArr;
+                int length = *(int*)(arrAddr + 0x18);
+                uintptr_t arrayStart = arrAddr + 0x20;
+                int elemSize = 24;
+                int valueOffset = 16;
+
+                void* m_getResType = FindMethodInHierarchy(collectKlass, OBFUSCATE("get_resType"), 0);
+                void* m_getInCold = FindMethodInHierarchy(collectKlass, OBFUSCATE("get_inCold"), 0);
+                void* m_getEntity = FindMethodInHierarchy(collectKlass, OBFUSCATE("get_entity"), 0);
+                void* entityKlass = imgData ? _monoClassFromName(imgData, OBFUSCATE("XDTGame.GAS.Client"), OBFUSCATE("Entity")) : nullptr;
+                if (!entityKlass && imgData) entityKlass = _monoClassFromName(imgData, OBFUSCATE("XDTLevelAndEntity.Core.World"), OBFUSCATE("Entity"));
+                if (!entityKlass) entityKlass = _monoClassFromName(imgGameplay, OBFUSCATE("XDTLevelAndEntity.Core.World"), OBFUSCATE("Entity"));
+                void* m_getPos = entityKlass ? FindMethodInHierarchy(entityKlass, OBFUSCATE("get_position"), 0) : nullptr;
+                void* m_getNetId = entityKlass ? FindMethodInHierarchy(entityKlass, OBFUSCATE("get_netId"), 0) : nullptr;
+                if (!m_getNetId && entityKlass)
+                    m_getNetId = FindMethodInHierarchy(entityKlass, OBFUSCATE("GetNetId"), 0);
+                const int activeWaypointResourceIndex = currentWaypoint.resourceIndex;
+                const bool useAreaScanner = currentWaypoint.useAreaScanner;
+                constexpr float kSpawnAreaRadius = 45.0f;
+                const float fixedCoordRadius =
+                    GetInstantFarmFixedRadius(activeWaypointResourceIndex);
+
+                // Jalur identity seperti helper referensi: entity -> LevelObject -> resourceID/label.
+                void* imgLevelIdentity = _monoImageLoaded(OBFUSCATE("XDTLevelAndEntity"));
+                if (!imgLevelIdentity) imgLevelIdentity = _monoImageLoaded(dllName.c_str());
+                void* entityHelperKlass = imgLevelIdentity
+                    ? _monoClassFromName(imgLevelIdentity, OBFUSCATE("XDTLevelAndEntity.Utils"), OBFUSCATE("EntityHelper"))
+                    : nullptr;
+                void* m_getLevelObject = entityHelperKlass
+                    ? FindMethodInHierarchy(entityHelperKlass, OBFUSCATE("GetLevelObject"), 1)
+                    : nullptr;
+
+                const char* collectIdGetterName = nullptr;
+                const char* entityIdGetterName = nullptr;
+                void* m_getCollectResourceId = FindFirstInstantFarmIdGetter(collectKlass, &collectIdGetterName);
+                void* m_getEntityResourceId = FindFirstInstantFarmIdGetter(entityKlass, &entityIdGetterName);
+                static std::mutex inspectLogMutex;
+                static std::unordered_set<uint64_t> inspectedEntities;
+                static std::unordered_map<int, int> resourceIdToIndex;
+
+                if (!m_getResType || !m_getInCold || !m_getEntity || !m_getPos) {
+                    return;
+                }
+
+                int scannedCount = 0;
+                int classifiedCount = 0;
+                int selectedCount = 0;
+                std::unordered_set<uint32_t> queuedNetIds;
+                std::unordered_map<uint32_t, uint32_t> dictionaryKeyByNetId;
+                for (int i = 0; i < length; i++) {
+                    int hash = *(int*)(arrayStart + (i * elemSize));
+                    if (hash >= 0) {
+                        uint32_t entityId = *(uint32_t*)(arrayStart + (i * elemSize) + 8);
+                        void* collectObj = *(void**)(arrayStart + (i * elemSize) + valueOffset);
+
+                        if (entityId > 0 && collectObj) {
+                            void* resTypeObj = _monoRuntimeInvoke(m_getResType, collectObj, nullptr, nullptr);
+                            if (!resTypeObj) continue;
+                            int resType = *(int*)_monoObjectUnbox(resTypeObj);
+
+                            ++scannedCount;
+                            void* entityObj = _monoRuntimeInvoke(m_getEntity, collectObj, nullptr, nullptr);
+                            if (!entityObj) continue;
+
+                            // Key Dictionary bukan selalu NetID protocol. Gunakan hanya
+                            // getter get_netId/GetNetId yang semantik-nya pasti network ID;
+                            // get_Id sengaja tidak dipakai karena dapat berupa local/config ID.
+                            uint32_t actualNetId = 0;
+                            if (m_getNetId) {
+                                void* netExc = nullptr;
+                                void* netObj = _monoRuntimeInvoke(m_getNetId, entityObj, nullptr, &netExc);
+                                if (netObj && !netExc)
+                                    actualNetId = *(uint32_t*)_monoObjectUnbox(netObj);
+                            }
+                            const uint32_t commandEntityId = actualNetId != 0 ? actualNetId : entityId;
+                            dictionaryKeyByNetId[commandEntityId] = entityId;
+
+                            void* posObj = _monoRuntimeInvoke(m_getPos, entityObj, nullptr, nullptr);
+                            if (!posObj) continue;
+
+                            Vector3 pos{};
+                            memcpy(&pos, _monoObjectUnbox(posObj), sizeof(Vector3));
+
+                            int resourceId = 0;
+                            const char* idSource = "NONE";
+                            std::string identityText;
+                            const char* identitySource = "NONE";
+                            void* levelObject = nullptr;
+
+                            // EntityHelper.GetLevelObject menerima ulong entity id pada build game ini.
+                            if (m_getLevelObject) {
+                                uint64_t longEntityId = (uint64_t)entityId;
+                                void* levelArgs[] = { &longEntityId };
+                                void* levelExc = nullptr;
+                                levelObject = _monoRuntimeInvoke(m_getLevelObject, nullptr, levelArgs, &levelExc);
+                                if (levelExc) levelObject = nullptr;
+                            }
+
+                            if (levelObject) {
+                                void* levelKlass = _monoObjectGetClass(levelObject);
+                                const char* levelGetterName = nullptr;
+                                void* levelIdGetter = FindFirstInstantFarmIdGetter(levelKlass, &levelGetterName);
+                                resourceId = InvokeInstantFarmIdGetter(levelIdGetter, levelObject);
+                                if (resourceId != 0) idSource = levelGetterName ? levelGetterName : "LevelObject";
+                                identityText = InstantFarmObjectText(levelObject);
+                                if (!identityText.empty()) identitySource = "LevelObject.ToString";
+                            }
+
+                            if (resourceId == 0) {
+                                resourceId = InvokeInstantFarmIdGetter(m_getCollectResourceId, collectObj);
+                                if (resourceId != 0) idSource = collectIdGetterName ? collectIdGetterName : "Collectable";
+                            }
+                            if (resourceId == 0) {
+                                resourceId = InvokeInstantFarmIdGetter(m_getEntityResourceId, entityObj);
+                                if (resourceId != 0) idSource = entityIdGetterName ? entityIdGetterName : "Entity";
+                            }
+                            if (identityText.empty()) {
+                                identityText = InstantFarmObjectText(collectObj);
+                                if (!identityText.empty()) identitySource = "Collectable.ToString";
+                            }
+
+                            float nearestDistance = FLT_MAX;
+                            const float waypointDistance = InstantFarmHorizontalDistance(pos, currentWaypoint.position);
+                            int resourceIndex = ClassifyInstantFarmIdentityText(identityText);
+                            if (resourceIndex >= 0) {
+                                identitySource = "managed-label/icon";
+                                if (resourceId > 0) {
+                                    std::lock_guard<std::mutex> logLock(inspectLogMutex);
+                                    auto old = resourceIdToIndex.find(resourceId);
+                                    if (old == resourceIdToIndex.end()) {
+                                        resourceIdToIndex[resourceId] = resourceIndex;
+                                    }
+                                    else if (old->second != resourceIndex) {
+                                        resourceIndex = -1; // Jangan panen identity yang bertentangan.
+                                    }
+                                }
+                            }
+                            else if (resourceId > 0) {
+                                std::lock_guard<std::mutex> logLock(inspectLogMutex);
+                                auto known = resourceIdToIndex.find(resourceId);
+                                if (known != resourceIdToIndex.end()) {
+                                    resourceIndex = known->second;
+                                    identitySource = "resourceID-cache";
+                                }
+                            }
+
+                            // Bootstrap presisi memakai anchor lama bila tersedia.
+                            if (resourceIndex < 0) {
+                                const int positionIndex = ClassifyInstantFarmResource(pos, resType, &nearestDistance);
+                                if (positionIndex >= 0) {
+                                    resourceIndex = positionIndex;
+                                    identitySource = "position-bootstrap";
+                                    if (resourceId > 0) {
+                                        std::lock_guard<std::mutex> logLock(inspectLogMutex);
+                                        auto old = resourceIdToIndex.find(resourceId);
+                                        if (old == resourceIdToIndex.end()) resourceIdToIndex[resourceId] = resourceIndex;
+                                        else if (old->second != resourceIndex) resourceIndex = -1;
+                                    }
+                                }
+                            }
+
+                            // Hanya Oyster sampai Mustard Greens yang memakai fallback area.
+                            if (resourceIndex < 0 && useAreaScanner &&
+                                activeWaypointResourceIndex >= 0 &&
+                                waypointDistance <= kSpawnAreaRadius &&
+                                IsInstantFarmTypeCompatible(activeWaypointResourceIndex, resType)) {
+                                resourceIndex = activeWaypointResourceIndex;
+                                identitySource = "waypoint-area";
+                            }
+
+                            // Untuk waypoint FIXED, gunakan fallback lokal yang tetap terkunci
+                            // pada resource aktif. Radius pohon/ore lebih besar karena koordinat
+                            // teleport adalah posisi karakter, bukan selalu pivot entity.
+                            if (resourceIndex < 0 && !useAreaScanner &&
+                                activeWaypointResourceIndex >= 0 &&
+                                waypointDistance <= fixedCoordRadius &&
+                                IsInstantFarmTypeCompatible(activeWaypointResourceIndex, resType)) {
+                                resourceIndex = activeWaypointResourceIndex;
+                                identitySource = "waypoint-fixed";
+                            }
+
+                            // Satu waypoint hanya boleh memanen resource pemiliknya.
+                            const bool belongsToActiveWaypoint =
+                                resourceIndex == activeWaypointResourceIndex;
+                            const bool insideWaypointRange = useAreaScanner
+                                ? waypointDistance <= kSpawnAreaRadius
+                                : waypointDistance <= fixedCoordRadius;
+                            const bool indexValid = resourceIndex >= 0 &&
+                                resourceIndex < NUM_RESOURCES;
+                            if (indexValid) ++classifiedCount;
+                            else ++scanUnknown;
+
+                            const bool typeCompatible = indexValid &&
+                                IsInstantFarmTypeCompatible(resourceIndex, resType);
+                            const bool checkboxSelected = indexValid &&
+                                g_farmSelections[resourceIndex];
+                            const char* classifiedName = indexValid
+                                ? farmNames[resourceIndex] : "UNKNOWN";
+                            const char* iconKey = indexValid
+                                ? GetInstantFarmIconSpriteKey(resourceIndex) : "";
+                            // iconKey adalah mapping lokal dari hasil classified, bukan metadata
+                            // independen dari entity. Round-trip ini hanya mendeteksi mapping yang
+                            // tidak konsisten; identitas utama tetap classifier + resType + area.
+                            const bool iconMapped = iconKey && *iconKey;
+                            const bool iconConsistent = !iconMapped ||
+                                ClassifyInstantFarmIdentityText(iconKey) == resourceIndex;
+
+                            bool coldReadOk = false;
+                            bool inCold = false;
+                            void* coldExc = nullptr;
+                            void* inColdObj = _monoRuntimeInvoke(
+                                m_getInCold, collectObj, nullptr, &coldExc);
+                            if (inColdObj && !coldExc) {
+                                void* coldRaw = _monoObjectUnbox(inColdObj);
+                                if (coldRaw) {
+                                    inCold = *(uint8_t*)coldRaw != 0;
+                                    coldReadOk = true;
+                                }
+                            }
+
+                            const char* rejectReason = "ACTIVE_QUEUE";
+                            if (!indexValid) {
+                                rejectReason = "UNKNOWN_CLASSIFICATION";
+                            }
+                            else if (!iconConsistent) {
+                                rejectReason = "ICON_CLASS_MISMATCH";
+                                ++scanIncompatible;
+                            }
+                            else if (!belongsToActiveWaypoint) {
+                                rejectReason = "OTHER_WAYPOINT_RESOURCE";
+                                ++scanNotSelected;
+                            }
+                            else if (!insideWaypointRange) {
+                                rejectReason = useAreaScanner
+                                    ? "OUTSIDE_AREA_RADIUS" : "OUTSIDE_FIXED_RADIUS";
+                                ++scanNotSelected;
+                            }
+                            else if (!typeCompatible) {
+                                rejectReason = "INCOMPATIBLE_RESTYPE";
+                                ++scanIncompatible;
+                            }
+                            else if (!checkboxSelected) {
+                                rejectReason = "CHECKBOX_NOT_SELECTED";
+                                ++scanNotSelected;
+                            }
+                            else if (!coldReadOk) {
+                                rejectReason = "COLD_READ_FAILED";
+                                ++scanColdReadFailed;
+                            }
+                            else if (inCold) {
+                                rejectReason = "COOLDOWN";
+                            }
+
+                            // Log per-entity hanya untuk kategori yang dipilih agar file tidak
+                            // dipenuhi ratusan entity dunia yang tidak relevan.
+                            const uint64_t inspectKey = (uint64_t(entityId) << 16) ^ uint64_t(uint32_t(resType));
+                            bool shouldLog = false;
+                            if (indexValid && checkboxSelected) {
+                                std::lock_guard<std::mutex> logLock(inspectLogMutex);
+                                shouldLog = inspectedEntities.insert(inspectKey).second;
+                            }
+                            if (shouldLog) {
+                                LOGI(
+                                    "[InstantFarm] CANDIDATE netId=%u resource='%s' iconKey='%s' "
+                                    "source='%s' resType=%d distance=%.2f inCold=%d decision=%s.\n",
+                                    commandEntityId, classifiedName, iconKey, identitySource,
+                                    resType, waypointDistance, inCold ? 1 : 0, rejectReason);
+                            }
+
+                            if (!indexValid || !iconConsistent || !belongsToActiveWaypoint ||
+                                !insideWaypointRange || !typeCompatible || !checkboxSelected || !coldReadOk)
+                                continue;
+                            if (inCold) {
+                                cooldownNetIds.insert(commandEntityId);
+                                ++scanSelectedCooldown;
+                                continue;
+                            }
+
+                            if (!queuedNetIds.insert(commandEntityId).second) {
+                                ++scanDuplicate;
+                                continue;
+                            }
+
+                            InstantFarmTarget target;
+                            target.entityId = commandEntityId;
+                            target.dictionaryKey = entityId;
+                            target.position = pos;
+                            target.resType = resType;
+                            target.resourceId = resourceId;
+                            target.resourceIndex = resourceIndex;
+                            routeList.push_back(target);
+                            ++selectedCount;
+                            ++scanSelectedActive;
+                        }
+                    }
+                }
+                static int scanSerial = 0;
+                static int lastScanned = -1;
+                static int lastClassified = -1;
+                static int lastSelected = -1;
+                ++scanSerial;
+                scanScanned = scannedCount;
+                scanClassified = classifiedCount;
+                if (scannedCount != lastScanned || classifiedCount != lastClassified ||
+                    selectedCount != lastSelected || (scanSerial % 10) == 0) {
+                    lastScanned = scannedCount;
+                    lastClassified = classifiedCount;
+                    lastSelected = selectedCount;
+                    LOGI("[InstantFarm] SCAN waypoint=%zu/%zu scanned=%d classified=%d active=%d cooldown=%d "
+                        "unknown=%d incompatible=%d notSelected=%d coldReadFailed=%d duplicate=%d queueSnapshot=%zu.\n",
+                        currentWaypointNumber, searchPoints.size(), scanScanned, scanClassified,
+                        scanSelectedActive, scanSelectedCooldown, scanUnknown, scanIncompatible,
+                        scanNotSelected, scanColdReadFailed, scanDuplicate, routeList.size());
+                }
+                });
+
+            // Scanner hanya memasukkan target terpilih yang get_inCold() == false.
+            // Entity cooldown dengan demikian tidak pernah masuk antrean.
+            auto findLiveTarget = [&](uint32_t netId) -> const InstantFarmTarget* {
+                for (const auto& candidate : routeList)
+                    if (candidate.entityId == netId) return &candidate;
+                return nullptr;
+            };
+
+            // Setiap scan (termasuk scan setelah teleport) digabungkan ke antrean
+            // pending. NetID yang sedang diproses, sudah pending, atau gagal pada
+            // waypoint ini tidak dimasukkan dua kali.
+            std::unordered_set<uint32_t> pendingNetIds;
+            if (currentTargetNetId != 0) pendingNetIds.insert(currentTargetNetId);
+            for (size_t i = targetQueueIndex; i < targetQueue.size(); ++i)
+                pendingNetIds.insert(targetQueue[i].entityId);
+
+            size_t newlyQueued = 0;
+            for (const auto& candidate : routeList) {
+                if (failedTargetsAtWaypoint.count(candidate.entityId)) continue;
+                if (!pendingNetIds.insert(candidate.entityId).second) continue;
+                targetQueue.push_back(candidate);
+                ++newlyQueued;
+            }
+            if (newlyQueued > 0) {
+                LOGI("[InstantFarm] QUEUE MERGE added=%zu pending=%zu waypoint=%zu/%zu.\n",
+                    newlyQueued, targetQueue.size() - targetQueueIndex,
+                    currentWaypointNumber, searchPoints.size());
+                consecutiveEmptyScans = 0;
+            }
+
+            // Verifikasi ulang target aktif dari scan terbaru. Jika tidak ditemukan,
+            // target sudah cooldown/hilang dan dianggap selesai.
+            if (currentTargetNetId != 0) {
+                const InstantFarmTarget* liveTarget = findLiveTarget(currentTargetNetId);
+                if (!liveTarget) {
+                    const bool becameCooldown = cooldownNetIds.count(currentTargetNetId) != 0;
+                    const int nextTargetWaitMs = cooldownMilliseconds(
+                        g_instantFarmNextTargetCooldown);
+                    LOGI("[InstantFarm] TARGET DONE netId=%u reason=%s attempts=%d; nextTargetWait=%dms.\n",
+                        currentTargetNetId, becameCooldown ? "COOLDOWN" : "MISSING",
+                        currentTargetAttempts, nextTargetWaitMs);
+                    currentTargetNetId = 0;
+                    currentTargetAttempts = 0;
+                    currentTargetStartedAt = 0;
+                    currentTargetTeleported = false;
+                    if (!interruptibleWait(nextTargetWaitMs)) continue;
+                    consecutiveEmptyScans = 0;
+                    continue;
+                }
+
+                const uint64_t now = InstantFarmNowMs();
+                if (currentTargetAttempts >= 20 ||
+                    (currentTargetStartedAt && now - currentTargetStartedAt >= 15000ULL)) {
+                    LOGI("[InstantFarm] TARGET TIMEOUT netId=%u attempts=%d elapsed=%llu; skip at this waypoint.\n",
+                        currentTargetNetId, currentTargetAttempts,
+                        (unsigned long long)(now - currentTargetStartedAt));
+                    failedTargetsAtWaypoint.insert(currentTargetNetId);
+                    currentTargetNetId = 0;
+                    currentTargetAttempts = 0;
+                    currentTargetStartedAt = 0;
+                    currentTargetTeleported = false;
+                    interruptibleWait(cooldownMilliseconds(
+                        g_instantFarmNextTargetCooldown));
+                    continue;
+                }
+
+                if (!currentTargetTeleported) {
+                    LOGI("[InstantFarm] TARGET move netId=%u resource='%s' type=%d pos=(%.2f, %.2f, %.2f).\n",
+                        liveTarget->entityId,
+                        (liveTarget->resourceIndex >= 0 && liveTarget->resourceIndex < NUM_RESOURCES)
+                            ? farmNames[liveTarget->resourceIndex] : "UNKNOWN",
+                        liveTarget->resType,
+                        liveTarget->position.x, liveTarget->position.y, liveTarget->position.z);
+                    if (!InstantFarmMoveToSearchPoint(dllName, liveTarget->position)) {
+                        LOGI("[InstantFarm] TARGET move FAILED netId=%u.\n", liveTarget->entityId);
+                        ++currentTargetAttempts;
+                        interruptibleWait(500);
+                        continue;
+                    }
+                    currentTargetTeleported = true;
+                    // Entity dan NetID sudah diperoleh dari scan waypoint aktif,
+                    // sehingga command dapat dikirim langsung setelah teleport.
+                }
+
+                bool commandOk = false;
+                RunOnUnityThreadSync([&]() {
+                    if (!workerActive() || g_toolRestoring) return;
+                    _monoThreadAttach(_monoGetRootDomain());
+                    // 缓存：原来每发一条指令都要 monoClassFromName + 3 次
+                    // FindMethodInHierarchy，等于把镜像的类表/方法表从头走一遍；
+                    // 采集节奏是 0.4 秒一条指令，Unity 线程被这本账占着，任务泵容易
+                    // 拖到超时。这里解析一次就够（进程生命周期内类不会换镜像）。
+                    static void* cachedProtocolKlass = nullptr;
+                    static void* cachedPickBush = nullptr;
+                    static void* cachedHitStone = nullptr;
+                    static void* cachedAttackTree = nullptr;
+                    if (!cachedProtocolKlass || !cachedPickBush || !cachedHitStone ||
+                        !cachedAttackTree) {
+                        void* imgProtocol = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol"));
+                        if (!imgProtocol) imgProtocol = _monoImageLoaded(OBFUSCATE("Assembly-CSharp"));
+                        if (!imgProtocol) return;
+                        cachedProtocolKlass = _monoClassFromName(
+                            imgProtocol, OBFUSCATE("XDTDataAndProtocol.ProtocolService.Resource"),
+                            OBFUSCATE("ResourceProtocolManager"));
+                        if (!cachedProtocolKlass) return;
+                        cachedPickBush = FindMethodInHierarchy(
+                            cachedProtocolKlass, OBFUSCATE("SendPickBushCommand"), 1);
+                        cachedHitStone = FindMethodInHierarchy(
+                            cachedProtocolKlass, OBFUSCATE("SendHitStoneCommand"), 2);
+                        cachedAttackTree = FindMethodInHierarchy(
+                            cachedProtocolKlass, OBFUSCATE("SendAttackTreeCommand"), 2);
+                    }
+                    void* protocolKlass = cachedProtocolKlass;
+                    void* sendPickBush = cachedPickBush;
+                    void* sendHitStone = cachedHitStone;
+                    void* sendAttackTree = cachedAttackTree;
+
+                    // Khusus Mandarin: sebagian CollectableComponent memakai key
+                    // dictionary sebagai ID command, bukan Entity.get_netId().
+                    // NetID utama tetap dicoba dahulu; fallback baru aktif setelah
+                    // tiga hit tidak pernah mengubah target menjadi cooldown.
+                    const bool mandarinTarget = liveTarget->resourceIndex == 2;
+                    const bool useDictionaryId = mandarinTarget && currentTargetAttempts >= 3 &&
+                        liveTarget->dictionaryKey != 0 &&
+                        liveTarget->dictionaryKey != liveTarget->entityId;
+                    uint32_t netId = useDictionaryId
+                        ? liveTarget->dictionaryKey : liveTarget->entityId;
+                    uint8_t isCombo = 0;
+                    void* commandExc = nullptr;
+                    const bool underwater = liveTarget->resourceIndex >= 14 &&
+                        liveTarget->resourceIndex <= 16;
+                    if (mandarinTarget) {
+                        // Identitas resource lebih dapat dipercaya daripada resType pada
+                        // Mandarin Android; beberapa spawn melaporkannya sebagai type 10.
+                        if (!sendAttackTree) return;
+                        void* args[] = { &netId, &isCombo };
+                        _monoRuntimeInvoke(sendAttackTree, nullptr, args, &commandExc);
+                    } else if (underwater || liveTarget->resType == 3 || liveTarget->resType == 10) {
+                        if (!sendPickBush) return;
+                        void* args[] = { &netId };
+                        _monoRuntimeInvoke(sendPickBush, nullptr, args, &commandExc);
+                    } else if (liveTarget->resType == 1) {
+                        if (!sendAttackTree) return;
+                        void* args[] = { &netId, &isCombo };
+                        _monoRuntimeInvoke(sendAttackTree, nullptr, args, &commandExc);
+                    } else if (liveTarget->resType == 2 || liveTarget->resType == 9) {
+                        if (!sendHitStone) return;
+                        void* args[] = { &netId, &isCombo };
+                        _monoRuntimeInvoke(sendHitStone, nullptr, args, &commandExc);
+                    } else return;
+                    commandOk = commandExc == nullptr;
+                });
+
+                ++currentTargetAttempts;
+                const InstantFarmTarget* commandTarget = findLiveTarget(currentTargetNetId);
+                const bool usedMandarinDictionaryId = commandTarget &&
+                    commandTarget->resourceIndex == 2 && currentTargetAttempts > 3 &&
+                    commandTarget->dictionaryKey != 0 &&
+                    commandTarget->dictionaryKey != commandTarget->entityId;
+                const uint32_t sentCommandId = usedMandarinDictionaryId
+                    ? commandTarget->dictionaryKey : currentTargetNetId;
+                LOGI("[InstantFarm] COMMAND targetNetId=%u sentId=%u idSource=%s attempt=%d ok=%d; verify by rescan.\n",
+                    currentTargetNetId, sentCommandId,
+                    usedMandarinDictionaryId ? "dictionary-fallback" : "entity-netId",
+                    currentTargetAttempts, commandOk ? 1 : 0);
+                // Scan berikutnya menjadi bukti keberhasilan sebenarnya. Interval
+                // pengiriman command dibaca live dari slider Tab Game.
+                // 下限见 cooldownMilliseconds()（0.30s）：低于这个节奏就是在对着
+                // 服务器"连点"，服务端一旦开始丢包/判无效，只会徒增无效请求。
+                interruptibleWait(cooldownMilliseconds(
+                    g_instantFarmPickupCooldown));
+                continue;
+            }
+
+            // Ambil target berikutnya dari antrean snapshot bila masih aktif.
+            while (targetQueueIndex < targetQueue.size()) {
+                const InstantFarmTarget& queued = targetQueue[targetQueueIndex++];
+                if (failedTargetsAtWaypoint.count(queued.entityId)) continue;
+                if (!findLiveTarget(queued.entityId)) continue;
+                currentTargetNetId = queued.entityId;
+                LOGI("[InstantFarm] QUEUE NEXT netId=%u index=%zu/%zu.\n",
+                    currentTargetNetId, targetQueueIndex, targetQueue.size());
+                currentTargetAttempts = 0;
+                currentTargetStartedAt = InstantFarmNowMs();
+                currentTargetTeleported = false;
+                break;
+            }
+            if (currentTargetNetId != 0) continue;
+
+            // Semua entry pending sudah dikonsumsi atau tidak lagi aktif. Buang
+            // snapshot lama; scan berikutnya dapat memasukkan NetID baru kembali.
+            targetQueue.clear();
+            targetQueueIndex = 0;
+
+            // Dua rescan tanpa target aktif/pending sebelum pindah waypoint.
+            ++consecutiveEmptyScans;
+            LOGI("[InstantFarm] RESCAN EMPTY waypoint=%zu/%zu pass=%d/2 cooldownSeen=%d.\n",
+                currentWaypointNumber, searchPoints.size(), consecutiveEmptyScans,
+                scanSelectedCooldown);
+            if (consecutiveEmptyScans >= 2) {
+                LOGI("[InstantFarm] WAYPOINT EXHAUSTED %zu/%zu; moving to next preset coordinate.\n",
+                    currentWaypointNumber, searchPoints.size());
+                mustMoveToWaypoint = true;
+                consecutiveEmptyScans = 0;
+                continue;
+            }
+            interruptibleWait(750);
+        }
+
     }
-    SMPlatform::SetBreadcrumbLight("farm:armed");
-    LOGI("[InstantFarm] worker handed off to main-thread state machine (generation=%llu).\n",
-         (unsigned long long) workerGeneration);
-}
 
 void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, std::string className) {
     const uint64_t workerGeneration = g_legacyInstantFarmGeneration.load(std::memory_order_acquire);
@@ -6991,7 +6490,6 @@ void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, 
         RunOnUnityThreadSync([&]() {
             if (!workerActive()) return;
             _monoThreadAttach(_monoGetRootDomain());
-            SMPlatform::SetBreadcrumbLight("farm:legacy:scan");
 
             void *gameplay = _monoImageLoaded(dllName.c_str());
             void *data = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol"));
@@ -7005,9 +6503,18 @@ void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, 
             if (!worldClass) worldClass = _monoClassFromName(gameplay, OBFUSCATE("XDTLevelAndEntity.Core.World"), OBFUSCATE("EntityWorld"));
             if (!collectClass || !worldClass) return;
 
-            // 同 ExecuteInstantFarmThread：mono 上 GetComponentSystem<T> 不能传 nullptr this。
-            void *system = SmFarmGetComponentSystem(worldClass, collectClass, "farm:legacy");
-            if (!system) return;
+            void *collectType = _monoClassGetType(collectClass);
+            void *openMethod = FindMethodInHierarchy(worldClass, OBFUSCATE("GetComponentSystem"), 0);
+            if (!collectType || !openMethod) return;
+
+            void *typeArgs[] = { collectType };
+            void *methodInst = _mono_metadata_get_generic_inst(1, typeArgs);
+            MonoGenericContext context = { nullptr, methodInst };
+            void *closedMethod = _mono_class_inflate_generic_method(openMethod, &context);
+
+            void *exception = nullptr;
+            void *system = _monoRuntimeInvoke(closedMethod, nullptr, nullptr, &exception);
+            if (!system || exception) return;
 
             void *componentsField = _monoClassGetFieldFromName(_monoObjectGetClass(system), OBFUSCATE("_components"));
             void *dictionary = nullptr;
@@ -7036,17 +6543,13 @@ void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, 
 
             if (!getType || !getCold || !getEntity || !getPosition) return;
 
-            // mono 数组：长度/首元素地址必须走 mono_array_*（il2cpp 0x18/0x20 会越界）。
-            int count = 0;
-            uint8_t *first = nullptr;
-            if (!SmFarmDictEntries(dictionary, entries, &count, &first)) {
-                SMPlatform::SetBreadcrumbLight("farm:legacy:badlen");
-                return;
-            }
+            const uintptr_t address = (uintptr_t)entries;
+            const int count = *(int*)(address + 0x18);
+            const uintptr_t first = address + 0x20;
             std::unordered_set<uint32_t> uniqueIds;
 
             for (int i = 0; i < count; ++i) {
-                const uintptr_t entry = (uintptr_t) first + (uintptr_t) i * SZ_DICT_ENTRY;
+                const uintptr_t entry = first + i * 24;
                 if (*(int*)entry < 0) continue;
                 const uint32_t dictionaryId = *(uint32_t*)(entry + 8);
                 void *collect = *(void**)(entry + 16);
@@ -7054,32 +6557,24 @@ void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, 
 
                 void *typeObject = _monoRuntimeInvoke(getType, collect, nullptr, nullptr);
                 if (!typeObject) continue;
-                void *typeRaw = SmFarmUnbox(typeObject);
-                if (!typeRaw) continue;
-                const int type = *(int*)typeRaw;
+                const int type = *(int*)_monoObjectUnbox(typeObject);
                 if (!selected(type)) continue;
 
                 void *coldObject = _monoRuntimeInvoke(getCold, collect, nullptr, nullptr);
-                if (!coldObject) continue;
-                void *coldRaw = SmFarmUnbox(coldObject);
-                if (!coldRaw || *(uint8_t*)coldRaw) continue;
+                if (!coldObject || *(uint8_t*)_monoObjectUnbox(coldObject)) continue;
 
                 void *entity = _monoRuntimeInvoke(getEntity, collect, nullptr, nullptr);
                 if (!entity) continue;
 
                 void *positionObject = _monoRuntimeInvoke(getPosition, entity, nullptr, nullptr);
                 if (!positionObject) continue;
-                void *positionRaw = SmFarmUnbox(positionObject);
-                if (!positionRaw) continue;
 
                 uint32_t netId = 0;
                 if (getNetId) {
                     void *netException = nullptr;
                     void *netObject = _monoRuntimeInvoke(getNetId, entity, nullptr, &netException);
-                    if (netObject && !netException) {
-                        void *netRaw = SmFarmUnbox(netObject);
-                        if (netRaw) netId = *(uint32_t*)netRaw;
-                    }
+                    if (netObject && !netException)
+                        netId = *(uint32_t*)_monoObjectUnbox(netObject);
                 }
                 if (!netId) netId = InstantFarmGetStrictNetId(entity);
                 if (!netId) netId = dictionaryId;
@@ -7089,10 +6584,9 @@ void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, 
                 target.entityId = netId;
                 target.dictionaryKey = dictionaryId;
                 target.resType = type;
-                memcpy(&target.position, positionRaw, sizeof(Vector3));
+                memcpy(&target.position, _monoObjectUnbox(positionObject), sizeof(Vector3));
                 targets.push_back(target);
             }
-            SMPlatform::SetBreadcrumbLight("farm:legacy:found:" + std::to_string(targets.size()));
         });
 
         if (targets.empty()) {
@@ -7133,23 +6627,13 @@ void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, 
                     void *method = FindMethodInHierarchy(protocolClass, methodName, parameterCount);
                     if (!method) return;
 
-                    // mono 实例方法必须给实例：拿不到单例就跳过本次指令（不崩优先）。
-                    void *protocolInst = SmFarmMethodIsStatic(method)
-                                             ? nullptr : SmFarmResolveSingleton(protocolClass);
-                    if (!SmFarmMethodIsStatic(method) && !protocolInst) {
-                        SMPlatform::SetBreadcrumbLight("farm:legacy:no-inst");
-                        return;
-                    }
-                    SMPlatform::SetBreadcrumbLight("farm:legacy:cmd");
                     if (parameterCount == 1) {
                         void *args[] = { &netId };
-                        SmFarmInvoke(method, protocolInst, args, &invokeException);
+                        _monoRuntimeInvoke(method, nullptr, args, &invokeException);
                     } else {
                         void *args[] = { &netId, &combo };
-                        SmFarmInvoke(method, protocolInst, args, &invokeException);
+                        _monoRuntimeInvoke(method, nullptr, args, &invokeException);
                     }
-                    SMPlatform::SetBreadcrumbLight(invokeException ? "farm:legacy:cmd-exc"
-                                                                   : "farm:legacy:cmd-ok");
                 });
                 if (!wait(200)) break;
             }
@@ -9651,14 +9135,6 @@ void EnsureTeleportAntiCrashPatched() {
 }
 
 
-// 静态判定 helper（传送相机校正段专用）：mono 实例方法传 nullptr this 会 SIGSEGV。
-// IsMonoMethod 为假 = AOT/il2cpp 方法，flags 不可信 → 不当实例方法处理（按静态传 nullptr）。
-static bool MossMethodIsStatic(void *m) {
-    if (!m) return false;
-    if (!SMMonoHot::IsMonoMethod(m)) return true;  /* AOT 不判 */
-    return (SMMonoHot::MethodGetFlags(m, nullptr) & 0x10u) != 0;
-}
-
 void AutoMoveTransferDirect(Vector3 pos) {
     SMPlatform::SetBreadcrumbLight("tp:auto");
     LOGI("[TeleportFix] AutoMoveTransferDirect dipanggil untuk posisi: %.2f, %.2f, %.2f", pos.x, pos.y, pos.z);
@@ -9698,58 +9174,43 @@ void AutoMoveTransferDirect(Vector3 pos) {
         return;
     }
 
-    // 先看签名：实例方法(s0)就不能传 nullptr this（mono SIGSEGV）。
-    // 这时优先去取 EntityHelper 的单例；拿不到才跳过（宁可这次不传送，也不要闪退）。
+    // 先看签名：如果是实例方法(s0)就不能传 nullptr，直接跳过并记录。
     SMPlatform::SetBreadcrumbLight("tp:sig:" + CompactMethodSig(autoMoveMethod));
-    void *helperInst = nullptr;
-    if (SmFarmMethodIsStatic(autoMoveMethod)) {
-        SMPlatform::SetBreadcrumbLight("tp:static");
-    } else {
-        helperInst = SmFarmResolveSingleton(helperClass);
-        if (!helperInst) {
+    {
+        const uint32_t mf = SMMonoHot::MethodGetFlags(autoMoveMethod, nullptr);
+        if (SMMonoHot::IsMonoMethod(autoMoveMethod) && (mf & 0x10u) == 0) {
             SMPlatform::SetBreadcrumbLight("tp:skip:s0");
-            g_smTeleportResult.store(2, std::memory_order_relaxed);
             return;
         }
-        SMPlatform::SetBreadcrumbLight("tp:inst:s0");
     }
 
-    // Panggil（静态传 nullptr；实例方法传真实单例实例）
+    // Panggil sebagai static method (instance = nullptr)
     Vector3 targetPos = pos;
     void *args[] = { &targetPos };
     SMPlatform::SetBreadcrumbLight("tp:invoke");
     void *exc = nullptr;
-    _monoRuntimeInvoke(autoMoveMethod, helperInst, args, &exc);
+    _monoRuntimeInvoke(autoMoveMethod, nullptr, args, &exc);
     SMPlatform::SetBreadcrumbLight("tp:invoke-done");
 
     if (exc) {
-        g_smTeleportResult.store(2, std::memory_order_relaxed);
         LOGE("[TeleportFix] Exception saat AutoMoveTransfer.");
     } else {
-        g_smTeleportResult.store(1, std::memory_order_relaxed);
         LOGI("[TeleportFix] AutoMoveTransfer sukses dipanggil ke (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
     }
 
     SMPlatform::SetBreadcrumbLight("tp:camera");
-    SMPlatform::SetBreadcrumbLight("tp:cam1");
     // SNAP KAMERA LENGKAP:
     // 1. Panggil EntityHelper.SetCameraLookAt() (untuk lock orientasi Euler)
-    //    mono 实例方法传 nullptr this = SIGSEGV，先判静态标志（AOT 不判，按静态传 nullptr）。
     void *setCameraLookAtMethod = FindMethodInHierarchy(helperClass, (const char *) OBFUSCATE("SetCameraLookAt"), 0);
     if (setCameraLookAtMethod) {
-        if (!MossMethodIsStatic(setCameraLookAtMethod)) {
-            SMPlatform::SetBreadcrumbLight("tp:cam-skip:lookat");
+        void *camExc = nullptr;
+        _monoRuntimeInvoke(setCameraLookAtMethod, nullptr, nullptr, &camExc);
+        if (camExc) {
+            LOGE("[TeleportFix] Exception saat SetCameraLookAt.");
         } else {
-            void *camExc = nullptr;
-            _monoRuntimeInvoke(setCameraLookAtMethod, nullptr, nullptr, &camExc);
-            if (camExc) {
-                LOGE("[TeleportFix] Exception saat SetCameraLookAt.");
-            } else {
-                LOGI("[TeleportFix] SetCameraLookAt sukses dipanggil.");
-            }
+            LOGI("[TeleportFix] SetCameraLookAt sukses dipanggil.");
         }
     }
-    SMPlatform::SetBreadcrumbLight("tp:cam2");
 
     // 2. Akses XDTCameraManager.Instance.CurrentController (FollowCameraController)
     void *camMgrClass = _monoClassFromName(img,
@@ -9762,85 +9223,53 @@ void AutoMoveTransferDirect(Vector3 pos) {
     }
 
     if (camMgrClass) {
-        SMPlatform::SetBreadcrumbLight("tp:cam3");
         void *getInstanceMethod = FindMethodInHierarchy(camMgrClass, (const char *) OBFUSCATE("get_Instance"), 0);
-        // get_Instance 若是实例属性 getter，传 nullptr this 会崩 → 跳过。
-        if (getInstanceMethod && !MossMethodIsStatic(getInstanceMethod)) {
-            SMPlatform::SetBreadcrumbLight("tp:cam-skip:inst");
-        } else if (getInstanceMethod) {
+        if (getInstanceMethod) {
             void *excCam = nullptr;
             void *camMgrInst = _monoRuntimeInvoke(getInstanceMethod, nullptr, nullptr, &excCam);
-            // camMgrInst 必须是 mono 对象：il2cpp 对象喂 mono 实例方法同样 SIGSEGV。
-            void *camMgrMonoKlass = nullptr;
-            if (camMgrInst && !excCam && SMMonoHot::ClassifyObject(camMgrInst, &camMgrMonoKlass)) {
-                SMPlatform::SetBreadcrumbLight("tp:cam4");
+            if (camMgrInst && !excCam) {
                 void *getCurrControllerMethod = FindMethodInHierarchy(camMgrClass, (const char *) OBFUSCATE("get_CurrentController"), 0);
                 if (!getCurrControllerMethod) {
                     getCurrControllerMethod = FindMethodInHierarchy(camMgrClass, (const char *) OBFUSCATE("get_CurrentCameraController"), 0);
                 }
                 void *controller = nullptr;
                 if (getCurrControllerMethod) {
-                    // 实例 accessor 用 camMgrInst 当 this（已确认非空 + 是 mono 对象），静态才传 nullptr。
-                    void *ctrlThis = MossMethodIsStatic(getCurrControllerMethod) ? nullptr : camMgrInst;
                     void *ctrlExc = nullptr;
-                    controller = _monoRuntimeInvoke(getCurrControllerMethod, ctrlThis, nullptr, &ctrlExc);
-                    if (ctrlExc) controller = nullptr;
+                    controller = _monoRuntimeInvoke(getCurrControllerMethod, camMgrInst, nullptr, &ctrlExc);
                 }
                 if (!controller && _monoClassGetFieldFromName && _monoFieldGetValue) {
                     void *f_curr = _monoClassGetFieldFromName(camMgrClass, (const char *) OBFUSCATE("_currentController"));
                     if (f_curr) _monoFieldGetValue(camMgrInst, f_curr, &controller);
                 }
-                SMPlatform::SetBreadcrumbLight("tp:cam5");
 
                 if (controller) {
                     void *controllerClass = _monoObjectGetClass(controller);
-                    void *controllerMonoKlass = nullptr;
-                    // controller 必须是 mono 对象（ClassifyObject 命中），或其类已在 mono 句柄表里；
-                    // 否则等于把跨运行时对象喂给 mono 实例方法 = 随机 SIGSEGV。
-                    if (!SMMonoHot::ClassifyObject(controller, &controllerMonoKlass) &&
-                        !(controllerClass && SMMonoHot::IsMonoClass(controllerClass))) {
-                        SMPlatform::SetBreadcrumbLight("tp:cam-skip:ctrl");
-                    } else {
-                        if (!controllerClass) controllerClass = controllerMonoKlass;
-                        if (controllerClass) {
-                            // A. SetInitialAxisValue(0 params)：实例传 controller，静态传 nullptr（否则 SIGSEGV）
-                            void *mSetInitAxis = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("SetInitialAxisValue"), 0);
-                            if (mSetInitAxis) {
-                                void *aExc = nullptr;
-                                _monoRuntimeInvoke(mSetInitAxis, MossMethodIsStatic(mSetInitAxis) ? nullptr : controller, nullptr, &aExc);
-                            }
+                    if (controllerClass) {
+                        // A. SetInitialAxisValue(0 params)
+                        void *mSetInitAxis = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("SetInitialAxisValue"), 0);
+                        if (mSetInitAxis) {
+                            _monoRuntimeInvoke(mSetInitAxis, controller, nullptr, nullptr);
+                        }
 
-                            // B. PopInit(0 params)
-                            void *mPopInit = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("PopInit"), 0);
-                            if (mPopInit) {
-                                void *bExc = nullptr;
-                                _monoRuntimeInvoke(mPopInit, MossMethodIsStatic(mPopInit) ? nullptr : controller, nullptr, &bExc);
-                            }
+                        // B. PopInit(0 params)
+                        void *mPopInit = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("PopInit"), 0);
+                        if (mPopInit) {
+                            _monoRuntimeInvoke(mPopInit, controller, nullptr, nullptr);
+                        }
 
-                            // C. ResetInterpolationValue(0 params)
-                            void *mResetInterp = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("ResetInterpolationValue"), 0);
-                            if (mResetInterp) {
-                                void *cExc = nullptr;
-                                _monoRuntimeInvoke(mResetInterp, MossMethodIsStatic(mResetInterp) ? nullptr : controller, nullptr, &cExc);
-                                if (!cExc) LOGI("[TeleportFix] ResetInterpolationValue sukses dieksekusi (lerp dihentikan).");
-                            }
-                            SMPlatform::SetBreadcrumbLight("tp:cam6");
+                        // C. ResetInterpolationValue(0 params)
+                        void *mResetInterp = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("ResetInterpolationValue"), 0);
+                        if (mResetInterp) {
+                            _monoRuntimeInvoke(mResetInterp, controller, nullptr, nullptr);
+                            LOGI("[TeleportFix] ResetInterpolationValue sukses dieksekusi (lerp dihentikan).");
+                        }
 
-                            // D. isFirstFrame = true (agar frame berikutnya langsung snap tanpa gliding)
-                            //    字段必须是 BOOLEAN(0x02) 才写 bool；类型不符（int/byte/struct）写下去会踩内存。
-                            void *fieldFirstFrame = _monoClassGetFieldFromName ? _monoClassGetFieldFromName(controllerClass, (const char *) OBFUSCATE("isFirstFrame")) : nullptr;
-                            if (fieldFirstFrame && _monoFieldSetValue) {
-                                void *fieldType = _monoFieldGetType ? _monoFieldGetType(fieldFirstFrame) : nullptr;
-                                const int typeCode = fieldType ? SMMonoHot::TypeGetType(fieldType) : -1;
-                                if (typeCode == 0x02) {  // MONO_TYPE_BOOLEAN
-                                    bool firstFrameVal = true;
-                                    _monoFieldSetValue(controller, fieldFirstFrame, &firstFrameVal);
-                                    LOGI("[TeleportFix] isFirstFrame diset true (kamera snap instan).");
-                                } else {
-                                    SMPlatform::SetBreadcrumbLight("tp:cam-skip:ff");
-                                }
-                            }
-                            SMPlatform::SetBreadcrumbLight("tp:cam7");
+                        // D. isFirstFrame = true (agar frame berikutnya langsung snap tanpa gliding)
+                        void *fieldFirstFrame = _monoClassGetFieldFromName ? _monoClassGetFieldFromName(controllerClass, (const char *) OBFUSCATE("isFirstFrame")) : nullptr;
+                        if (fieldFirstFrame && _monoFieldSetValue) {
+                            bool firstFrameVal = true;
+                            _monoFieldSetValue(controller, fieldFirstFrame, &firstFrameVal);
+                            LOGI("[TeleportFix] isFirstFrame diset true (kamera snap instan).");
                         }
                     }
                 }
@@ -9864,38 +9293,27 @@ void Transfer2EntityDirect(uint32_t entityNetId) {
     if (!img) { LOGE("[TeleportFix] Transfer2EntityDirect: XDTLevelAndEntity belum diload."); return; }
 
     // 1. Coba ambil posisi target entity
-    SMPlatform::SetBreadcrumbLight("tp:entity:lookup");
     void *entitiesKlass = _monoClassFromName(img, (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"), (const char *) OBFUSCATE("Entities"));
     void *m_getAny = entitiesKlass ? FindMethodInHierarchy(entitiesKlass, (const char *) OBFUSCATE("GetAnyEntity"), 1) : nullptr;
     void *targetEntity = nullptr;
     if (m_getAny) {
-        // mono 上 GetAnyEntity 若为实例方法，必须给 Entities 单例；拿不到就跳过。
-        void *entitiesInst = SmFarmMethodIsStatic(m_getAny)
-                                 ? nullptr : SmFarmResolveSingleton(entitiesKlass);
-        if (!SmFarmMethodIsStatic(m_getAny) && !entitiesInst) {
-            SMPlatform::SetBreadcrumbLight("tp:entity:no-inst");
-        } else {
-            uint32_t netId = entityNetId;
-            void *args[] = { &netId };
-            void *exc = nullptr;
-            targetEntity = SmFarmInvoke(m_getAny, entitiesInst, args, &exc);
-            if (exc) LOGE("[TeleportFix] Exception saat GetAnyEntity.");
-        }
+        uint32_t netId = entityNetId;
+        void *args[] = { &netId };
+        void *exc = nullptr;
+        targetEntity = _monoRuntimeInvoke(m_getAny, nullptr, args, &exc);
+        if (exc) LOGE("[TeleportFix] Exception saat GetAnyEntity.");
     } else {
         LOGE("[TeleportFix] GetAnyEntity method tidak ditemukan.");
     }
 
     if (targetEntity) {
-        SMPlatform::SetBreadcrumbLight("tp:entity:pos");
         void *entKlass = _monoObjectGetClass(targetEntity);
         void *m_getPos = entKlass ? FindMethodInHierarchy(entKlass, (const char *) OBFUSCATE("get_position"), 0) : nullptr;
         if (m_getPos) {
             void *exc = nullptr;
-            void *boxedPos = SmFarmInvoke(m_getPos, targetEntity, nullptr, &exc);
-            void *posRaw = boxedPos ? SmFarmUnbox(boxedPos) : nullptr;
-            if (posRaw && !exc) {
-                Vector3 targetPos{};
-                memcpy(&targetPos, posRaw, sizeof(Vector3));
+            void *boxedPos = _monoRuntimeInvoke(m_getPos, targetEntity, nullptr, &exc);
+            if (boxedPos && !exc) {
+                Vector3 targetPos = *(Vector3 *) _monoObjectUnbox(boxedPos);
                 LOGI("[TeleportFix] Berhasil mendapatkan posisi target: %.2f, %.2f, %.2f. Menggunakan AutoMoveTransferDirect.", targetPos.x, targetPos.y, targetPos.z);
                 AutoMoveTransferDirect(targetPos);
                 return;
@@ -9910,37 +9328,24 @@ void Transfer2EntityDirect(uint32_t entityNetId) {
     }
 
     // Fallback ke method lama jika targetEntity belum ter-resolve
-    SMPlatform::SetBreadcrumbLight("tp:entity:fallback");
     LOGI("[TeleportFix] FALLBACK: Menggunakan EntityHelper.Transfer2Entity(%u) karena posisi tidak didapat.", entityNetId);
     EnsureTeleportAntiCrashPatched();
     void *klass = _monoClassFromName(img, (const char *) OBFUSCATE("XDTLevelAndEntity.Utils"), (const char *) OBFUSCATE("EntityHelper"));
     if (!klass) return;
     void *m_transfer = FindMethodInHierarchy(klass, (const char *) OBFUSCATE("Transfer2Entity"), 1);
     if (!m_transfer) { LOGE("[TeleportFix] EntityHelper.Transfer2Entity method tidak ditemukan."); return; }
-    // 同样是实例方法风险点：单例拿不到就不调用（旧代码直接传 nullptr）。
-    void *helperInst = SmFarmMethodIsStatic(m_transfer)
-                           ? nullptr : SmFarmResolveSingleton(klass);
-    if (!SmFarmMethodIsStatic(m_transfer) && !helperInst) {
-        SMPlatform::SetBreadcrumbLight("tp:entity:no-inst2");
-        return;
-    }
     uint32_t netId = entityNetId;
     void *args[] = { &netId };
     void *exc = nullptr;
-    SMPlatform::SetBreadcrumbLight("tp:entity:invoke");
-    SmFarmInvoke(m_transfer, helperInst, args, &exc);
+    _monoRuntimeInvoke(m_transfer, nullptr, args, &exc);
     if (exc) LOGE("[TeleportFix] Exception saat invoke EntityHelper.Transfer2Entity.");
-    SMPlatform::SetBreadcrumbLight(exc ? "tp:entity:exc" : "tp:entity:done");
 }
 
 bool AutoMoveTransferNative(Vector3 pos) {
-    // 记录"这次传送到底有没有真的发出去"：worker 用它决定是否重试/换点，
-    // 旧代码恒返回 true，导致传送被安全跳过时 worker 还以为已经到位。
-    g_smTeleportResult.store(0, std::memory_order_relaxed);
     RunOnUnityThreadSync([pos]() {
         AutoMoveTransferDirect(pos);
     });
-    return g_smTeleportResult.load(std::memory_order_relaxed) != 2;
+    return true;
 }
 
 void ManualTeleportNative(Vector3 pos) {

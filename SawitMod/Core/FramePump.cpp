@@ -57,53 +57,6 @@ void (*SMOldGameAppUpdate)(void *) = nullptr;
 bool g_framePumpArmed = false;
 void SMRunUnityFramePump() {
     if (!g_unityFramePumpReady.load(std::memory_order_acquire)) return;
-    // ---------------------------------------------------------------------
-    // 线程身份登记 + 同步任务泵：必须无条件执行（放在 g_framePumpArmed 判定之前）。
-    //
-    //   RunOnUnityThreadSync() 是采集/传送链路把 mono 反射调用搬回 Unity 线程的
-    //   唯一通道，它同时依赖两件事：
-    //     ① g_unityThreadId 已登记 —— 否则 worker 线程永远不会被判定为“已在 Unity
-    //        线程”，只能入队干等；Unity 线程自己调用时也无法命中自调用短路。
-    //     ② 这里每帧排空 g_unityTasks —— 否则队列永远没人执行。
-    //
-    //   旧版把这两步都写在 g_framePumpArmed 之后：玩家没有在菜单里手动启用任务泵
-    //   时，“瞬间资源采集 / 传送采集”这类 worker 线程发出的同步任务永远没人跑，
-    //   RunOnUnityThreadSync 等满 15~20 秒后把它判定为 abandoned；表现出两个症状：
-    //     * 传送采集点了没反应 / 卡住十几秒；
-    //     * 任务泵随后被启用、排空队列时，abandoned 的 lambda 若已被判为 started，
-    //       就会在已经返回的调用方栈帧上执行 —— 随机 SIGSEGV，崩点落在 mono 反射
-    //       里（tp:camera 段），并且没有可用 backtrace。
-    //   因此这里只把“重活”（MonoHot::Tick、自动做饭、相机等）留在 armed 之后。
-    // ---------------------------------------------------------------------
-    g_unityThreadId.store(std::this_thread::get_id());
-    {
-        std::vector<std::function<void()>> pendingTasks;
-        g_unityTaskMutex.lock();
-        pendingTasks = g_unityTasks;
-        g_unityTasks.clear();
-        g_unityTaskMutex.unlock();
-        for (auto &pendingTask : pendingTasks) {
-            // Jangan biarkan 1 task yang melempar exception menghentikan pump
-            // atau menggantung RunOnUnityThreadSync (penyebab deadlock di loading 100%).
-            try { pendingTask(); } catch (...) {}
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // 传送采集主线程状态机：每帧推进一个状态。
-    //
-    //   旧实现的采集流程跑在一个 detached worker 线程的长循环里，跨传送/跨等待
-    //   持有 mono 对象裸指针，主线程继续跑时 SGen（moving GC）搬走对象 → 悬垂
-    //   指针 → SIGSEGV（崩溃面包屑停在 farm:wait 之后的扫描段）。
-    //   现在 worker 只投递 dll/ns/class 这些值类型参数，整条 scan → teleport →
-    //   command 流程都在**这一帧、这个函数**里完成，跨帧只保留 netId 等值。
-    //
-    //   放在 g_framePumpArmed 判定之前：和它替代掉的 RunOnUnityThreadSync 任务
-    //   同一个可用性（这两个队列任务同样在 armed 之前就被排空）。
-    // ---------------------------------------------------------------------
-    SMInstantFarmTick();
-
-
     // 默认不跑：等玩家进入世界后在菜单里手动启用，避免卡加载。
     if (!g_framePumpArmed) return;
 
@@ -116,11 +69,21 @@ void SMRunUnityFramePump() {
     if (traceFrame) STARTUP_TRACE("F01 first Time.get_deltaTime frame entered");
 
     {
+        // Catat Unity thread supaya RunOnUnityThreadSync dapat mendeteksi self-call.
+        g_unityThreadId.store(std::this_thread::get_id());
+        // Catat id render thread supaya RunOnUnityThreadSync bisa deteksi self-call.
+        g_unityThreadId.store(std::this_thread::get_id());
         if (traceFrame) STARTUP_TRACE("F02 unity thread registered");
         // Agent dan hook lifecycle sudah disiapkan setelah Mono siap. Callback
         // update hanya memompa refresh/command ketika method ini memang aktif.
         ClientControlAgent::PumpUnityCommands();
         if (traceFrame) STARTUP_TRACE("F03 client-control pump returned");
+        std::vector<std::function<void()>> tasksCopy;
+        g_unityTaskMutex.lock();
+        tasksCopy = g_unityTasks;
+        g_unityTasks.clear();
+        g_unityTaskMutex.unlock();
+        if (traceFrame) STARTUP_TRACE("F04 unity task queue copied");
         static int testIndexCheckDelay = 0;
         testIndexCheckDelay++;
         if (testIndexCheckDelay >= 60) {
@@ -128,6 +91,11 @@ void SMRunUnityFramePump() {
             DisableTestIndexNowNative();
         }
         if (traceFrame) STARTUP_TRACE("F05 periodic task scheduling complete");
+        for (auto &task: tasksCopy) {
+            // Jangan biarkan 1 task yang melempar exception menghentikan pump
+            // atau menggantung RunOnUnityThreadSync (penyebab deadlock di loading 100%).
+            try { task(); } catch (...) {}
+        }
         if (traceFrame) STARTUP_TRACE("F06 unity tasks complete");
         if (g_cameraModActive) {
             try {
@@ -424,11 +392,6 @@ void SMRunUnityFramePump() {
                 }
                 continue;
             }
-            // 瞬间资源采集的队列派发入口：与 bed66c2（删除前那一版）逐行一致。
-            // 种植页「瞬间资源采集」按钮本身走 FetchPayloadSync + 直接起线程，
-            // 不经过这条队列；但队列侧必须保留同一入口，否则任何携带
-            // methodDesc=CUSTOM_INSTANT_FARM 的请求会被静默丢弃，链路上出现
-            // “菜单能起、队列不通”的不一致（上一轮恢复漏掉的正是这一段）。
             if (req.methodDesc == (const char *) OBFUSCATE("CUSTOM_INSTANT_FARM")) {
                 std::thread([req]() {
                     ExecuteInstantFarmThread(req.dllName, req.nameSpace, req.className);

@@ -373,12 +373,7 @@ extern "C" VIRBOX_TARGET_ATTR void *Virbox_ExecuteDynamic(
         try { if (nums.size() > 1) targetPos.y = std::stof(nums[1]); } catch (...) {}
         try { if (nums.size() > 2) targetPos.z = std::stof(nums[2]); } catch (...) {}
 
-        // 传送链路必须封送回 Unity 线程再碰 mono 反射：这条路径可能跑在菜单线程或
-        // worker 线程（Virbox 载荷派发 / std::thread detach），在非 Unity 线程里
-        // 直接 make/compile 方法头会崩（面包屑在 tp:camera 之前的 tp: 段即此路径）。
-        // AutoMoveTransferNative 内部用 RunOnUnityThreadSync 封送；若当前已经在
-        // Unity 线程，RunOnUnityThreadSync 会自检并就地执行，不会自己等自己。
-        AutoMoveTransferNative(targetPos);
+        AutoMoveTransferDirect(targetPos);
         return nullptr;
     }
 
@@ -386,11 +381,7 @@ extern "C" VIRBOX_TARGET_ATTR void *Virbox_ExecuteDynamic(
         uint32_t netId = 0;
         try { if (!paramInput.empty()) netId = (uint32_t)std::stoul(paramInput); } catch (...) {}
         if (netId != 0) {
-            // 同上：只在最外层封送一次。Transfer2EntityNative -> RunOnUnityThreadSync
-            // -> Transfer2EntityDirect，后者内部再调 AutoMoveTransferDirect 时已经在
-            // Unity 线程上下文里，所以内层保留直调（不再套第二层 Native，避免双重封送
-            // 白等一个 pump 周期）。
-            Transfer2EntityNative(netId);
+            Transfer2EntityDirect(netId);
             return nullptr;
         }
     }
