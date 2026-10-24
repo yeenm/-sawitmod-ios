@@ -71,6 +71,73 @@ static bool CyloneOpenUrl(const char *url) {
     return true;
 }
 
+// ---- 主页「最近步骤」（取证用）----
+// 环形缓冲（SMPlatform::BreadcrumbRingDump）是纯内存态，闪退重启后为空；
+// 而用户恰恰是崩溃后才重启看菜单。SetBreadcrumbLight 每次都会把最近 8 条
+// 覆盖写进 DataDir()/recent_steps.txt，所以 ring 为 0 条时回落到这个文件，
+// 显示的就是「上次运行」的步骤。
+// 每帧重取 8 条 snprintf 没必要：250ms 取样一次（沿用旧逻辑的节流）。
+namespace {
+
+constexpr int kRecentStepsMax = 8;
+
+struct RecentStepsView {
+    std::string lines[kRecentStepsMax];
+    int count = 0;
+    bool fromLastRun = false;  // true：来自上次运行的持久化文件，本次运行还没有步骤
+};
+
+RecentStepsView &SampleRecentSteps() {
+    static RecentStepsView view;
+    static std::chrono::steady_clock::time_point sampledAt{};
+    const std::chrono::steady_clock::time_point nowTp = std::chrono::steady_clock::now();
+    if (sampledAt.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(nowTp - sampledAt).count() < 250) {
+        return view;
+    }
+    sampledAt = nowTp;
+    RecentStepsView next;
+    next.count = SMPlatform::BreadcrumbRingDump(next.lines, kRecentStepsMax);
+    if (next.count <= 0) {
+        next.count = SMPlatform::LoadRecentStepsFromFile(next.lines, kRecentStepsMax);
+        next.fromLastRun = next.count > 0;
+    }
+    view = next;
+    return view;
+}
+
+void DrawRecentStepsSection() {
+    const RecentStepsView &view = SampleRecentSteps();
+    ImGui::PushStyleColor(ImGuiCol_Text, ActiveUI::kTextInactive);
+    ImGui::TextUnformatted(view.fromLastRun ? u8"最近步骤（上次运行）:"
+                                            : u8"最近步骤:");
+    // 高度固定成 8 行并允许滚动：既不撑破主页排版，也不会因为某条步骤名太长
+    // 把下面的按钮/脚注顶出去。上次运行时多留一行给下面的说明。
+    const float rowH = ImGui::GetTextLineHeightWithSpacing();
+    ImGui::BeginChild("##recent_steps",
+                      ImVec2(0, (view.fromLastRun ? kRecentStepsMax + 1 : kRecentStepsMax) * rowH),
+                      false);
+    if (view.count <= 0) {
+        ImGui::TextUnformatted(u8"（无）");
+    } else {
+        // 小一号字：面包屑都是很短的行，缩到 0.86 更容易一屏看全。
+        const float bcBaseFontSize = ImGui::GetStyle().FontSizeBase;
+        const bool bcFontPushed = bcBaseFontSize > 0.0f;
+        if (bcFontPushed) ImGui::PushFont(nullptr, bcBaseFontSize * 0.86f);
+        for (int i = 0; i < view.count; ++i) {
+            // TextUnformatted：步骤名里偶尔带 % 或 %s 片段，
+            // 走 printf 格式化会吃掉/读飞参数，这里一律不格式化。
+            ImGui::TextUnformatted(view.lines[i].c_str());
+        }
+        if (bcFontPushed) ImGui::PopFont();
+    }
+    if (view.fromLastRun) ImGui::TextUnformatted(u8"※ 本次运行尚未产生步骤");
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+}  // namespace
+
 void DrawMenu() {
     ImGuiIO &io = ImGui::GetIO();
     if (g_MenuMinimized) {
@@ -486,49 +553,12 @@ void DrawMenu() {
             }
             // ---- 最近步骤（取证用）----
             // 崩溃弹窗（「SawitMod 上次崩溃」原生 UIAlert）有时拿不到，主页这里直接把
-            // 轻量面包屑环形缓冲的最近 8 条摊开：每行原样是 "t<tid> | farm:xxx"
+            // 轻量面包屑的最近 8 条摊开：每行原样是 "t<tid> | farm:xxx"
             // （和崩溃报告 "recent steps (newest first)" 段落同一格式、同新→旧顺序），
             // 用户拍一张主页截图就能判断崩溃线程和最后几步。
-            {
-                ImGui::PushStyleColor(ImGuiCol_Text, ActiveUI::kTextInactive);
-                ImGui::TextUnformatted(u8"最近步骤:");
-                ImGui::PopStyleColor();
-
-                // 环形缓冲本身只读不分配，但每帧 8 条 snprintf 没必要：250ms 取样一次。
-                static std::string stepLines[8];
-                static int stepCount = 0;
-                static std::chrono::steady_clock::time_point stepSampledAt{};
-                const std::chrono::steady_clock::time_point nowTp =
-                        std::chrono::steady_clock::now();
-                if (stepSampledAt.time_since_epoch().count() == 0 ||
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                            nowTp - stepSampledAt).count() >= 250) {
-                    stepSampledAt = nowTp;
-                    stepCount = SMPlatform::BreadcrumbRingDump(stepLines, 8);
-                }
-
-                // 高度固定成 8 行并允许滚动：既不撑破主页排版，也不会因为某条
-                // 步骤名太长把下面的按钮/脚注顶出去。
-                ImGui::PushStyleColor(ImGuiCol_Text, ActiveUI::kTextInactive);
-                ImGui::BeginChild("##recent_steps",
-                                  ImVec2(0, 8 * ImGui::GetTextLineHeightWithSpacing()), false);
-                if (stepCount <= 0) {
-                    ImGui::TextUnformatted(u8"（无）");
-                } else {
-                    // 小一号字：面包屑都是很短的行，缩到 0.86 更容易一屏看全。
-                    const float bcBaseFontSize = ImGui::GetStyle().FontSizeBase;
-                    const bool bcFontPushed = bcBaseFontSize > 0.0f;
-                    if (bcFontPushed) ImGui::PushFont(nullptr, bcBaseFontSize * 0.86f);
-                    for (int i = 0; i < stepCount; ++i) {
-                        // TextUnformatted：步骤名里偶尔带 % 或 %s 片段，
-                        // 走 printf 格式化会吃掉/读飞参数，这里一律不格式化。
-                        ImGui::TextUnformatted(stepLines[i].c_str());
-                    }
-                    if (bcFontPushed) ImGui::PopFont();
-                }
-                ImGui::EndChild();
-                ImGui::PopStyleColor();
-            }
+            // 本次运行还没打点（典型就是闪退后刚重启）时回落到 recent_steps.txt，
+            // 标题变成「最近步骤（上次运行）」——这样崩溃证据才拿得到。
+            DrawRecentStepsSection();
             {
                 std::string dbg = SMOrientationDebug();
                 dbg += " prev=";

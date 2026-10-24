@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <unistd.h>
 #include <atomic>
+#include <chrono>
 #include <pthread.h>
 #include <mutex>
 #include <cstring>
@@ -234,6 +235,55 @@ int BreadcrumbRingDump(std::string *outLines, int maxLines) {
     return count;
 }
 
+// ---- 最近步骤落盘（闪退重启后仍能读到）----
+// 环形缓冲是纯内存态，进程一死就没了；而用户恰恰是崩溃后重启才看菜单。
+// 所以每次轻量打点都顺手把 ring 的最新 8 条覆盖写到 DataDir()/recent_steps.txt。
+// 只 fopen("w")+fputs+fclose，不做 fsync（页缓存就够活过 SIGSEGV/SIGKILL，
+// 又不阻塞每帧热路径）；200ms 内的重复调用直接合并跳过。
+static const char *RecentStepsFilePath() {
+    static std::string path;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        path = DataDir() + "/recent_steps.txt";
+    });
+    return path.c_str();
+}
+
+static void PersistRecentSteps() {
+    // 在锁内取一份 ring 快照（8 条 snprintf，微秒级），再在锁外写文件，
+    // 避免和热路径上的打点抢锁时把 fopen 也包进临界区。
+    std::string lines[8];
+    int n = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_bcMutex);
+        n = BreadcrumbRingDump(lines, 8);
+    }
+    if (n <= 0) return;
+    FILE *fp = fopen(RecentStepsFilePath(), "w");
+    if (!fp) return;
+    for (int i = 0; i < n; ++i) {
+        fputs(lines[i].c_str(), fp);
+        fputc('\n', fp);
+    }
+    fclose(fp);
+}
+
+int LoadRecentStepsFromFile(std::string *outLines, int maxLines) {
+    if (!outLines || maxLines <= 0) return 0;
+    FILE *fp = fopen(RecentStepsFilePath(), "r");
+    if (!fp) return 0;
+    int count = 0;
+    char buf[256];
+    while (count < maxLines && fgets(buf, sizeof(buf), fp)) {
+        size_t n = strlen(buf);
+        while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
+        if (n == 0) continue;  // 跳过空行（上一版留下的多余换行）
+        outLines[count++] = buf;
+    }
+    fclose(fp);
+    return count;
+}
+
 
 
 void SetBreadcrumb(const std::string &step) {
@@ -281,6 +331,20 @@ void SetBreadcrumbLight(const std::string &step) {
         fputs(step.c_str(), fp);
         fclose(fp);
     }
+
+    // 再把「最近 8 条」覆盖写进 recent_steps.txt：闪退重启后 ring 已清空，
+    // 菜单只能靠这个文件把上次运行的步骤显示出来。节流 200ms（只丢中间态，
+    // 每次写都是整段 ring 快照，不会丢关键的最后一步太多——ring 里有 16 条）。
+    static std::atomic<long long> lastPersistMs{0};
+    const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    long long prevMs = lastPersistMs.load(std::memory_order_relaxed);
+    if (prevMs != 0 && nowMs - prevMs < 200) return;
+    if (!lastPersistMs.compare_exchange_strong(prevMs, nowMs, std::memory_order_relaxed) &&
+        nowMs - prevMs < 200) {
+        return;  // 另一个线程刚写过，这一笔合并掉
+    }
+    PersistRecentSteps();
 }
 
 std::string TakeBreadcrumb() {

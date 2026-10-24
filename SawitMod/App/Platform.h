@@ -56,6 +56,12 @@ void SetBreadcrumb(const std::string &step);
 void SetBreadcrumbLight(const std::string &step);
 // 崩溃用：最近 N 条轻量面包屑（带线程 tag），崩溃处理器逐条写进报告。
 int BreadcrumbRingDump(std::string *outLines, int maxLines);
+// 重启后取证：SetBreadcrumbLight 每次都会把最近 8 条轻量面包屑
+// （格式 "tXXXX | step"，每行一条，新→旧）落到 DataDir()/recent_steps.txt。
+// 环形缓冲是纯内存态，闪退重启后会被清空；菜单靠这个接口把「上次运行的
+// 最近步骤」读回来显示。最多读 maxLines 条（顺序与文件一致，新→旧）；
+// 文件不存在（首次安装/从未打点）返回 0。
+int LoadRecentStepsFromFile(std::string *outLines, int maxLines);
 std::string TakeBreadcrumb();
 const char *BreadcrumbCStr();
 void SetClipboard(const std::string &text);
