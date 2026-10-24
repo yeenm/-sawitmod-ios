@@ -127,7 +127,10 @@ void AutoBubbleLoopThread(std::string dllName, std::string nameSpace, std::strin
 
 // --- Instant Farm / Gather ---
 void PatchGatherConfigNative();
+// 传送采集：worker 侧只投递值类型参数（ExecuteInstantFarmThread），
+// mono 工作全部由主线程状态机分帧完成（SMInstantFarmTick，由 SMRunUnityFramePump 每帧调）。
 void ExecuteInstantFarmThread(std::string dllName, const std::string& nameSpace, const std::string& className);
+void SMInstantFarmTick();
 void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, std::string className);
 
 // --- Misc feature toggles ---

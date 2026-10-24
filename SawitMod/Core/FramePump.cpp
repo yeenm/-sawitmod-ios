@@ -89,6 +89,21 @@ void SMRunUnityFramePump() {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // 传送采集主线程状态机：每帧推进一个状态。
+    //
+    //   旧实现的采集流程跑在一个 detached worker 线程的长循环里，跨传送/跨等待
+    //   持有 mono 对象裸指针，主线程继续跑时 SGen（moving GC）搬走对象 → 悬垂
+    //   指针 → SIGSEGV（崩溃面包屑停在 farm:wait 之后的扫描段）。
+    //   现在 worker 只投递 dll/ns/class 这些值类型参数，整条 scan → teleport →
+    //   command 流程都在**这一帧、这个函数**里完成，跨帧只保留 netId 等值。
+    //
+    //   放在 g_framePumpArmed 判定之前：和它替代掉的 RunOnUnityThreadSync 任务
+    //   同一个可用性（这两个队列任务同样在 armed 之前就被排空）。
+    // ---------------------------------------------------------------------
+    SMInstantFarmTick();
+
+
     // 默认不跑：等玩家进入世界后在菜单里手动启用，避免卡加载。
     if (!g_framePumpArmed) return;
 
