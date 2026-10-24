@@ -9206,6 +9206,15 @@ void AutoMoveTransferDirect(Vector3 pos) {
         LOGI("[TeleportFix] AutoMoveTransfer sukses dipanggil ke (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
     }
 
+    // 相机吸附会改写游戏相机控制器状态；实测相机段跑完后仍有概率崩在游戏自己的
+    // 相机更新里（最后面包屑 tp:cam7）。传送本身不需要它，默认关闭。
+    {
+        static const bool kEnableCameraSnap = false;
+        if (!kEnableCameraSnap) {
+            SMPlatform::SetBreadcrumbLight("tp:cam-off");
+            return;
+        }
+    }
     SMPlatform::SetBreadcrumbLight("tp:camera");
     SMPlatform::SetBreadcrumbLight("tp:cam1");
     // SNAP KAMERA LENGKAP:
