@@ -185,13 +185,13 @@ void DrawMenu() {
     // ---- 免费功能（不需要卡密）：采集类 ----
     // 驱动方式必须和付费页一致，这里踩过两次坑：
     //   1) op=11 不是走 VM 派发，它有原生 worker；
-    //   2) 通用「瞬间自动采集 / 瞬间资源采集」两处菜单入口已整块删除，
-    //      现在只有这里的「蓝莓自动采集」还在用同一套 worker：
+    //   2) 瞬间采集有**两套**系统，真正带"蓝莓"的是新的那套，种植页的
+    //      「瞬间资源采集」入口（game_sub==2）和这里的「蓝莓自动采集」共用同一套 worker：
     //        g_farmSelections[4]（farmNames[] 第 5 项 = Blueberry）
     //        + g_instantFarmingActive + g_instantFarmGeneration
     //        + ExecuteInstantFarmThread()（读 g_farmSelections 决定采什么）
     //      旧的那套（g_farmBush/g_farmDynamicBush + ExecuteLegacyInstantFarmThread）
-    //      已经没有调用方，函数只作保留。
+    //      菜单入口（杂项页「瞬间自动采集」）已删除，函数只作保留、无调用方。
     //   3) op=10 自动收集气泡走 AutoBubbleLoopThread（条件 g_autoCollectBubbleActive）。
     static constexpr int kBlueberryIndex = 4;   // farmNames[]: Ore/Stone/Mandarin/Raspberry/Blueberry
     static std::atomic<bool> g_berryAuto{false};    // 蓝莓自动采集
@@ -940,9 +940,82 @@ void DrawMenu() {
             ImGui::Separator();
             }
 
-            // 「瞬间资源采集」整块已移除（资源选择列表 + 采集/下一目标冷却 + 开始/停止按钮）。
-            // 种植页现在只剩「自动种植机器人」。底层 ExecuteInstantFarmThread 保留，
-            // 仅供免费功能「蓝莓自动采集」复用，菜单里不再有通用入口。
+            if (game_sub == 2) {
+            ImGui::Spacing();
+            ActiveUI::Section("O", Tr("Instant Resource Farming", u8"瞬间资源采集"));
+            ImGui::Text(Tr("Select resources to collect instantly:", u8"选择要瞬间采集的资源:"));
+            if (ImGui::BeginListBox(OBFUSCATE("##instant_resource_list"), ImVec2(-1, 360))) {
+                // 选中态：深绿底 + 暖白字 + "✓"前缀。
+                // 原来选中用的是主题的 Header/Hover（焦糖 #9E6830 叠在米色上，字又是深灰），
+                // 看起来就是一块"深褐色"，在米色面板里既不明显也不好读。
+                static const ImVec4 kFarmSelBg = ImVec4(0.118f, 0.463f, 0.235f, 1.00f);
+                static const ImVec4 kFarmSelHover = ImVec4(0.157f, 0.553f, 0.294f, 1.00f);
+                static const ImVec4 kFarmSelActive = ImVec4(0.086f, 0.376f, 0.192f, 1.00f);
+                static const ImVec4 kFarmSelText = ImVec4(1.000f, 0.988f, 0.965f, 1.00f);
+                for (int i = 0; i < NUM_RESOURCES; i++) {
+                    const bool selected = g_farmSelections[i];
+                    char rowLabel[192];
+                    snprintf(rowLabel, sizeof(rowLabel), "%s  %s",
+                             selected ? u8"✓" : u8"·", Tr(farmNames[i], farmNamesZh[i]));
+                    if (selected) {
+                        ImGui::PushStyleColor(ImGuiCol_Header, kFarmSelBg);
+                        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, kFarmSelHover);
+                        ImGui::PushStyleColor(ImGuiCol_HeaderActive, kFarmSelActive);
+                        ImGui::PushStyleColor(ImGuiCol_Text, kFarmSelText);
+                    }
+                    if (ImGui::Selectable(rowLabel, selected,
+                                          ImGuiSelectableFlags_DontClosePopups, ImVec2(0, 50))) {
+                        g_farmSelections[i] = !g_farmSelections[i];
+                    }
+                    if (selected) ImGui::PopStyleColor(4);
+                }
+                ImGui::EndListBox();
+            }
+            ImGui::Spacing();
+
+            float pickupCooldown = g_instantFarmPickupCooldown.load(std::memory_order_relaxed);
+            if (ImGui::SliderFloat(
+                    Tr("Pickup Cooldown", u8"采集冷却"),
+                    &pickupCooldown, 0.3f, 5.0f, "%.2f s")) {
+                g_instantFarmPickupCooldown.store(pickupCooldown, std::memory_order_relaxed);
+            }
+            float nextTargetCooldown = g_instantFarmNextTargetCooldown.load(std::memory_order_relaxed);
+            if (ImGui::SliderFloat(
+                    Tr("Next Target Cooldown", u8"下一目标冷却"),
+                    &nextTargetCooldown, 0.1f, 5.0f, "%.1f s")) {
+                g_instantFarmNextTargetCooldown.store(nextTargetCooldown, std::memory_order_relaxed);
+            }
+            ImGui::Spacing();
+
+            if (g_instantFarmingActive) {
+                if (ImGui::Button(Tr("STOP INSTANT RESOURCE FARM", u8"停止瞬间资源采集"), ImVec2(-1, 70))) {
+                    g_instantFarmingActive = false;
+                    g_instantFarmGeneration.fetch_add(1, std::memory_order_acq_rel);
+                }
+            } else if (ImGui::Button(Tr("START INSTANT RESOURCE FARM", u8"开始瞬间资源采集"), ImVec2(-1, 70))) {
+                bool selected = false;
+                for (int i = 0; i < NUM_RESOURCES; ++i) selected = selected || g_farmSelections[i];
+                if (selected && SesiAktif()) {
+                    g_instantFarmGeneration.fetch_add(1, std::memory_order_acq_rel);
+                    g_instantFarmingActive = true;
+                    std::thread([]() {
+                        if (!SesiAktif()) {
+                            g_instantFarmingActive = false;
+                            return;
+                        }
+                        InvokeRequest req = FetchPayloadSync(WireForOp(OP_INSTANT_FARM_TRIGGER));
+                        if (req.dllName.empty() || req.nameSpace.empty() || req.className.empty()) {
+                            g_instantFarmingActive = false;
+                            return;
+                        }
+                        ExecuteInstantFarmThread(req.dllName, req.nameSpace, req.className);
+                    }).detach();
+                }
+            }
+            ImGui::TextColored(ActiveUI::kMuted, Tr("Scans the selected resource identity and moves to another spawn point when empty.", u8"识别所选资源；当前区域为空时自动前往下一个刷新点。"));
+            ImGui::Spacing();
+            ImGui::Separator();
+            }
 
             if (game_sub == 0) {
             ImGui::Spacing();
