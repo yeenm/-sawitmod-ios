@@ -2199,6 +2199,22 @@ void FetchCookerNamesFromTable() {
 
 // 用 mono 原生 API 造一个 List<T> 实例（T = 传进来的 mono class）。
 // PC 权威路径 Entities.GetComponents<T>(ref List<T>) 需要先有 List<T>。
+
+// 从已膨胀方法的签名参数里直接拿 List<T>（比去 corlib 找 List`1 再膨胀可靠）
+static void *SMCreateListFromMethodSignature(void *closedMethod) {
+    if (!closedMethod || !SMMonoHot::Available()) return nullptr;
+    void *sig = SMMonoHot::MethodSignature(closedMethod);
+    if (!sig) return nullptr;
+    void *iter = nullptr;
+    void *type = SMMonoHot::SignatureGetParams(sig, &iter);
+    if (!type) return nullptr;
+    void *klass = SMMonoHot::ClassFromMonoType(type);
+    if (!klass) return nullptr;
+    void *obj = SMMonoHot::ObjectNew(klass);
+    if (obj) SMMonoHot::RuntimeObjectInit(obj);
+    return obj;
+}
+
 static void *SMCreateMonoListForType(void *elementKlass) {
     if (!SMMonoHot::Available() || !elementKlass) return nullptr;
     void *elementType = SMMonoHot::ClassGetType(elementKlass);
@@ -2282,7 +2298,8 @@ void ScanCookersNative() {
         if (!closed) { SMPlatform::SetBreadcrumbLight("cook:no-inflate"); return; }
         _monoCompileMethod(closed);
 
-        void *listObj = SMCreateMonoListForType(cookType);
+        void *listObj = SMCreateListFromMethodSignature(closed);
+        if (!listObj) listObj = SMCreateMonoListForType(cookType);
         if (!listObj) { SMPlatform::SetBreadcrumbLight("cook:no-list"); return; }
         void *listSlot = listObj;
         void *getArgs[1] = {&listSlot};
