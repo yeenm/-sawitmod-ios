@@ -85,6 +85,19 @@ static void *SmFarmInvoke(void *method, void *instance, void **params, void **ou
     return _monoRuntimeInvoke(method, instance, params, outExc ? outExc : &dummyExc);
 }
 
+// 只接受"确实是目标类的实例"：取到对象类后沿继承链比对。
+// 静态字段读串类型（比如字段其实是实例字段，static get 会读到垃圾）时把结果挡掉，
+// 否则拿一个错误对象当 this 去 invoke，照样是随机 SIGSEGV。
+static bool SmFarmObjectIsA(void *obj, void *klass) {
+    if (!obj || !klass) return false;
+    void *cls = _monoObjectGetClass(obj);
+    for (int depth = 0; cls && depth < 12; ++depth) {
+        if (cls == klass) return true;
+        cls = _monoClassGetParent(cls);
+    }
+    return false;
+}
+
 // 取单例/全局实例：静态访问器（get_Instance/get_Current/…）→ 静态字段（_instance/…）。
 // 只调用静态访问器；实例 accessor 传 nullptr 一样会崩，直接跳过。
 static void *SmFarmResolveSingleton(void *klass) {
@@ -99,7 +112,7 @@ static void *SmFarmResolveSingleton(void *klass) {
         if (!m || !SmFarmMethodIsStatic(m)) continue;
         void *exc = nullptr;
         void *inst = _monoRuntimeInvoke(m, nullptr, nullptr, &exc);
-        if (inst && !exc) return inst;
+        if (inst && !exc && SmFarmObjectIsA(inst, klass)) return inst;
     }
     static const char *kFields[] = {
             "_instance", "instance", "s_instance", "m_instance", "Instance",
@@ -112,7 +125,7 @@ static void *SmFarmResolveSingleton(void *klass) {
         if (!field) continue;
         void *inst = nullptr;
         _monoFieldStaticGetValue(vtable, field, &inst);
-        if (inst) return inst;
+        if (inst && SmFarmObjectIsA(inst, klass)) return inst;
     }
     return nullptr;
 }
