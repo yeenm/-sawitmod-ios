@@ -2240,14 +2240,32 @@ void ScanCookersNative() {
         if (!imgGameplay) imgGameplay = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
         if (!imgGameplay) { SMPlatform::SetBreadcrumbLight("cook:no-img"); return; }
 
-        void *cookKlass = _monoClassFromName(imgGameplay,
-            (const char *) OBFUSCATE("XDTLevelAndEntity.Gameplay.Component.Homeland"),
-            (const char *) OBFUSCATE("CookBuildComponent"));
+        void *cookKlass = nullptr;
+        {
+            static const char *kCookNsCandidates[] = {
+                "XDTLevelAndEntity.Gameplay.Component.Homeland",
+                "ScriptsRefactory.LevelAndEntity.Gameplay.Component.Homeland",
+                "XDTLevelAndEntity.Gameplay.Component.GamePlay",
+            };
+            for (const char *ns : kCookNsCandidates) {
+                cookKlass = _monoClassFromName(imgGameplay, ns,
+                    (const char *) OBFUSCATE("CookBuildComponent"));
+                if (cookKlass) break;
+            }
+        }
         if (!cookKlass) { SMPlatform::SetBreadcrumbLight("cook:no-cls"); return; }
 
-        void *entitiesCls = _monoClassFromName(imgGameplay,
-            (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"),
-            (const char *) OBFUSCATE("Entities"));
+        void *entitiesCls = nullptr;
+        {
+            void *imgData2 = _monoImageLoaded((const char *) OBFUSCATE("XDTDataAndProtocol"));
+            void *imgs[2] = {imgGameplay, imgData2};
+            for (int ii = 0; ii < 2 && !entitiesCls; ++ii) {
+                if (!imgs[ii]) continue;
+                entitiesCls = _monoClassFromName(imgs[ii],
+                    (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"),
+                    (const char *) OBFUSCATE("Entities"));
+            }
+        }
         if (!entitiesCls) { SMPlatform::SetBreadcrumbLight("cook:no-entities"); return; }
         void *openGet = FindMethodInHierarchy(entitiesCls, (const char *) OBFUSCATE("GetComponents"), 1);
         if (!openGet) { SMPlatform::SetBreadcrumbLight("cook:no-get"); return; }
@@ -2281,7 +2299,10 @@ void ScanCookersNative() {
         void *cntObj = _monoRuntimeInvoke(m_count, listObj, nullptr, &exc);
         int count = (cntObj && !exc) ? *(int *) _monoObjectUnbox(cntObj) : 0;
         SMPlatform::SetBreadcrumbLight("cook:list:" + std::to_string(count));
-        if (count <= 0) return;
+        if (count <= 0) {
+            SMPlatform::SetBreadcrumbLight(exc ? "cook:zero-exc" : "cook:zero");
+            return;
+        }
 
         void *f_entity = FindFieldInHierarchy(cookKlass, (const char *) OBFUSCATE("entity"));
         if (!f_entity) f_entity = FindFieldInHierarchy(cookKlass, (const char *) OBFUSCATE("_entity"));
