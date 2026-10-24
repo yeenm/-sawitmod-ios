@@ -2197,27 +2197,32 @@ void FetchCookerNamesFromTable() {
 }
 
 // ============================================================================
-//  灶台扫描（cook:*）—— 造 List<T> 的三条路 + 两条不碰 List 的旁路
+//  灶台扫描（cook:*）—— 首选安卓在役版实测可用的 BuildModule.GetBuildItems 路
 // ----------------------------------------------------------------------------
-//  PC 权威链路 Entities.GetComponents<CookBuildComponent>(ref List<T>) 在 iOS
-//  mono 上断在"造不出 List<T>"（旧面包屑 cook:no-list），两个坑：
-//    ① 第二个参数是 `ref List<T>`，签名里的 MonoType 是 BYREF 包装
-//       （MONO_TYPE_BYREF=0x10）——mono_class_from_mono_type 对 byref 返回 null，
-//       于是整条链在这里断掉；
-//    ② 即便拿到关闭泛型类，mono_object_new 也不跑 .ctor，List._items 还是 null，
-//       传进游戏里再枚举会抛异常。
-//  所以按"从近到远"给三条造 List 的路，每条都做可用性校验：
-//    A 签名解包：byref → 元素类型 → List<T> 关闭泛型类（签名里的已经是膨胀好的）
-//    B corlib 兜底：找开放 List`1，用灶台类膨胀（多 image：mscorlib /
-//      System.Private.CoreLib / netstandard / System）
-//    C BCL 兜底：Type.GetType(程序集限定名) + Activator.CreateInstance
-//      （PC 模组同款；类型名解析失败只返回 null，不会 abort，.ctor 一定跑过）
-//  三条全失败也不放弃，改用不碰 List 的数据源：
-//    S EntityWorld.GetComponentSystem<CookBuildComponent>() 的 _components 字典
-//      （与已跑通的 ScanPotsNative 同一条链路）
-//    D LevelObjectManager._instance._dictionary 直接遍历 LevelObject（原生字段读）
-//  面包屑：成功 cook:found:N:<L|S|D>；全灭 cook:no-list:<1|2|3>
-//    :1 签名/BYREF 阶段  :2 类阶段  :3 new/init 阶段
+//  路线 BM（首选，安卓真机实测能扫到灶台）：
+//    XDTGUI.Module.Build.BuildModule.GetBuildItems(uint playerNetId)   // 静态 1 参
+//    → 游戏自己建好的 List（元素是构建组件，带 get_entity()）
+//    → 型号：_cookerStaticId → ComponentData.staticId → EntityUtil.GetEntityResId(netId)
+//    → 锅位：_cookBurnerMap（Dictionary<ulong, CookingComponent>）的 Key/Value
+//    —— 不膨胀泛型、不造 List，天然绕开下面两个坑；只有遇到 ref List<T> 重载时，
+//       才用工程既有的三条造 List 路现造一个（签名解包 / corlib 膨胀 / BCL Type.GetType）。
+//
+//  路线 L（PC 权威兜底）：Entities.GetComponents<CookBuildComponent>(ref List<T>)
+//    在 iOS mono 上可能断在"造不出 List<T>"，两个坑：
+//    ① `ref List<T>` 签名里的 MonoType 是 BYREF 包装（MONO_TYPE_BYREF=0x10）——
+//       mono_class_from_mono_type 对 byref 返回 null；
+//    ② mono_object_new 不跑 .ctor，List._items 还是 null，传进游戏会抛异常。
+//    所以三条造 List 的路都做可用性校验（get_Count 能跑通才算数）。
+//
+//  路线 D（最后兜底）：LevelObjectManager._instance._dictionary 遍历 LevelObject，
+//    有灶台型号表时按 staticId 直判，否则拿实体上的 CookBuildComponent 探一次。
+//    ⚠️ 不再走 EntityWorld.GetComponentSystem（PC 源码零命中，逆向猜出来的旁路）。
+//
+//  面包屑：cook:bm:N（BM 路成功 N 个）/ cook:found:N:L|D（兜底路成功）/
+//          cook:bm-fail:<stage>，stage 语义：
+//            1 BuildModule 类未找到          2 GetBuildItems 或单例未找到
+//            3 调用抛异常/返回 null          4 List 枚举不出来
+//            5 有候选但一个都没判定成灶台（附候选数 /N）   6 列表为空
 // ============================================================================
 
 // List`1 类名/命名空间校验：开放泛型和关闭泛型的 Name 都是 "List`1"，
@@ -2453,6 +2458,11 @@ struct SMCookFieldCache {
     void *f_burnerMap = nullptr;
     void *f_burnerEntity = nullptr;
     void *f_burnerType = nullptr;
+    // 组件 → 实体的"方法"通道（BuildModule.GetBuildItems 的元素只有 get_entity()）
+    void *m_getEntity = nullptr;
+    // 组件 → 型号的"方法"通道（ComponentData 属性返回装箱结构，只能按方法取）
+    void *m_getCompData = nullptr;
+    void *f_compDataStaticId = nullptr;
 };
 
 static void SMCookResolveFields(void *cookKlass, SMCookFieldCache *cache) {
@@ -2471,6 +2481,151 @@ static void SMCookResolveFields(void *cookKlass, SMCookFieldCache *cache) {
     if (!cache->f_burnerMap)
         cache->f_burnerMap =
                 FindFieldInHierarchy(cookKlass, (const char *) OBFUSCATE("cookBurnerMap"));
+    if (!cache->f_entity) {
+        cache->m_getEntity =
+                FindMethodInHierarchy(cookKlass, (const char *) OBFUSCATE("get_entity"), 0);
+        if (!cache->m_getEntity)
+            cache->m_getEntity =
+                    FindMethodInHierarchy(cookKlass, (const char *) OBFUSCATE("get_Entity"), 0);
+    }
+}
+
+// 组件 → 型号（BuildModule 路的元素不一定是 CookBuildComponent，没有 _cookerStaticId）：
+// ComponentData 只按"方法/属性"取（mono 会把返回的值类型装箱）；绝不当字段读，
+// 否则内联结构会被当指针用。
+static int SMCookStaticIdFromComponentData(void *comp, SMCookFieldCache *cache) {
+    if (!comp || !cache) return 0;
+    if (!cache->m_getCompData) {
+        void *klass = _monoObjectGetClass(comp);
+        if (!klass) return 0;
+        cache->m_getCompData =
+                FindMethodInHierarchy(klass, (const char *) OBFUSCATE("get_ComponentData"), 0);
+        if (!cache->m_getCompData)
+            cache->m_getCompData =
+                    FindMethodInHierarchy(klass, (const char *) OBFUSCATE("ComponentData"), 0);
+        if (!cache->m_getCompData)
+            cache->m_getCompData =
+                    FindMethodInHierarchy(klass, (const char *) OBFUSCATE("get_componentData"), 0);
+    }
+    if (!cache->m_getCompData) return 0;
+    void *exc = nullptr;
+    void *dataObj = _monoRuntimeInvoke(cache->m_getCompData, comp, nullptr, &exc);
+    if (!dataObj || exc) return 0;
+    if (!cache->f_compDataStaticId) {
+        void *dataKlass = _monoObjectGetClass(dataObj);
+        if (!dataKlass) return 0;
+        cache->f_compDataStaticId =
+                FindFieldInHierarchy(dataKlass, (const char *) OBFUSCATE("staticId"));
+        if (!cache->f_compDataStaticId)
+            cache->f_compDataStaticId =
+                    FindFieldInHierarchy(dataKlass, (const char *) OBFUSCATE("staticID"));
+        if (!cache->f_compDataStaticId)
+            cache->f_compDataStaticId =
+                    FindFieldInHierarchy(dataKlass, (const char *) OBFUSCATE("Id"));
+    }
+    if (!cache->f_compDataStaticId) return 0;
+    int staticId = 0;
+    _monoFieldGetValue(dataObj, cache->f_compDataStaticId, &staticId);
+    return staticId;
+}
+
+// 静态判定：MONO_METHOD_ATTR_STATIC=0x10。flags 读不出来（老 bug 下膨胀方法恒 0）时
+// 按静态处理 —— 与安卓在役版一致（它一直传 nullptr this）。
+static bool SMCookMethodIsStatic(void *method) {
+    if (!method) return false;
+    const uint32_t flags = SMMonoHot::MethodGetFlags(method, nullptr);
+    return flags == 0 || (flags & 0x10u) != 0;
+}
+
+// 实体 → 资源型号：EntityUtil.GetEntityResId(uint netId)（静态 1 参，返回 boxed int）
+static int SMCookEntityResId(uint32_t netId) {
+    if (netId == 0) return 0;
+    static void *s_utilKlass = nullptr;
+    static bool s_resolved = false;
+    if (!s_resolved) {
+        s_resolved = true;
+        void *img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity"));
+        if (!img) img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
+        if (img)
+            s_utilKlass = _monoClassFromName(
+                    img, (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"),
+                    (const char *) OBFUSCATE("EntityUtil"));
+    }
+    if (!s_utilKlass) return 0;
+    void *m = FindMethodInHierarchy(s_utilKlass, (const char *) OBFUSCATE("GetEntityResId"), 1);
+    if (!m || !SMCookMethodIsStatic(m)) return 0;
+    uint32_t arg = netId;
+    void *args[1] = {&arg};
+    void *exc = nullptr;
+    void *res = _monoRuntimeInvoke(m, nullptr, args, &exc);
+    if (!res || exc) return 0;
+    return *(int *) _monoObjectUnbox(res);
+}
+
+// 型号是不是灶台：先查 TableData 拉到的灶台名表，再问 TableData.GetCooker(staticId, false)。
+// 返回 1=是 0=不是 -1=判不了（表不可用）。
+static int SMCookTableCookerKnown(int staticId) {
+    if (staticId <= 0) return 0;
+    if (g_cookerNamesCache.find(staticId) != g_cookerNamesCache.end()) return 1;
+    static std::unordered_map<int, int> s_known;
+    auto hit = s_known.find(staticId);
+    if (hit != s_known.end()) return hit->second;
+    if (!SMMonoHot::Available()) return -1;
+
+    void *image = _monoImageLoaded((const char *) OBFUSCATE("EcsClient"));
+    if (!image) image = _monoImageLoaded((const char *) OBFUSCATE("EcsClient.dll"));
+    if (!image) return -1;
+    void *tableData = _monoClassFromName(image, (const char *) OBFUSCATE(""),
+                                         (const char *) OBFUSCATE("TableData"));
+    if (!tableData)
+        tableData = _monoClassFromName(image, (const char *) OBFUSCATE("XD.GameGerm.ExpParser"),
+                                       (const char *) OBFUSCATE("TableData"));
+    if (!tableData) return -1;
+
+    int value = -1;
+    void *m = FindMethodInHierarchy(tableData, (const char *) OBFUSCATE("GetCooker"), 2);
+    if (m && SMCookMethodIsStatic(m)) {
+        int argId = staticId;
+        bool needException = false;
+        void *args[2] = {&argId, &needException};
+        void *exc = nullptr;
+        void *row = _monoRuntimeInvoke(m, nullptr, args, &exc);
+        if (!exc) value = row ? 1 : 0;
+    }
+    if (value < 0) {
+        m = FindMethodInHierarchy(tableData, (const char *) OBFUSCATE("GetCooker"), 1);
+        if (m && SMCookMethodIsStatic(m)) {
+            int argId = staticId;
+            void *args[1] = {&argId};
+            void *exc = nullptr;
+            void *row = _monoRuntimeInvoke(m, nullptr, args, &exc);
+            if (!exc) value = row ? 1 : 0;
+        }
+    }
+    if (value >= 0) s_known[staticId] = value;
+    return value;
+}
+
+// 单例：get_Instance() → 静态字段 _instance / Instance
+static void *SMCookSingletonInstance(void *klass) {
+    if (!klass) return nullptr;
+    void *inst = nullptr;
+    void *m = FindMethodInHierarchy(klass, (const char *) OBFUSCATE("get_Instance"), 0);
+    if (!m) m = FindMethodInHierarchy(klass, (const char *) OBFUSCATE("get_instance"), 0);
+    if (m) {
+        void *exc = nullptr;
+        inst = _monoRuntimeInvoke(m, nullptr, nullptr, &exc);
+        if (exc) inst = nullptr;
+    }
+    if (!inst) {
+        void *f = FindFieldInHierarchy(klass, (const char *) OBFUSCATE("_instance"));
+        if (!f) f = FindFieldInHierarchy(klass, (const char *) OBFUSCATE("Instance"));
+        if (f) {
+            void *vtable = _monoClassGetVTable(_monoGetRootDomain(), klass);
+            if (vtable) _monoFieldStaticGetValue(vtable, f, &inst);
+        }
+    }
+    return inst;
 }
 
 static void SMCookAddTarget(std::vector<CookerTarget> *found, const CookerTarget &target) {
@@ -2482,24 +2637,37 @@ static void SMCookAddTarget(std::vector<CookerTarget> *found, const CookerTarget
 }
 
 // pureFallbackId：字典/列表自带实体 id 时传进来，get_InstanceID 拿不到就用它。
-static void SMCookPushComponent(void *comp, SMCookFieldCache *cache, uint32_t pureFallbackId,
-                                std::vector<CookerTarget> *found) {
-    if (!comp || !cache || !found) return;
+// staticIdOverride：调用方已解好的型号（BuildModule 路的 ComponentData.staticId）。
+// 返回是否真的产出了目标。
+static bool SMCookPushComponentEx(void *comp, SMCookFieldCache *cache, uint32_t pureFallbackId,
+                                  int staticIdOverride, std::vector<CookerTarget> *found) {
+    if (!comp || !cache || !found) return false;
 
-    int staticIdVal = 0;
-    if (cache->f_staticId) _monoFieldGetValue(comp, cache->f_staticId, &staticIdVal);
-    if (staticIdVal <= 0) return;   // 没有炉子型号 → 不是灶台
-
+    // 组件 → 实体：字段 entity/_entity 优先，其次 get_entity()/get_Entity()
     void *entityObj = nullptr;
     if (cache->f_entity) _monoFieldGetValue(comp, cache->f_entity, &entityObj);
-    if (!entityObj) return;
+    if (!entityObj && cache->m_getEntity) {
+        void *exc0 = nullptr;
+        entityObj = _monoRuntimeInvoke(cache->m_getEntity, comp, nullptr, &exc0);
+        if (exc0) entityObj = nullptr;
+    }
+    if (!entityObj) return false;
 
     void *entKlass = _monoObjectGetClass(entityObj);
-    void *m_net = FindMethodInHierarchy(entKlass, (const char *) OBFUSCATE("get_netId"), 0);
+    void *m_net =
+            entKlass ? FindMethodInHierarchy(entKlass, (const char *) OBFUSCATE("get_netId"), 0)
+                     : nullptr;
     void *exc = nullptr;
     void *netObj = m_net ? _monoRuntimeInvoke(m_net, entityObj, nullptr, &exc) : nullptr;
     uint32_t cookerNetId = (netObj && !exc) ? *(uint32_t *) _monoObjectUnbox(netObj) : 0;
-    if (cookerNetId == 0) return;
+    if (cookerNetId == 0) return false;
+
+    // 型号：字段 _cookerStaticId → 调用方解好的 → EntityUtil.GetEntityResId(netId)
+    int staticIdVal = 0;
+    if (cache->f_staticId) _monoFieldGetValue(comp, cache->f_staticId, &staticIdVal);
+    if (staticIdVal <= 0) staticIdVal = staticIdOverride;
+    if (staticIdVal <= 0) staticIdVal = SMCookEntityResId(cookerNetId);
+    if (staticIdVal <= 0) return false;   // 没有炉子型号 → 不是灶台
 
     int pureId = 0;
     void *m_iid =
@@ -2604,29 +2772,162 @@ static void SMCookPushComponent(void *comp, SMCookFieldCache *cache, uint32_t pu
         }
         if (!exists) found->push_back(target);
     }
+    return true;
+}
+
+// 旧调用点（L/D 路）保持原签名：型号只从 _cookerStaticId 取。
+static void SMCookPushComponent(void *comp, SMCookFieldCache *cache, uint32_t pureFallbackId,
+                                std::vector<CookerTarget> *found) {
+    SMCookPushComponentEx(comp, cache, pureFallbackId, 0, found);
 }
 
 // ---------------------------------------------------------------------------
-//  S：EntityWorld.GetComponentSystem<T>() → _components 字典 → CookBuildComponent
-//     直接用工程里已跑通的 GetComponentsOfClass（AutoPumpkinSculpture.h，番茄/沙雕/
-//     水壶扫描都在用）：它优先走**非泛型**的 GetComponentSystem(Type) 重载 ——
-//     既不用膨胀泛型，也不用造 List，正好绕开 cook:no-list 的两个坑。
+//  BM：XDTGUI.Module.Build.BuildModule.GetBuildItems(uint playerNetId)（静态 1 参）
+//      —— 安卓在役版实测唯一能拿到"已摆建筑/家具"清单的入口；元素是构建组件，
+//      带 get_entity()，运行时类可能就是 CookBuildComponent（有 _cookerStaticId /
+//      _cookBurnerMap）。List 由游戏自己建好，这里只枚举；只有遇到 ref List<T>
+//      重载时才用工程既有的三条造 List 路现造一个。
+//      返回阶段码（0 = 成功且找到灶台）：
+//        1 BuildModule 类未找到             2 GetBuildItems / 单例未找到
+//        3 调用抛异常或返回 null            4 List 枚举不出来
+//        5 有候选但一个都没判定成灶台（outListed = 候选数）   6 列表为空
 // ---------------------------------------------------------------------------
-static bool SMCookScanViaComponentSystem(void *imgGameplay, void *imgData, void *cookKlass,
-                                         std::vector<CookerTarget> *found) {
-    if (!found || !cookKlass) return false;
+static int SMCookScanViaBuildModule(void *imgGameplay, void *imgData, void *cookKlass,
+                                    uint32_t playerNetId, std::vector<CookerTarget> *found,
+                                    int *outListed) {
+    if (outListed) *outListed = 0;
+    if (!found) return 2;
+    if (playerNetId == 0) return 3;
     (void) imgGameplay;
     (void) imgData;
-    std::vector<void *> components = GetComponentsOfClass(cookKlass);
-    if (components.empty()) return false;
+
+    void *klassBM = FindClassInBuildImages("XDTGUI.Module.Build", "BuildModule");
+    if (!klassBM) klassBM = FindClassInBuildImages("XDTLevelAndEntity", "BuildModule");
+    if (!klassBM) klassBM = FindClassInBuildImages("XDTGameUI.Module.Build", "BuildModule");
+    if (!klassBM) return 1;
+
+    void *m_items1 =
+            FindMethodInHierarchy(klassBM, (const char *) OBFUSCATE("GetBuildItems"), 1);
+    void *m_items2 =
+            FindMethodInHierarchy(klassBM, (const char *) OBFUSCATE("GetBuildItems"), 2);
+    void *m_items0 =
+            FindMethodInHierarchy(klassBM, (const char *) OBFUSCATE("GetBuildItems"), 0);
+    if (!m_items1 && !m_items2 && !m_items0) return 2;
+
+    bool needInstance = false;
+    // 实例方法必须取到单例才调（绝不用 nullptr 去试探，会 SIGSEGV）；
+    // flags 读不出来时按静态处理（与安卓在役版一致）。
+    auto invokeItems = [&](void *method, void **args) -> void * {
+        if (!method) return nullptr;
+        void *obj = nullptr;
+        if (!SMCookMethodIsStatic(method)) {
+            obj = SMCookSingletonInstance(klassBM);
+            if (!obj) {
+                needInstance = true;
+                return nullptr;
+            }
+        }
+        void *exc = nullptr;
+        void *result = _monoRuntimeInvoke(method, obj, args, &exc);
+        return exc ? nullptr : result;
+    };
+
+    uint32_t netIdArg = playerNetId;
+    void *args1[1] = {&netIdArg};
+    void *listObj = invokeItems(m_items1, args1);
+    if (!listObj && m_items2) {
+        // ref/out List<T>：只有这条重载才需要自己造 List（签名解包 → corlib → BCL）
+        int why = 1;
+        void *listSlot = SMCreateCookList(m_items2, cookKlass, &why);
+        if (listSlot) {
+            void *args2[2] = {&netIdArg, &listSlot};
+            void *obj = nullptr;
+            const bool isStatic = SMCookMethodIsStatic(m_items2);
+            if (!isStatic) {
+                obj = SMCookSingletonInstance(klassBM);
+                if (!obj) needInstance = true;
+            }
+            if (obj || isStatic) {
+                void *exc2 = nullptr;
+                _monoRuntimeInvoke(m_items2, obj, args2, &exc2);
+                if (!exc2) listObj = listSlot;
+            }
+        }
+    }
+    if (!listObj && m_items0) listObj = invokeItems(m_items0, nullptr);
+    if (!listObj) return needInstance ? 2 : 3;
+
+    void *listKlass = _monoObjectGetClass(listObj);
+    if (!listKlass) return 4;
+    // 返回类型兜底：List<T>（get_Count/get_Item 或 _items/_size 字段）或托管数组
+    const char *listKlassName = SMMonoHot::ClassGetName(listKlass);
+    const bool isMonoArray = listKlassName && strstr(listKlassName, "[]") != nullptr;
+    void *m_count = isMonoArray
+            ? nullptr
+            : FindMethodInHierarchy(listKlass, (const char *) OBFUSCATE("get_Count"), 0);
+    void *m_item = isMonoArray
+            ? nullptr
+            : FindMethodInHierarchy(listKlass, (const char *) OBFUSCATE("get_Item"), 1);
+    void *f_items = nullptr;
+    void *f_size = nullptr;
+    if (!isMonoArray && (!m_count || !m_item)) {
+        f_items = FindFieldInHierarchy(listKlass, (const char *) OBFUSCATE("_items"));
+        if (!f_items) f_items = FindFieldInHierarchy(listKlass, (const char *) OBFUSCATE("items"));
+        f_size = FindFieldInHierarchy(listKlass, (const char *) OBFUSCATE("_size"));
+        if (!f_size) f_size = FindFieldInHierarchy(listKlass, (const char *) OBFUSCATE("size"));
+        if (!f_items || !f_size) return 4;
+    }
+
+    int count = 0;
+    if (isMonoArray) {
+        count = SMMonoHot::ArrayLength(listObj);
+    } else if (m_count) {
+        void *exc3 = nullptr;
+        void *boxed = _monoRuntimeInvoke(m_count, listObj, nullptr, &exc3);
+        if (boxed && !exc3) count = *(int *) _monoObjectUnbox(boxed);
+    } else {
+        _monoFieldGetValue(listObj, f_size, &count);
+    }
+    if (count <= 0) return 6;
+    if (count > 20000) return 4;
+    if (outListed) *outListed = count;
+
+    void *itemsArr = nullptr;
+    if (isMonoArray) itemsArr = listObj;
+    else if (!m_item && f_items) _monoFieldGetValue(listObj, f_items, &itemsArr);
+
+    void *lastKlass = nullptr;
     SMCookFieldCache cache;
-    SMCookResolveFields(cookKlass, &cache);
-    for (void *comp : components) {
+    for (int i = 0; i < count; ++i) {
+        void *comp = nullptr;
+        if (m_item) {
+            int index = i;
+            void *indexArgs[1] = {&index};
+            void *exc4 = nullptr;
+            comp = _monoRuntimeInvoke(m_item, listObj, indexArgs, &exc4);
+            if (exc4) comp = nullptr;
+        } else if (itemsArr) {
+            comp = *(void **) SMMonoHot::ArrayAddrWithSize(itemsArr, (int) sizeof(void *),
+                                                           (uintptr_t) i);
+        }
         if (!comp) continue;
-        SMCookPushComponent(comp, &cache, 0, found);
+        void *itemKlass = _monoObjectGetClass(comp);
+        if (!itemKlass) continue;
+        if (itemKlass != lastKlass) {
+            lastKlass = itemKlass;
+            cache = SMCookFieldCache();
+            SMCookResolveFields(itemKlass, &cache);
+        }
+        int staticIdOverride = SMCookStaticIdFromComponentData(comp, &cache);
+        const bool cookMarker = (cache.f_burnerMap != nullptr) || (cache.f_staticId != nullptr);
+        if (!cookMarker) {
+            // 不是 CookBuildComponent：只认型号表里确实是灶台的，别把墙/地板/家具收进来
+            if (SMCookTableCookerKnown(staticIdOverride) != 1) continue;
+        }
+        SMCookPushComponentEx(comp, &cache, 0, staticIdOverride, found);
         if (found->size() >= 256) break;
     }
-    return !found->empty();
+    return found->empty() ? 5 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2773,15 +3074,17 @@ static bool SMCookScanViaLevelObjects(void *imgGameplay, void *imgData, void *en
 }
 
 void ScanCookersNative() {
-    // 按 PC 模组权威调用链重写：
-    //   Entities.GetComponents<CookBuildComponent>(ref List<T>)
-    //   → comp._cookerStaticId / comp.entity / comp._cookBurnerMap
-    //   → (cookerNetId, levelObjectNetId=(1<<32)|key, staticId, cookType)
-    // List 造不出来时依次退到 GetComponentSystem 字典和 LevelObject 字典，
-    // 保证至少能拿到若干灶台（面包屑出现 cook:found:N）。
+    // 扫描链（优先级从高到低）：
+    //   BM  XDTGUI.Module.Build.BuildModule.GetBuildItems(playerNetId)（安卓真机实测可用）
+    //   L   Entities.GetComponents<CookBuildComponent>(ref List<T>)（PC 权威，List 可能造不出来）
+    //   D   LevelObjectManager._instance._dictionary（最后兜底）
+    // 组件 → CookerTarget 统一走 SMCookPushComponentEx：
+    //   netId(get_netId) / burnerId((1<<32)|_cookBurnerMap.Key) / staticId / cookType
+    // 面包屑：cook:bm:N（BM 路）/ cook:found:N:L|D / cook:bm-fail:<stage>。
     RunOnUnityThreadAsync([]() {
         _monoThreadAttach(_monoGetRootDomain());
         if (!g_cookPn.empty()) FetchCookerNamesFromTable();
+        if (g_gardenPlayerNetId == 0) GetPlayerNetIdOnUnityThread();
 
         void *imgGameplay = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity"));
         if (!imgGameplay) imgGameplay = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
@@ -2800,13 +3103,26 @@ void ScanCookersNative() {
                 if (cookKlass) break;
             }
         }
-        if (!cookKlass) { SMPlatform::SetBreadcrumbLight("cook:no-cls"); return; }
 
         void *imgData = _monoImageLoaded((const char *) OBFUSCATE("XDTDataAndProtocol"));
         if (!imgData) imgData = _monoImageLoaded((const char *) OBFUSCATE("XDTDataAndProtocol.dll"));
 
+        std::vector<CookerTarget> found;
+        const char *source = nullptr;
+        int bmStage = 0;
+        int bmListed = 0;
+        int listWhy = 1;
+        bool listBuilt = false;
+        int listCount = 0;
         void *entitiesCls = nullptr;
-        {
+
+        // ---------------- 路线 BM：BuildModule.GetBuildItems（安卓实测可用） ----------------
+        bmStage = SMCookScanViaBuildModule(imgGameplay, imgData, cookKlass,
+                                           g_gardenPlayerNetId, &found, &bmListed);
+        if (!found.empty()) source = "BM";
+
+        // ---------------- 路线 L：Entities.GetComponents<T>(ref List<T>) ----------------
+        if (found.empty() && cookKlass) {
             void *imgs[2] = {imgGameplay, imgData};
             for (int ii = 0; ii < 2 && !entitiesCls; ++ii) {
                 if (!imgs[ii]) continue;
@@ -2814,91 +3130,78 @@ void ScanCookersNative() {
                     (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"),
                     (const char *) OBFUSCATE("Entities"));
             }
-        }
-
-        std::vector<CookerTarget> found;
-        const char *source = nullptr;
-        int listWhy = 1;
-        bool listBuilt = false;
-
-        // ---------------- 路线 1：Entities.GetComponents<T>(ref List<T>) ----------------
-        if (!entitiesCls) {
-            SMPlatform::SetBreadcrumbLight("cook:no-entities");
-        } else {
-            void *openGet = FindMethodInHierarchy(entitiesCls, (const char *) OBFUSCATE("GetComponents"), 1);
-            void *cookType = _monoClassGetType(cookKlass);
-            void *closed = nullptr;
-            if (openGet && cookType) {
-                void *typeArgs[1] = {cookType};
-                void *genInst = _mono_metadata_get_generic_inst(1, typeArgs);
-                if (genInst) {
-                    MonoGenericContext ctx;
-                    ctx.class_inst = nullptr;
-                    ctx.method_inst = genInst;
-                    closed = _mono_class_inflate_generic_method(openGet, &ctx);
-                    if (closed) _monoCompileMethod(closed);
+            if (entitiesCls) {
+                void *openGet = FindMethodInHierarchy(entitiesCls, (const char *) OBFUSCATE("GetComponents"), 1);
+                void *cookType = _monoClassGetType(cookKlass);
+                void *closed = nullptr;
+                if (openGet && cookType) {
+                    void *typeArgs[1] = {cookType};
+                    void *genInst = _mono_metadata_get_generic_inst(1, typeArgs);
+                    if (genInst) {
+                        MonoGenericContext ctx;
+                        ctx.class_inst = nullptr;
+                        ctx.method_inst = genInst;
+                        closed = _mono_class_inflate_generic_method(openGet, &ctx);
+                        if (closed) _monoCompileMethod(closed);
+                    }
                 }
-            }
-            if (!closed) {
-                SMPlatform::SetBreadcrumbLight("cook:no-inflate");
-            } else {
-                void *listObj = SMCreateCookList(closed, cookKlass, &listWhy);
-                if (listObj) {
-                    listBuilt = true;
-                    void *listSlot = listObj;
-                    void *getArgs[1] = {&listSlot};
-                    void *exc = nullptr;
-                    _monoRuntimeInvoke(closed, nullptr, getArgs, &exc);
-                    listObj = listSlot;
-                    void *listKlass = listObj ? _monoObjectGetClass(listObj) : nullptr;
-                    void *m_count = listKlass ? FindMethodInHierarchy(listKlass, (const char *) OBFUSCATE("get_Count"), 0) : nullptr;
-                    void *m_item = listKlass ? FindMethodInHierarchy(listKlass, (const char *) OBFUSCATE("get_Item"), 1) : nullptr;
-                    if (listObj && !exc && m_count && m_item) {
-                        exc = nullptr;
-                        void *cntObj = _monoRuntimeInvoke(m_count, listObj, nullptr, &exc);
-                        int count = (cntObj && !exc) ? *(int *) _monoObjectUnbox(cntObj) : 0;
-                        if (count > 100000) count = 0;
-                        SMPlatform::SetBreadcrumbLight("cook:list:" + std::to_string(count));
-                        SMCookFieldCache cache;
-                        SMCookResolveFields(cookKlass, &cache);
-                        for (int i = 0; i < count; ++i) {
-                            int index = i;
-                            void *iArgs[1] = {&index};
+                if (closed) {
+                    void *listObj = SMCreateCookList(closed, cookKlass, &listWhy);
+                    if (listObj) {
+                        listBuilt = true;
+                        void *listSlot = listObj;
+                        void *getArgs[1] = {&listSlot};
+                        void *exc = nullptr;
+                        _monoRuntimeInvoke(closed, nullptr, getArgs, &exc);
+                        listObj = listSlot;
+                        void *listKlass = listObj ? _monoObjectGetClass(listObj) : nullptr;
+                        void *m_count = listKlass ? FindMethodInHierarchy(listKlass, (const char *) OBFUSCATE("get_Count"), 0) : nullptr;
+                        void *m_item = listKlass ? FindMethodInHierarchy(listKlass, (const char *) OBFUSCATE("get_Item"), 1) : nullptr;
+                        if (listObj && !exc && m_count && m_item) {
                             exc = nullptr;
-                            void *comp = _monoRuntimeInvoke(m_item, listObj, iArgs, &exc);
-                            if (!comp || exc) continue;
-                            SMCookPushComponent(comp, &cache, 0, &found);
+                            void *cntObj = _monoRuntimeInvoke(m_count, listObj, nullptr, &exc);
+                            int count = (cntObj && !exc) ? *(int *) _monoObjectUnbox(cntObj) : 0;
+                            if (count > 100000) count = 0;
+                            listCount = count;
+                            SMCookFieldCache cache;
+                            SMCookResolveFields(cookKlass, &cache);
+                            for (int i = 0; i < count; ++i) {
+                                int index = i;
+                                void *iArgs[1] = {&index};
+                                exc = nullptr;
+                                void *comp = _monoRuntimeInvoke(m_item, listObj, iArgs, &exc);
+                                if (!comp || exc) continue;
+                                SMCookPushComponent(comp, &cache, 0, &found);
+                            }
+                            if (!found.empty()) source = "L";
                         }
-                        if (!found.empty()) source = "L";
                     }
                 }
             }
         }
 
-        // ---------------- 路线 2：EntityWorld.GetComponentSystem<T>() ----------------
-        if (found.empty()) {
-            SMPlatform::SetBreadcrumbLight("cook:slot:sys");
-            if (SMCookScanViaComponentSystem(imgGameplay, imgData, cookKlass, &found))
-                source = "S";
-        }
-
-        // ---------------- 路线 3：LevelObjectManager._instance._dictionary ----------------
-        if (found.empty()) {
-            SMPlatform::SetBreadcrumbLight("cook:slot:lom");
+        // ---------------- 路线 D：LevelObjectManager._instance._dictionary ----------------
+        if (found.empty() && cookKlass) {
             if (SMCookScanViaLevelObjects(imgGameplay, imgData, entitiesCls, cookKlass, &found))
                 source = "D";
         }
 
         if (!found.empty()) {
             g_availableCookers = found;
-            SMPlatform::SetBreadcrumbLight("cook:found:" + std::to_string((int) found.size()) +
-                                           ":" + (source ? source : "?"));
+            const std::string cnt = std::to_string((int) found.size());
+            if (source && strcmp(source, "BM") == 0)
+                SMPlatform::SetBreadcrumbLight("cook:bm:" + cnt);
+            else
+                SMPlatform::SetBreadcrumbLight("cook:found:" + cnt + ":" + (source ? source : "?"));
             return;
         }
-        if (!listBuilt)
-            SMPlatform::SetBreadcrumbLight("cook:no-list:" + std::to_string(listWhy));
-        else
-            SMPlatform::SetBreadcrumbLight("cook:zero");
+
+        // 全灭：把 BM 的失败阶段带出来（5 再附候选数），后面附 L 路阶段
+        std::string bc = "cook:bm-fail:" + std::to_string(bmStage);
+        if (bmStage == 5 && bmListed > 0) bc += "/" + std::to_string(bmListed);
+        if (listBuilt) bc += ":L" + std::to_string(listCount);
+        else if (cookKlass) bc += ":L" + std::to_string(listWhy);
+        SMPlatform::SetBreadcrumbLight(bc);
     });
 }
 
