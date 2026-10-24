@@ -989,6 +989,7 @@ void DrawMenu() {
 
             if (g_instantFarmingActive) {
                 if (ImGui::Button(Tr("STOP INSTANT RESOURCE FARM", u8"停止瞬间资源采集"), ImVec2(-1, 70))) {
+                    SMPlatform::SetBreadcrumbLight("farm:stop");
                     g_instantFarmingActive = false;
                     g_instantFarmGeneration.fetch_add(1, std::memory_order_acq_rel);
                 }
@@ -996,15 +997,20 @@ void DrawMenu() {
                 bool selected = false;
                 for (int i = 0; i < NUM_RESOURCES; ++i) selected = selected || g_farmSelections[i];
                 if (selected && SesiAktif()) {
+                    // 阶段打点：用户点下按钮就要能在"主页/崩溃报告"里看到走到哪一步。
+                    SMPlatform::SetBreadcrumbLight("farm:start");
                     g_instantFarmGeneration.fetch_add(1, std::memory_order_acq_rel);
                     g_instantFarmingActive = true;
                     std::thread([]() {
                         if (!SesiAktif()) {
+                            SMPlatform::SetBreadcrumbLight("farm:start-nosesi");
                             g_instantFarmingActive = false;
                             return;
                         }
+                        SMPlatform::SetBreadcrumbLight("farm:start-payload");
                         InvokeRequest req = FetchPayloadSync(WireForOp(OP_INSTANT_FARM_TRIGGER));
                         if (req.dllName.empty() || req.nameSpace.empty() || req.className.empty()) {
+                            SMPlatform::SetBreadcrumbLight("farm:start-nopayload");
                             g_instantFarmingActive = false;
                             return;
                         }

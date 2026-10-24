@@ -49,6 +49,162 @@ static void *AndroidMonoArrayNew(void *domain, void *byteKlass, size_t count);
 static int CountBackpackItemTotalByStaticId(int targetStaticId);
 static void *GetLocalPlayerInstance();
 
+// ===========================================================================
+//  传送 / 瞬间采集链路（传送采集物资）的 mono 安全守卫
+// ---------------------------------------------------------------------------
+//  背景：这一整条链路是从 Android 版（纯 il2cpp）逐行照搬到 iOS 的。il2cpp 上
+//  「实例方法传 nullptr」通常只是把 0 当 this 送进去、方法体不碰 this 就侥幸不炸；
+//  侧载 iOS 是 il2cpp AOT + 加密 mono 双运行时，热更层的游戏类（EntityWorld /
+//  CollectableComponent / ResourceProtocolManager / EntityHelper）全在 mono 里，
+//  mono_runtime_invoke(method, NULL, ...) 会把 NULL 当 this 交给 IL，
+//  方法体一碰 this 就是 SIGSEGV —— 没有 C++ 异常、没有堆栈，表现就是"点一下闪退"。
+//
+//  这里的三个守卫覆盖了链路上全部「已知会崩」的调用形态：
+//    ① SmFarmMethodIsStatic / SmFarmInvoke —— 实例方法传 nullptr 的通用拦截
+//    ② SmFarmResolveSingleton            —— 需要实例时取单例，取不到安全 return
+//    ③ SmFarmDictEntries                 —— mono 数组长度/首元素地址（il2cpp 偏移禁读）
+// ===========================================================================
+
+// mono 方法是否 static。非 mono（AOT/il2cpp）方法返回 true = 保持旧行为（按静态传）。
+static bool SmFarmMethodIsStatic(void *method) {
+    if (!method) return true;
+    if (!SMMonoHot::IsMonoMethod(method)) return true;
+    return (SMMonoHot::MethodGetFlags(method, nullptr) & 0x10u) != 0u;  // METHOD_ATTRIBUTE_STATIC
+}
+
+// 统一 invoke 入口：mono 实例方法缺 this 时直接返回 nullptr，绝不带死调用。
+static void *SmFarmInvoke(void *method, void *instance, void **params, void **outExc) {
+    void *dummyExc = nullptr;
+    if (outExc) *outExc = nullptr;
+    if (!method) return nullptr;
+    if (!SMMonoHot::IsMonoMethod(method))
+        return _monoRuntimeInvoke(method, instance, params, outExc ? outExc : &dummyExc);
+    if (SmFarmMethodIsStatic(method))
+        return _monoRuntimeInvoke(method, nullptr, params, outExc ? outExc : &dummyExc);
+    if (!instance) return nullptr;   // 实例方法 + 空 this = SIGSEGV，直接放弃
+    return _monoRuntimeInvoke(method, instance, params, outExc ? outExc : &dummyExc);
+}
+
+// 取单例/全局实例：静态访问器（get_Instance/get_Current/…）→ 静态字段（_instance/…）。
+// 只调用静态访问器；实例 accessor 传 nullptr 一样会崩，直接跳过。
+static void *SmFarmResolveSingleton(void *klass) {
+    if (!klass) return nullptr;
+    static const char *kAccessors[] = {
+            "get_Instance", "get_instance", "get_Current", "get_CurrentWorld",
+            "get_CurWorld", "get_World", "get_LogicWorld", "get_Default",
+            "get_Main", "GetInstance", "GetWorld", "get_Singleton",
+    };
+    for (const char *name : kAccessors) {
+        void *m = FindMethodInHierarchy(klass, name, 0);
+        if (!m || !SmFarmMethodIsStatic(m)) continue;
+        void *exc = nullptr;
+        void *inst = _monoRuntimeInvoke(m, nullptr, nullptr, &exc);
+        if (inst && !exc) return inst;
+    }
+    static const char *kFields[] = {
+            "_instance", "instance", "s_instance", "m_instance", "Instance",
+            "<Instance>k__BackingField", "_current", "Current",
+    };
+    void *vtable = _monoClassGetVTable ? _monoClassGetVTable(_monoGetRootDomain(), klass) : nullptr;
+    if (!vtable) return nullptr;
+    for (const char *name : kFields) {
+        void *field = FindFieldInHierarchy(klass, name);
+        if (!field) continue;
+        void *inst = nullptr;
+        _monoFieldStaticGetValue(vtable, field, &inst);
+        if (inst) return inst;
+    }
+    return nullptr;
+}
+
+// Dictionary.entries（T[]）→ 长度 + 首元素地址。
+//   il2cpp：length@+0x18、data@+0x20（固定偏移，旧行为）
+//   mono  ：必须走 mono_array_length / mono_array_addr_with_size；直接按 il2cpp
+//           偏移读会拿到天文长度 → 循环越界读 → SIGSEGV（报告 §9.2 / G07）
+// 返回 false 表示长度或数据地址不可信，调用方必须直接 return。
+static bool SmFarmDictEntries(void *dictObj, void *entriesArr, int *outLength,
+                              uint8_t **outData) {
+    if (outLength) *outLength = 0;
+    if (outData) *outData = nullptr;
+    if (!entriesArr) return false;
+    void *arrMonoKlass = nullptr;
+    void *dictKlass = dictObj ? _monoObjectGetClass(dictObj) : nullptr;
+    const bool monoArray = SMMonoHot::ClassifyObject(entriesArr, &arrMonoKlass) ||
+                           (dictKlass && SMMonoHot::IsMonoClass(dictKlass));
+    if (monoArray && SMMonoHot::Available()) {
+        const int length = SMMonoHot::ArrayLength(entriesArr);
+        void *first = SMMonoHot::ArrayAddrWithSize(entriesArr, SZ_DICT_ENTRY, 0);
+        if (length <= 0 || length > 200000 || !first) return false;
+        if (outLength) *outLength = length;
+        if (outData) *outData = (uint8_t *) first;
+        return true;
+    }
+    const uintptr_t addr = (uintptr_t) entriesArr;
+    const int length = SafeRead<int>(addr + OFF_ARR_COUNT, 0);
+    if (length <= 0 || length > 200000) return false;
+    if (outLength) *outLength = length;
+    if (outData) *outData = (uint8_t *) (addr + OFF_ARR_DATA);
+    return true;
+}
+
+// EntityWorld.GetComponentSystem<T>()：三件事必须同时成立才调用，否则安全返回 nullptr。
+//   ① 膨胀泛型后先 _monoCompileMethod（iOS mono 是 IL 解释器，不编译取不到入口）
+//   ② 方法是实例方法时必须给真实 EntityWorld 实例（nullptr this = SIGSEGV）
+//   ③ 拿不到实例就 return（宁可这次采集空转，也不要闪退）
+static void *SmFarmGetComponentSystem(void *worldKlass, void *componentKlass,
+                                      const std::string &stagePrefix) {
+    if (!worldKlass || !componentKlass) return nullptr;
+    void *componentType = _monoClassGetType(componentKlass);
+    if (!componentType) return nullptr;
+    void *openMethod = FindMethodInHierarchy(worldKlass, OBFUSCATE("GetComponentSystem"), 0);
+    if (!openMethod) {
+        SMPlatform::SetBreadcrumbLight(stagePrefix + ":no-open");
+        return nullptr;
+    }
+    void *typeArgs[] = {componentType};
+    void *methodInst = _mono_metadata_get_generic_inst(1, typeArgs);
+    if (!methodInst) {
+        SMPlatform::SetBreadcrumbLight(stagePrefix + ":no-inflate");
+        return nullptr;
+    }
+    MonoGenericContext ctx = {nullptr, methodInst};
+    void *closed = _mono_class_inflate_generic_method(openMethod, &ctx);
+    if (!closed) {
+        SMPlatform::SetBreadcrumbLight(stagePrefix + ":no-inflate");
+        return nullptr;
+    }
+    const bool monoClosed = SMMonoHot::IsMonoMethod(closed);
+    if (monoClosed) _monoCompileMethod(closed);   // 解释器模式：膨胀泛型必须先编译
+    const bool needInstance = monoClosed && !SmFarmMethodIsStatic(closed);
+    SMPlatform::SetBreadcrumbLight(stagePrefix + (needInstance ? ":csig:i" : ":csig:s"));
+    void *worldInst = nullptr;
+    if (needInstance) {
+        worldInst = SmFarmResolveSingleton(worldKlass);
+        if (!worldInst) {
+            SMPlatform::SetBreadcrumbLight(stagePrefix + ":no-inst");
+            return nullptr;
+        }
+        SMPlatform::SetBreadcrumbLight(stagePrefix + ":inst");
+    }
+    void *exc = nullptr;
+    void *sysObj = _monoRuntimeInvoke(closed, worldInst, nullptr, &exc);
+    if (exc || !sysObj) {
+        SMPlatform::SetBreadcrumbLight(stagePrefix + ":compsys-fail");
+        return nullptr;
+    }
+    return sysObj;
+}
+
+// unbox 判空：mono_object_unbox 对 null/错型返回 null，直接解引用就是 SIGSEGV。
+static inline void *SmFarmUnbox(const void *boxed) {
+    if (!boxed) return nullptr;
+    return _monoObjectUnbox(const_cast<void *>(boxed));
+}
+
+// 传送/采集链路里"这一次传送是否真的发出去了"（AutoMoveTransferNative 用它回报）。
+//   0 = 还没结论，1 = 已调用，2 = 被安全跳过（实例方法缺 this / 找不到方法）
+static std::atomic<int> g_smTeleportResult{0};
+
 struct ESPCachedMethods {
     bool isInitialized = false;
     void *m_GetPlayer = nullptr;
@@ -1958,21 +2114,32 @@ void PickAllOwnedMaturePlants(
         void* imgGameplay = _monoImageLoaded(imgGameplayName.c_str());
         if (!imgGameplay && imgGameplayName.find(".dll") == std::string::npos)
             imgGameplay = _monoImageLoaded((imgGameplayName + ".dll").c_str());
-        if (!imgData || !imgGameplay) return;
+        if (!imgData || !imgGameplay) {
+            SMPlatform::SetBreadcrumbLight("pickall:no-img");
+            return;
+        }
 
+        SMPlatform::SetBreadcrumbLight("pickall:player");
         void* playerClass = _monoClassFromName(imgData, PN("n_nsPlayerData").c_str(), PN("n_clsPlayerData").c_str());
         void* gameplayApi = _monoClassFromName(imgGameplay, PN("n_nsGameplayApi").c_str(), PN("n_clsGameplayApi").c_str());
         void* getSelf = playerClass ? FindMethodInHierarchy(playerClass, PN("n_getSelfId").c_str(), 0) : nullptr;
         void* getOwner = gameplayApi ? FindMethodInHierarchy(gameplayApi, PN("n_getFieldOwner").c_str(), 0) : nullptr;
-        if (!getSelf || !getOwner) return;
+        if (!getSelf || !getOwner) {
+            SMPlatform::SetBreadcrumbLight("pickall:no-player-method");
+            return;
+        }
         void* exc = nullptr;
-        void* selfObj = _monoRuntimeInvoke(getSelf, nullptr, nullptr, &exc);
+        void* selfObj = SmFarmInvoke(getSelf, nullptr, nullptr, &exc);
         if (!selfObj || exc) return;
-        uint32_t selfId = *(uint32_t*)_monoObjectUnbox(selfObj);
+        void* selfRaw = SmFarmUnbox(selfObj);
+        if (!selfRaw) return;
+        uint32_t selfId = *(uint32_t*)selfRaw;
         exc = nullptr;
-        void* ownerObj = _monoRuntimeInvoke(getOwner, nullptr, nullptr, &exc);
+        void* ownerObj = SmFarmInvoke(getOwner, nullptr, nullptr, &exc);
         if (!ownerObj || exc) return;
-        uint32_t fieldOwner = *(uint32_t*)_monoObjectUnbox(ownerObj);
+        void* ownerRaw = SmFarmUnbox(ownerObj);
+        if (!ownerRaw) return;
+        uint32_t fieldOwner = *(uint32_t*)ownerRaw;
         if (!selfId || fieldOwner != selfId) return;
 
         void* plantClass = _monoClassFromName(imgGameplay, PN("n_nsHomeland").c_str(), PN("n_clsPlant").c_str());
@@ -1982,24 +2149,27 @@ void PickAllOwnedMaturePlants(
         if (!worldClass) worldClass = _monoClassFromName(imgGameplay, OBFUSCATE("XDTLevelAndEntity.Core.World"), PN("n_clsWorld").c_str());
         if (!worldClass) worldClass = _monoClassFromName(imgData, OBFUSCATE("XDTLevelAndEntity.Core.World"), PN("n_clsWorld").c_str());
         if (!plantClass || !furnitureClass || !worldClass) return;
-        void* open = FindMethodInHierarchy(worldClass, PN("n_getComponentSystem").c_str(), 0);
-        if (!open) return;
-        void* typeArgs[] = {_monoClassGetType(plantClass)};
-        void* inst = _mono_metadata_get_generic_inst(1, typeArgs);
-        MonoGenericContext ctx = {nullptr, inst};
-        void* closed = _mono_class_inflate_generic_method(open, &ctx);
-        exc = nullptr;
-        void* system = _monoRuntimeInvoke(closed, nullptr, nullptr, &exc);
-        if (!system || exc) return;
+        // mono 上 GetComponentSystem<T> 是实例方法：膨胀后必须 mono_compile_method
+        // 并给真实 EntityWorld 实例，否则 nullptr this = SIGSEGV。
+        SMPlatform::SetBreadcrumbLight("pickall:compsys");
+        void* system = SmFarmGetComponentSystem(worldClass, plantClass, "pickall");
+        if (!system) return;
         void* componentsField = FindFieldInHierarchy(_monoObjectGetClass(system), PN("n_components").c_str());
         void* dictionary = nullptr;
         if (componentsField) _monoFieldGetValue(system, componentsField, &dictionary);
-        if (!dictionary) return;
+        if (!dictionary) {
+            SMPlatform::SetBreadcrumbLight("pickall:no-dict");
+            return;
+        }
         void* entriesField = FindFieldInHierarchy(_monoObjectGetClass(dictionary), PN("n_entries").c_str());
         if (!entriesField) entriesField = FindFieldInHierarchy(_monoObjectGetClass(dictionary), OBFUSCATE("entries"));
         void* entries = nullptr;
         if (entriesField) _monoFieldGetValue(dictionary, entriesField, &entries);
-        if (!entries) return;
+        if (!entries) {
+            SMPlatform::SetBreadcrumbLight("pickall:no-entries");
+            return;
+        }
+        SMPlatform::SetBreadcrumbLight("pickall:entries");
 
         void* getEntity = FindMethodInHierarchy(plantClass, PN("n_getEntity").c_str(), 0);
         void* getData = FindMethodInHierarchy(plantClass, PN("n_getComponentData").c_str(), 0);
@@ -2008,34 +2178,50 @@ void PickAllOwnedMaturePlants(
         void* protocol = _monoClassFromName(imgData, protocolNamespace.c_str(), protocolClass.c_str());
         void* mature = protocol ? FindMethodInHierarchy(protocol, PN("n_tryGetMatureTime").c_str(), 3) : nullptr;
         void* pick = protocol ? FindMethodInHierarchy(protocol, PN("n_pickPlant").c_str(), 1) : nullptr;
-        if (!getEntity || !getData || !furnitureField || !getOwnerId || !mature || !pick) return;
+        if (!getEntity || !getData || !furnitureField || !getOwnerId || !mature || !pick) {
+            SMPlatform::SetBreadcrumbLight("pickall:no-method");
+            return;
+        }
+        // 协议管理层若是实例方法，mono 上必须给单例实例（拿不到就让 SmFarmInvoke 跳过）。
+        void* protocolInst = (SmFarmMethodIsStatic(mature) && SmFarmMethodIsStatic(pick))
+                                 ? nullptr : SmFarmResolveSingleton(protocol);
+        SMPlatform::SetBreadcrumbLight(protocolInst ? "pickall:proto-inst" : "pickall:proto-static");
 
-        const uintptr_t addr = (uintptr_t)entries;
-        const int length = SafeRead<int>(addr + OFF_ARR_COUNT, 0);
-        if (length <= 0 || length > 200000) return;
-        const uintptr_t data = addr + OFF_ARR_DATA;
-        constexpr int stride = 24;
+        int length = 0;
+        uint8_t *data = nullptr;
+        // mono 数组不能按 il2cpp 的 0x18/0x20 读（长度会变成天文数字 → 越界崩）。
+        if (!SmFarmDictEntries(dictionary, entries, &length, &data)) {
+            SMPlatform::SetBreadcrumbLight("pickall:badlen");
+            return;
+        }
+        constexpr int stride = SZ_DICT_ENTRY;
+        SMPlatform::SetBreadcrumbLight("pickall:loop:" + std::to_string(length));
+        int pickedCount = 0;
         for (int i = 0; i < length; ++i) {
-            const uintptr_t entry = data + (uintptr_t)i * stride;
+            const uintptr_t entry = (uintptr_t)data + (uintptr_t)i * stride;
             if (SafeRead<int>(entry, -1) < 0) continue;
             void* plant = SafeRead<void*>(entry + OFF_ENTRY_VALUE, nullptr);
             if (!plant) continue;
             exc = nullptr;
-            void* entity = _monoRuntimeInvoke(getEntity, plant, nullptr, &exc);
+            void* entity = SmFarmInvoke(getEntity, plant, nullptr, &exc);
             if (!entity || exc) continue;
             void* netMethod = FindMethodInHierarchy(_monoObjectGetClass(entity), PN("n_getNetId").c_str(), 0);
-            void* netObj = netMethod ? _monoRuntimeInvoke(netMethod, entity, nullptr, &exc) : nullptr;
+            void* netObj = netMethod ? SmFarmInvoke(netMethod, entity, nullptr, &exc) : nullptr;
             if (!netObj || exc) continue;
-            uint32_t netId = *(uint32_t*)_monoObjectUnbox(netObj);
+            void* netRaw = SmFarmUnbox(netObj);
+            if (!netRaw) continue;
+            uint32_t netId = *(uint32_t*)netRaw;
             if (!netId) continue;
             void* furniture = nullptr;
             _monoFieldGetValue(plant, furnitureField, &furniture);
             if (!furniture) continue;
             exc = nullptr;
-            void* plantOwnerObj = _monoRuntimeInvoke(getOwnerId, furniture, nullptr, &exc);
-            if (!plantOwnerObj || exc || *(uint32_t*)_monoObjectUnbox(plantOwnerObj) != selfId) continue;
+            void* plantOwnerObj = SmFarmInvoke(getOwnerId, furniture, nullptr, &exc);
+            if (!plantOwnerObj || exc) continue;
+            void* ownerRaw = SmFarmUnbox(plantOwnerObj);
+            if (!ownerRaw || *(uint32_t*)ownerRaw != selfId) continue;
             exc = nullptr;
-            void* dataObj = _monoRuntimeInvoke(getData, plant, nullptr, &exc);
+            void* dataObj = SmFarmInvoke(getData, plant, nullptr, &exc);
             if (!dataObj || exc) continue;
             void* dataClass = _monoObjectGetClass(dataObj);
             void* stageField = FindFieldInHierarchy(dataClass, PN("n_stage").c_str());
@@ -2048,12 +2234,19 @@ void PickAllOwnedMaturePlants(
             float coldTime = 0.0f;
             void* matureArgs[] = {&netId, &matureMs, &coldTime};
             exc = nullptr;
-            void* matureObj = _monoRuntimeInvoke(mature, nullptr, matureArgs, &exc);
-            if (!matureObj || exc || !*(uint8_t*)_monoObjectUnbox(matureObj)) continue;
+            // TryGetMatureTime/PickPlant 是协议管理层方法：mono 上实例方法必须给实例，
+            // 拿不到就跳过（SmFarmInvoke 内部拦截 nullptr this）。
+            void* matureObj = SmFarmInvoke(mature, protocolInst, matureArgs, &exc);
+            if (!matureObj || exc) continue;
+            void* matureRaw = SmFarmUnbox(matureObj);
+            if (!matureRaw || !*(uint8_t*)matureRaw) continue;
+            SMPlatform::SetBreadcrumbLight("pickall:pick:" + std::to_string(netId));
             void* pickArgs[] = {&netId};
             exc = nullptr;
-            _monoRuntimeInvoke(pick, nullptr, pickArgs, &exc);
+            SmFarmInvoke(pick, protocolInst, pickArgs, &exc);
+            if (!exc) ++pickedCount;
         }
+        SMPlatform::SetBreadcrumbLight("pickall:done:" + std::to_string(pickedCount));
 
         RunOnUnityThreadSync([]() {
             ScanPotsNative();
@@ -5476,14 +5669,18 @@ void PatchGatherConfigNative() {
         void *gatherKlass = _monoObjectGetClass(gatherConfigInst);
 
         // Helper untuk memanipulasi Float langsung ke Offset Memori
+        //  ⚠️ mono_field_get_offset 对静态字段/装箱字段可能返回 -1，直接写
+        //     inst+(-1) 会踩到对象头前的内存 → 随机 SIGSEGV。这里只接受
+        //     看起来像"合法实例字段偏移"的值，其余一律跳过。
         auto setFloat = [&](const char *fName, float val) {
             void *field = _monoClassGetFieldFromName(gatherKlass, fName);
-            if (field) {
-                int offset = _monoFieldGetOffset(field);
-                *(float *) ((uint8_t *) gatherConfigInst + offset) = val;
-            }
+            if (!field) return;
+            int offset = _monoFieldGetOffset(field);
+            if (offset < 0x10 || offset > 0x1000) return;
+            *(float *) ((uint8_t *) gatherConfigInst + offset) = val;
         };
 
+        SMPlatform::SetBreadcrumbLight("farm:gather:write");
         // EKSEKUSI VACUUM MAGNET
         setFloat(OBFUSCATE("AutoCollectingDistance"), 999.0f);
         setFloat(OBFUSCATE("WaitingForCollectingTime"), 0.0f);
@@ -5726,7 +5923,11 @@ static uint64_t InstantFarmNowMs() {
 
 static bool InstantFarmMoveToSearchPoint(const std::string& dllName, const Vector3& point) {
     (void)dllName;
-    return AutoMoveTransferNative(point);
+    // AutoMoveTransferNative 现在会回报"这次传送到底发出去没有"：被安全跳过
+    // （实例方法缺 this / 方法不存在）或抛异常时返回 false，worker 不会在原地空转。
+    const bool moved = AutoMoveTransferNative(point);
+    if (!moved) SMPlatform::SetBreadcrumbLight("farm:tp-skip");
+    return moved;
 }
 
 static bool InstantFarmUsesAreaScanner(int resourceIndex) {
@@ -5761,7 +5962,10 @@ void ExecuteInstantFarmThread(
             if (g_instantFarmWorkerLease.compare_exchange_weak(
                     expectedLease, workerGeneration, std::memory_order_acq_rel)) break;
         }
-        if (expectedLease == workerGeneration) return; // Trigger duplikat untuk start yang sama.
+        if (expectedLease == workerGeneration) {
+            SMPlatform::SetBreadcrumbLight("farm:dup");
+            return; // Trigger duplikat untuk start yang sama.
+        }
 
         const auto workerActive = [&]() {
             return g_instantFarmingActive &&
@@ -5771,6 +5975,7 @@ void ExecuteInstantFarmThread(
         if (dllName.length() >= 4 && dllName.substr(dllName.length() - 4) == ".dll") {
             dllName = dllName.substr(0, dllName.length() - 4);
         }
+        SMPlatform::SetBreadcrumbLight("farm:gather");
         PatchGatherConfigNative();
 
         std::string selectedNames;
@@ -5788,6 +5993,7 @@ void ExecuteInstantFarmThread(
         int consecutiveEmptyScans = 0;
         bool mustMoveToWaypoint = true;
 
+        SMPlatform::SetBreadcrumbLight("farm:wp:" + std::to_string(searchPoints.size()));
         LOGI("[InstantFarm] ===== WORKER START generation=%llu =====\n",
             (unsigned long long)workerGeneration);
         LOGI("[InstantFarm] Selected='%s' waypoints=%zu.\n",
@@ -5835,6 +6041,8 @@ void ExecuteInstantFarmThread(
                 if (searchPointIndex >= searchPoints.size()) searchPointIndex = 0;
                 currentWaypointNumber = searchPointIndex + 1;
                 currentWaypoint = searchPoints[searchPointIndex++];
+                SMPlatform::SetBreadcrumbLight("farm:move:" + std::to_string(currentWaypointNumber) +
+                                               "/" + std::to_string(searchPoints.size()));
                 LOGI("[InstantFarm] WAYPOINT move %zu/%zu resource='%s' mode=%s pos=(%.2f, %.2f, %.2f).\n",
                     currentWaypointNumber, searchPoints.size(),
                     (currentWaypoint.resourceIndex >= 0 && currentWaypoint.resourceIndex < NUM_RESOURCES)
@@ -5842,6 +6050,7 @@ void ExecuteInstantFarmThread(
                     currentWaypoint.useAreaScanner ? "AREA_SCAN" : "FIXED",
                     currentWaypoint.position.x, currentWaypoint.position.y, currentWaypoint.position.z);
                 if (!InstantFarmMoveToSearchPoint(dllName, currentWaypoint.position)) {
+                    SMPlatform::SetBreadcrumbLight("farm:move-fail");
                     LOGI("[InstantFarm] WAYPOINT move FAILED %zu/%zu.\n",
                         currentWaypointNumber, searchPoints.size());
                     usleep(1000 * 1000u);
@@ -5859,6 +6068,7 @@ void ExecuteInstantFarmThread(
                 mustMoveToWaypoint = false;
 
                 // Tunggu streaming area/component system, tetapi STOP tetap responsif.
+                SMPlatform::SetBreadcrumbLight("farm:wait");
                 if (!interruptibleWait(2500)) continue;
             }
 
@@ -5876,49 +6086,74 @@ void ExecuteInstantFarmThread(
 
             RunOnUnityThreadSync([&]() {
                 _monoThreadAttach(_monoGetRootDomain());
+                SMPlatform::SetBreadcrumbLight("farm:scan:img");
                 void* imgGameplay = _monoImageLoaded(dllName.c_str());
-                if (!imgGameplay) return;
+                if (!imgGameplay) {
+                    SMPlatform::SetBreadcrumbLight("farm:no-img");
+                    return;
+                }
 
                 void* collectKlass = _monoClassFromName(imgGameplay, nameSpace.c_str(), className.c_str());
-                if (!collectKlass) return;
-                void* collectMonoType = _monoClassGetType(collectKlass);
+                if (!collectKlass) {
+                    SMPlatform::SetBreadcrumbLight("farm:no-class");
+                    return;
+                }
 
+                SMPlatform::SetBreadcrumbLight("farm:world");
                 void* imgData = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol"));
                 void* worldKlass = imgData ? _monoClassFromName(imgData, OBFUSCATE("XDTGame.GAS.Client"), OBFUSCATE("EntityWorld")) : nullptr;
                 if (!worldKlass && imgData) worldKlass = _monoClassFromName(imgData, OBFUSCATE("XDTLevelAndEntity.Core.World"), OBFUSCATE("EntityWorld"));
                 if (!worldKlass) worldKlass = _monoClassFromName(imgGameplay, OBFUSCATE("XDTLevelAndEntity.Core.World"), OBFUSCATE("EntityWorld"));
-                if (!worldKlass) return;
-                void* openMethod = FindMethodInHierarchy(worldKlass, OBFUSCATE("GetComponentSystem"), 0);
-                if (!openMethod) return;
+                if (!worldKlass) {
+                    SMPlatform::SetBreadcrumbLight("farm:no-world");
+                    return;
+                }
 
-                void* typeArgs[] = { collectMonoType };
-                void* methodInst = _mono_metadata_get_generic_inst(1, typeArgs);
-                MonoGenericContext ctx = { nullptr, methodInst };
-                void* closedMethod = _mono_class_inflate_generic_method(openMethod, &ctx);
-
-                void* exc = nullptr;
-                void* sysObj = _monoRuntimeInvoke(closedMethod, nullptr, nullptr, &exc);
-                if (!sysObj || exc) return;
+                // mono 上 GetComponentSystem<T>()：膨胀 → compile → 实例判定 → 单例。
+                // 旧代码直接 _monoRuntimeInvoke(closed, nullptr, ...)，实例方法传 nullptr
+                // 当 this ⇒ 第一次扫描就 SIGSEGV（"点传送采集就闪退"的根因）。
+                SMPlatform::SetBreadcrumbLight("farm:compsys");
+                void* sysObj = SmFarmGetComponentSystem(worldKlass, collectKlass, "farm");
+                if (!sysObj) return;
 
                 void* f_components = _monoClassGetFieldFromName(_monoObjectGetClass(sysObj), OBFUSCATE("_components"));
                 void* dictObj = nullptr;
+                if (!f_components) {
+                    SMPlatform::SetBreadcrumbLight("farm:no-fcomp");
+                    return;
+                }
                 _monoFieldGetValue(sysObj, f_components, &dictObj);
-                if (!dictObj) return;
+                if (!dictObj) {
+                    SMPlatform::SetBreadcrumbLight("farm:no-dict");
+                    return;
+                }
 
                 void* dictKlass = _monoObjectGetClass(dictObj);
                 void* f_entries = _monoClassGetFieldFromName(dictKlass, OBFUSCATE("entries"));
                 if (!f_entries) f_entries = _monoClassGetFieldFromName(dictKlass, OBFUSCATE("_entries"));
-                if (!f_entries) return;
+                if (!f_entries) {
+                    SMPlatform::SetBreadcrumbLight("farm:no-entries-field");
+                    return;
+                }
 
                 void* entriesArr = nullptr;
                 _monoFieldGetValue(dictObj, f_entries, &entriesArr);
-                if (!entriesArr) return;
+                if (!entriesArr) {
+                    SMPlatform::SetBreadcrumbLight("farm:no-entries");
+                    return;
+                }
 
-                uintptr_t arrAddr = (uintptr_t)entriesArr;
-                int length = *(int*)(arrAddr + 0x18);
-                uintptr_t arrayStart = arrAddr + 0x20;
-                int elemSize = 24;
-                int valueOffset = 16;
+                // Dictionary.entries：mono 数组必须走 mono_array_length/addr（旧代码
+                // 用 il2cpp 的 0x18/0x20 固定偏移 → 长度变天文数字 → 越界读崩）。
+                int length = 0;
+                uint8_t* arrayStart = nullptr;
+                if (!SmFarmDictEntries(dictObj, entriesArr, &length, &arrayStart)) {
+                    SMPlatform::SetBreadcrumbLight("farm:badlen");
+                    return;
+                }
+                const int elemSize = SZ_DICT_ENTRY;
+                const int valueOffset = (int) OFF_ENTRY_VALUE;
+                SMPlatform::SetBreadcrumbLight("farm:entries:" + std::to_string(length));
 
                 void* m_getResType = FindMethodInHierarchy(collectKlass, OBFUSCATE("get_resType"), 0);
                 void* m_getInCold = FindMethodInHierarchy(collectKlass, OBFUSCATE("get_inCold"), 0);
@@ -5972,7 +6207,10 @@ void ExecuteInstantFarmThread(
                         if (entityId > 0 && collectObj) {
                             void* resTypeObj = _monoRuntimeInvoke(m_getResType, collectObj, nullptr, nullptr);
                             if (!resTypeObj) continue;
-                            int resType = *(int*)_monoObjectUnbox(resTypeObj);
+                            // mono_object_unbox 对 null/错型返回 null：不判空直接解引用 = SIGSEGV。
+                            void* resTypeRaw = SmFarmUnbox(resTypeObj);
+                            if (!resTypeRaw) continue;
+                            int resType = *(int*)resTypeRaw;
 
                             ++scannedCount;
                             void* entityObj = _monoRuntimeInvoke(m_getEntity, collectObj, nullptr, nullptr);
@@ -5985,8 +6223,10 @@ void ExecuteInstantFarmThread(
                             if (m_getNetId) {
                                 void* netExc = nullptr;
                                 void* netObj = _monoRuntimeInvoke(m_getNetId, entityObj, nullptr, &netExc);
-                                if (netObj && !netExc)
-                                    actualNetId = *(uint32_t*)_monoObjectUnbox(netObj);
+                                if (netObj && !netExc) {
+                                    void* netRaw = SmFarmUnbox(netObj);
+                                    if (netRaw) actualNetId = *(uint32_t*)netRaw;
+                                }
                             }
                             const uint32_t commandEntityId = actualNetId != 0 ? actualNetId : entityId;
                             dictionaryKeyByNetId[commandEntityId] = entityId;
@@ -5995,7 +6235,9 @@ void ExecuteInstantFarmThread(
                             if (!posObj) continue;
 
                             Vector3 pos{};
-                            memcpy(&pos, _monoObjectUnbox(posObj), sizeof(Vector3));
+                            void* posRaw = SmFarmUnbox(posObj);
+                            if (!posRaw) continue;
+                            memcpy(&pos, posRaw, sizeof(Vector3));
 
                             int resourceId = 0;
                             const char* idSource = "NONE";
@@ -6003,12 +6245,14 @@ void ExecuteInstantFarmThread(
                             const char* identitySource = "NONE";
                             void* levelObject = nullptr;
 
-                            // EntityHelper.GetLevelObject menerima ulong entity id pada build game ini.
+                            // EntityHelper.GetLevelObject menerima ulong entity id pada build game ini。
+                            // 注意：这里以 static 方式调用；若热更层把它改成实例方法，
+                            // SmFarmInvoke 会直接返回 null（不会再送 nullptr this 进去崩）。
                             if (m_getLevelObject) {
                                 uint64_t longEntityId = (uint64_t)entityId;
                                 void* levelArgs[] = { &longEntityId };
                                 void* levelExc = nullptr;
-                                levelObject = _monoRuntimeInvoke(m_getLevelObject, nullptr, levelArgs, &levelExc);
+                                levelObject = SmFarmInvoke(m_getLevelObject, nullptr, levelArgs, &levelExc);
                                 if (levelExc) levelObject = nullptr;
                             }
 
@@ -6127,7 +6371,7 @@ void ExecuteInstantFarmThread(
                             void* inColdObj = _monoRuntimeInvoke(
                                 m_getInCold, collectObj, nullptr, &coldExc);
                             if (inColdObj && !coldExc) {
-                                void* coldRaw = _monoObjectUnbox(inColdObj);
+                                void* coldRaw = SmFarmUnbox(inColdObj);
                                 if (coldRaw) {
                                     inCold = *(uint8_t*)coldRaw != 0;
                                     coldReadOk = true;
@@ -6229,6 +6473,8 @@ void ExecuteInstantFarmThread(
                         scanNotSelected, scanColdReadFailed, scanDuplicate, routeList.size());
                 }
                 });
+                SMPlatform::SetBreadcrumbLight("farm:scan:" + std::to_string(scanScanned) + "/" +
+                                               std::to_string(routeList.size()));
 
             // Scanner hanya memasukkan target terpilih yang get_inCold() == false.
             // Entity cooldown dengan demikian tidak pernah masuk antrean.
@@ -6297,6 +6543,7 @@ void ExecuteInstantFarmThread(
                 }
 
                 if (!currentTargetTeleported) {
+                    SMPlatform::SetBreadcrumbLight("farm:tp:" + std::to_string(liveTarget->entityId));
                     LOGI("[InstantFarm] TARGET move netId=%u resource='%s' type=%d pos=(%.2f, %.2f, %.2f).\n",
                         liveTarget->entityId,
                         (liveTarget->resourceIndex >= 0 && liveTarget->resourceIndex < NUM_RESOURCES)
@@ -6304,6 +6551,7 @@ void ExecuteInstantFarmThread(
                         liveTarget->resType,
                         liveTarget->position.x, liveTarget->position.y, liveTarget->position.z);
                     if (!InstantFarmMoveToSearchPoint(dllName, liveTarget->position)) {
+                        SMPlatform::SetBreadcrumbLight("farm:tp-fail");
                         LOGI("[InstantFarm] TARGET move FAILED netId=%u.\n", liveTarget->entityId);
                         ++currentTargetAttempts;
                         interruptibleWait(500);
@@ -6318,6 +6566,7 @@ void ExecuteInstantFarmThread(
                 RunOnUnityThreadSync([&]() {
                     if (!workerActive() || g_toolRestoring) return;
                     _monoThreadAttach(_monoGetRootDomain());
+                    SMPlatform::SetBreadcrumbLight("farm:cmd:resolve");
                     // 缓存：原来每发一条指令都要 monoClassFromName + 3 次
                     // FindMethodInHierarchy，等于把镜像的类表/方法表从头走一遍；
                     // 采集节奏是 0.4 秒一条指令，Unity 线程被这本账占着，任务泵容易
@@ -6326,15 +6575,22 @@ void ExecuteInstantFarmThread(
                     static void* cachedPickBush = nullptr;
                     static void* cachedHitStone = nullptr;
                     static void* cachedAttackTree = nullptr;
+                    static void* cachedProtocolInst = nullptr;
                     if (!cachedProtocolKlass || !cachedPickBush || !cachedHitStone ||
                         !cachedAttackTree) {
                         void* imgProtocol = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol"));
                         if (!imgProtocol) imgProtocol = _monoImageLoaded(OBFUSCATE("Assembly-CSharp"));
-                        if (!imgProtocol) return;
+                        if (!imgProtocol) {
+                            SMPlatform::SetBreadcrumbLight("farm:cmd:no-img");
+                            return;
+                        }
                         cachedProtocolKlass = _monoClassFromName(
                             imgProtocol, OBFUSCATE("XDTDataAndProtocol.ProtocolService.Resource"),
                             OBFUSCATE("ResourceProtocolManager"));
-                        if (!cachedProtocolKlass) return;
+                        if (!cachedProtocolKlass) {
+                            SMPlatform::SetBreadcrumbLight("farm:cmd:no-class");
+                            return;
+                        }
                         cachedPickBush = FindMethodInHierarchy(
                             cachedProtocolKlass, OBFUSCATE("SendPickBushCommand"), 1);
                         cachedHitStone = FindMethodInHierarchy(
@@ -6346,6 +6602,22 @@ void ExecuteInstantFarmThread(
                     void* sendPickBush = cachedPickBush;
                     void* sendHitStone = cachedHitStone;
                     void* sendAttackTree = cachedAttackTree;
+
+                    // Send*Command 在 Android(il2cpp) 上一律按静态调用，mono 侧若被
+                    // 编译成实例方法，传 nullptr this 会直接 SIGSEGV。这里按需取单例：
+                    // 只有真的存在实例方法时才去找 ResourceProtocolManager 的 Instance。
+                    const bool needProtocolInst =
+                        (sendPickBush && !SmFarmMethodIsStatic(sendPickBush)) ||
+                        (sendHitStone && !SmFarmMethodIsStatic(sendHitStone)) ||
+                        (sendAttackTree && !SmFarmMethodIsStatic(sendAttackTree));
+                    if (needProtocolInst && !cachedProtocolInst) {
+                        cachedProtocolInst = SmFarmResolveSingleton(protocolKlass);
+                        if (!cachedProtocolInst) {
+                            SMPlatform::SetBreadcrumbLight("farm:cmd:no-inst");
+                            return;   // 实例方法拿不到实例：宁可不发，也不能崩
+                        }
+                    }
+                    void* protocolInst = needProtocolInst ? cachedProtocolInst : nullptr;
 
                     // Khusus Mandarin: sebagian CollectableComponent memakai key
                     // dictionary sebagai ID command, bukan Entity.get_netId().
@@ -6365,22 +6637,27 @@ void ExecuteInstantFarmThread(
                         // Identitas resource lebih dapat dipercaya daripada resType pada
                         // Mandarin Android; beberapa spawn melaporkannya sebagai type 10.
                         if (!sendAttackTree) return;
+                        SMPlatform::SetBreadcrumbLight("farm:cmd:tree");
                         void* args[] = { &netId, &isCombo };
-                        _monoRuntimeInvoke(sendAttackTree, nullptr, args, &commandExc);
+                        SmFarmInvoke(sendAttackTree, protocolInst, args, &commandExc);
                     } else if (underwater || liveTarget->resType == 3 || liveTarget->resType == 10) {
                         if (!sendPickBush) return;
+                        SMPlatform::SetBreadcrumbLight("farm:cmd:bush");
                         void* args[] = { &netId };
-                        _monoRuntimeInvoke(sendPickBush, nullptr, args, &commandExc);
+                        SmFarmInvoke(sendPickBush, protocolInst, args, &commandExc);
                     } else if (liveTarget->resType == 1) {
                         if (!sendAttackTree) return;
+                        SMPlatform::SetBreadcrumbLight("farm:cmd:tree");
                         void* args[] = { &netId, &isCombo };
-                        _monoRuntimeInvoke(sendAttackTree, nullptr, args, &commandExc);
+                        SmFarmInvoke(sendAttackTree, protocolInst, args, &commandExc);
                     } else if (liveTarget->resType == 2 || liveTarget->resType == 9) {
                         if (!sendHitStone) return;
+                        SMPlatform::SetBreadcrumbLight("farm:cmd:stone");
                         void* args[] = { &netId, &isCombo };
-                        _monoRuntimeInvoke(sendHitStone, nullptr, args, &commandExc);
+                        SmFarmInvoke(sendHitStone, protocolInst, args, &commandExc);
                     } else return;
                     commandOk = commandExc == nullptr;
+                    SMPlatform::SetBreadcrumbLight(commandOk ? "farm:cmd:ok" : "farm:cmd:exc");
                 });
 
                 ++currentTargetAttempts;
@@ -6426,12 +6703,14 @@ void ExecuteInstantFarmThread(
 
             // Dua rescan tanpa target aktif/pending sebelum pindah waypoint.
             ++consecutiveEmptyScans;
+            SMPlatform::SetBreadcrumbLight("farm:empty:" + std::to_string(consecutiveEmptyScans));
             LOGI("[InstantFarm] RESCAN EMPTY waypoint=%zu/%zu pass=%d/2 cooldownSeen=%d.\n",
                 currentWaypointNumber, searchPoints.size(), consecutiveEmptyScans,
                 scanSelectedCooldown);
             if (consecutiveEmptyScans >= 2) {
                 LOGI("[InstantFarm] WAYPOINT EXHAUSTED %zu/%zu; moving to next preset coordinate.\n",
                     currentWaypointNumber, searchPoints.size());
+                SMPlatform::SetBreadcrumbLight("farm:wp-next");
                 mustMoveToWaypoint = true;
                 consecutiveEmptyScans = 0;
                 continue;
@@ -6490,6 +6769,7 @@ void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, 
         RunOnUnityThreadSync([&]() {
             if (!workerActive()) return;
             _monoThreadAttach(_monoGetRootDomain());
+            SMPlatform::SetBreadcrumbLight("farm:legacy:scan");
 
             void *gameplay = _monoImageLoaded(dllName.c_str());
             void *data = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol"));
@@ -6503,18 +6783,9 @@ void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, 
             if (!worldClass) worldClass = _monoClassFromName(gameplay, OBFUSCATE("XDTLevelAndEntity.Core.World"), OBFUSCATE("EntityWorld"));
             if (!collectClass || !worldClass) return;
 
-            void *collectType = _monoClassGetType(collectClass);
-            void *openMethod = FindMethodInHierarchy(worldClass, OBFUSCATE("GetComponentSystem"), 0);
-            if (!collectType || !openMethod) return;
-
-            void *typeArgs[] = { collectType };
-            void *methodInst = _mono_metadata_get_generic_inst(1, typeArgs);
-            MonoGenericContext context = { nullptr, methodInst };
-            void *closedMethod = _mono_class_inflate_generic_method(openMethod, &context);
-
-            void *exception = nullptr;
-            void *system = _monoRuntimeInvoke(closedMethod, nullptr, nullptr, &exception);
-            if (!system || exception) return;
+            // 同 ExecuteInstantFarmThread：mono 上 GetComponentSystem<T> 不能传 nullptr this。
+            void *system = SmFarmGetComponentSystem(worldClass, collectClass, "farm:legacy");
+            if (!system) return;
 
             void *componentsField = _monoClassGetFieldFromName(_monoObjectGetClass(system), OBFUSCATE("_components"));
             void *dictionary = nullptr;
@@ -6543,13 +6814,17 @@ void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, 
 
             if (!getType || !getCold || !getEntity || !getPosition) return;
 
-            const uintptr_t address = (uintptr_t)entries;
-            const int count = *(int*)(address + 0x18);
-            const uintptr_t first = address + 0x20;
+            // mono 数组：长度/首元素地址必须走 mono_array_*（il2cpp 0x18/0x20 会越界）。
+            int count = 0;
+            uint8_t *first = nullptr;
+            if (!SmFarmDictEntries(dictionary, entries, &count, &first)) {
+                SMPlatform::SetBreadcrumbLight("farm:legacy:badlen");
+                return;
+            }
             std::unordered_set<uint32_t> uniqueIds;
 
             for (int i = 0; i < count; ++i) {
-                const uintptr_t entry = first + i * 24;
+                const uintptr_t entry = (uintptr_t) first + (uintptr_t) i * SZ_DICT_ENTRY;
                 if (*(int*)entry < 0) continue;
                 const uint32_t dictionaryId = *(uint32_t*)(entry + 8);
                 void *collect = *(void**)(entry + 16);
@@ -6557,24 +6832,32 @@ void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, 
 
                 void *typeObject = _monoRuntimeInvoke(getType, collect, nullptr, nullptr);
                 if (!typeObject) continue;
-                const int type = *(int*)_monoObjectUnbox(typeObject);
+                void *typeRaw = SmFarmUnbox(typeObject);
+                if (!typeRaw) continue;
+                const int type = *(int*)typeRaw;
                 if (!selected(type)) continue;
 
                 void *coldObject = _monoRuntimeInvoke(getCold, collect, nullptr, nullptr);
-                if (!coldObject || *(uint8_t*)_monoObjectUnbox(coldObject)) continue;
+                if (!coldObject) continue;
+                void *coldRaw = SmFarmUnbox(coldObject);
+                if (!coldRaw || *(uint8_t*)coldRaw) continue;
 
                 void *entity = _monoRuntimeInvoke(getEntity, collect, nullptr, nullptr);
                 if (!entity) continue;
 
                 void *positionObject = _monoRuntimeInvoke(getPosition, entity, nullptr, nullptr);
                 if (!positionObject) continue;
+                void *positionRaw = SmFarmUnbox(positionObject);
+                if (!positionRaw) continue;
 
                 uint32_t netId = 0;
                 if (getNetId) {
                     void *netException = nullptr;
                     void *netObject = _monoRuntimeInvoke(getNetId, entity, nullptr, &netException);
-                    if (netObject && !netException)
-                        netId = *(uint32_t*)_monoObjectUnbox(netObject);
+                    if (netObject && !netException) {
+                        void *netRaw = SmFarmUnbox(netObject);
+                        if (netRaw) netId = *(uint32_t*)netRaw;
+                    }
                 }
                 if (!netId) netId = InstantFarmGetStrictNetId(entity);
                 if (!netId) netId = dictionaryId;
@@ -6584,9 +6867,10 @@ void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, 
                 target.entityId = netId;
                 target.dictionaryKey = dictionaryId;
                 target.resType = type;
-                memcpy(&target.position, _monoObjectUnbox(positionObject), sizeof(Vector3));
+                memcpy(&target.position, positionRaw, sizeof(Vector3));
                 targets.push_back(target);
             }
+            SMPlatform::SetBreadcrumbLight("farm:legacy:found:" + std::to_string(targets.size()));
         });
 
         if (targets.empty()) {
@@ -6627,13 +6911,23 @@ void ExecuteLegacyInstantFarmThread(std::string dllName, std::string nameSpace, 
                     void *method = FindMethodInHierarchy(protocolClass, methodName, parameterCount);
                     if (!method) return;
 
+                    // mono 实例方法必须给实例：拿不到单例就跳过本次指令（不崩优先）。
+                    void *protocolInst = SmFarmMethodIsStatic(method)
+                                             ? nullptr : SmFarmResolveSingleton(protocolClass);
+                    if (!SmFarmMethodIsStatic(method) && !protocolInst) {
+                        SMPlatform::SetBreadcrumbLight("farm:legacy:no-inst");
+                        return;
+                    }
+                    SMPlatform::SetBreadcrumbLight("farm:legacy:cmd");
                     if (parameterCount == 1) {
                         void *args[] = { &netId };
-                        _monoRuntimeInvoke(method, nullptr, args, &invokeException);
+                        SmFarmInvoke(method, protocolInst, args, &invokeException);
                     } else {
                         void *args[] = { &netId, &combo };
-                        _monoRuntimeInvoke(method, nullptr, args, &invokeException);
+                        SmFarmInvoke(method, protocolInst, args, &invokeException);
                     }
+                    SMPlatform::SetBreadcrumbLight(invokeException ? "farm:legacy:cmd-exc"
+                                                                   : "farm:legacy:cmd-ok");
                 });
                 if (!wait(200)) break;
             }
@@ -9182,27 +9476,35 @@ void AutoMoveTransferDirect(Vector3 pos) {
         return;
     }
 
-    // 先看签名：如果是实例方法(s0)就不能传 nullptr，直接跳过并记录。
+    // 先看签名：实例方法(s0)就不能传 nullptr this（mono SIGSEGV）。
+    // 这时优先去取 EntityHelper 的单例；拿不到才跳过（宁可这次不传送，也不要闪退）。
     SMPlatform::SetBreadcrumbLight("tp:sig:" + CompactMethodSig(autoMoveMethod));
-    {
-        const uint32_t mf = SMMonoHot::MethodGetFlags(autoMoveMethod, nullptr);
-        if (SMMonoHot::IsMonoMethod(autoMoveMethod) && (mf & 0x10u) == 0) {
+    void *helperInst = nullptr;
+    if (SmFarmMethodIsStatic(autoMoveMethod)) {
+        SMPlatform::SetBreadcrumbLight("tp:static");
+    } else {
+        helperInst = SmFarmResolveSingleton(helperClass);
+        if (!helperInst) {
             SMPlatform::SetBreadcrumbLight("tp:skip:s0");
+            g_smTeleportResult.store(2, std::memory_order_relaxed);
             return;
         }
+        SMPlatform::SetBreadcrumbLight("tp:inst:s0");
     }
 
-    // Panggil sebagai static method (instance = nullptr)
+    // Panggil（静态传 nullptr；实例方法传真实单例实例）
     Vector3 targetPos = pos;
     void *args[] = { &targetPos };
     SMPlatform::SetBreadcrumbLight("tp:invoke");
     void *exc = nullptr;
-    _monoRuntimeInvoke(autoMoveMethod, nullptr, args, &exc);
+    _monoRuntimeInvoke(autoMoveMethod, helperInst, args, &exc);
     SMPlatform::SetBreadcrumbLight("tp:invoke-done");
 
     if (exc) {
+        g_smTeleportResult.store(2, std::memory_order_relaxed);
         LOGE("[TeleportFix] Exception saat AutoMoveTransfer.");
     } else {
+        g_smTeleportResult.store(1, std::memory_order_relaxed);
         LOGI("[TeleportFix] AutoMoveTransfer sukses dipanggil ke (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
     }
 
@@ -9340,27 +9642,38 @@ void Transfer2EntityDirect(uint32_t entityNetId) {
     if (!img) { LOGE("[TeleportFix] Transfer2EntityDirect: XDTLevelAndEntity belum diload."); return; }
 
     // 1. Coba ambil posisi target entity
+    SMPlatform::SetBreadcrumbLight("tp:entity:lookup");
     void *entitiesKlass = _monoClassFromName(img, (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"), (const char *) OBFUSCATE("Entities"));
     void *m_getAny = entitiesKlass ? FindMethodInHierarchy(entitiesKlass, (const char *) OBFUSCATE("GetAnyEntity"), 1) : nullptr;
     void *targetEntity = nullptr;
     if (m_getAny) {
-        uint32_t netId = entityNetId;
-        void *args[] = { &netId };
-        void *exc = nullptr;
-        targetEntity = _monoRuntimeInvoke(m_getAny, nullptr, args, &exc);
-        if (exc) LOGE("[TeleportFix] Exception saat GetAnyEntity.");
+        // mono 上 GetAnyEntity 若为实例方法，必须给 Entities 单例；拿不到就跳过。
+        void *entitiesInst = SmFarmMethodIsStatic(m_getAny)
+                                 ? nullptr : SmFarmResolveSingleton(entitiesKlass);
+        if (!SmFarmMethodIsStatic(m_getAny) && !entitiesInst) {
+            SMPlatform::SetBreadcrumbLight("tp:entity:no-inst");
+        } else {
+            uint32_t netId = entityNetId;
+            void *args[] = { &netId };
+            void *exc = nullptr;
+            targetEntity = SmFarmInvoke(m_getAny, entitiesInst, args, &exc);
+            if (exc) LOGE("[TeleportFix] Exception saat GetAnyEntity.");
+        }
     } else {
         LOGE("[TeleportFix] GetAnyEntity method tidak ditemukan.");
     }
 
     if (targetEntity) {
+        SMPlatform::SetBreadcrumbLight("tp:entity:pos");
         void *entKlass = _monoObjectGetClass(targetEntity);
         void *m_getPos = entKlass ? FindMethodInHierarchy(entKlass, (const char *) OBFUSCATE("get_position"), 0) : nullptr;
         if (m_getPos) {
             void *exc = nullptr;
-            void *boxedPos = _monoRuntimeInvoke(m_getPos, targetEntity, nullptr, &exc);
-            if (boxedPos && !exc) {
-                Vector3 targetPos = *(Vector3 *) _monoObjectUnbox(boxedPos);
+            void *boxedPos = SmFarmInvoke(m_getPos, targetEntity, nullptr, &exc);
+            void *posRaw = boxedPos ? SmFarmUnbox(boxedPos) : nullptr;
+            if (posRaw && !exc) {
+                Vector3 targetPos{};
+                memcpy(&targetPos, posRaw, sizeof(Vector3));
                 LOGI("[TeleportFix] Berhasil mendapatkan posisi target: %.2f, %.2f, %.2f. Menggunakan AutoMoveTransferDirect.", targetPos.x, targetPos.y, targetPos.z);
                 AutoMoveTransferDirect(targetPos);
                 return;
@@ -9375,24 +9688,37 @@ void Transfer2EntityDirect(uint32_t entityNetId) {
     }
 
     // Fallback ke method lama jika targetEntity belum ter-resolve
+    SMPlatform::SetBreadcrumbLight("tp:entity:fallback");
     LOGI("[TeleportFix] FALLBACK: Menggunakan EntityHelper.Transfer2Entity(%u) karena posisi tidak didapat.", entityNetId);
     EnsureTeleportAntiCrashPatched();
     void *klass = _monoClassFromName(img, (const char *) OBFUSCATE("XDTLevelAndEntity.Utils"), (const char *) OBFUSCATE("EntityHelper"));
     if (!klass) return;
     void *m_transfer = FindMethodInHierarchy(klass, (const char *) OBFUSCATE("Transfer2Entity"), 1);
     if (!m_transfer) { LOGE("[TeleportFix] EntityHelper.Transfer2Entity method tidak ditemukan."); return; }
+    // 同样是实例方法风险点：单例拿不到就不调用（旧代码直接传 nullptr）。
+    void *helperInst = SmFarmMethodIsStatic(m_transfer)
+                           ? nullptr : SmFarmResolveSingleton(klass);
+    if (!SmFarmMethodIsStatic(m_transfer) && !helperInst) {
+        SMPlatform::SetBreadcrumbLight("tp:entity:no-inst2");
+        return;
+    }
     uint32_t netId = entityNetId;
     void *args[] = { &netId };
     void *exc = nullptr;
-    _monoRuntimeInvoke(m_transfer, nullptr, args, &exc);
+    SMPlatform::SetBreadcrumbLight("tp:entity:invoke");
+    SmFarmInvoke(m_transfer, helperInst, args, &exc);
     if (exc) LOGE("[TeleportFix] Exception saat invoke EntityHelper.Transfer2Entity.");
+    SMPlatform::SetBreadcrumbLight(exc ? "tp:entity:exc" : "tp:entity:done");
 }
 
 bool AutoMoveTransferNative(Vector3 pos) {
+    // 记录"这次传送到底有没有真的发出去"：worker 用它决定是否重试/换点，
+    // 旧代码恒返回 true，导致传送被安全跳过时 worker 还以为已经到位。
+    g_smTeleportResult.store(0, std::memory_order_relaxed);
     RunOnUnityThreadSync([pos]() {
         AutoMoveTransferDirect(pos);
     });
-    return true;
+    return g_smTeleportResult.load(std::memory_order_relaxed) != 2;
 }
 
 void ManualTeleportNative(Vector3 pos) {
