@@ -15,10 +15,10 @@
 inline constexpr const char* ANDROID_CLIENT_BRAND = "SAWIT";
 
 // ---- Teks yang tampil di UI ----
-inline constexpr const char* ANDROID_BRAND_NAME = u8"婉婉的爹";
-inline constexpr const char* ANDROID_BRAND_HOME_TITLE = u8"婉婉的爹";
-inline constexpr const char* ANDROID_BRAND_FOOTER_EN = u8"婉婉的爹 @ 2026";
-inline constexpr const char* ANDROID_BRAND_FOOTER_CN = u8"婉婉的爹 @ 2026 保留所有权利";
+inline constexpr const char* ANDROID_BRAND_NAME = u8"婉婉的爹iOS";
+inline constexpr const char* ANDROID_BRAND_HOME_TITLE = u8"婉婉的爹iOS";
+inline constexpr const char* ANDROID_BRAND_FOOTER_EN = u8"婉婉的爹iOS @ 2026";
+inline constexpr const char* ANDROID_BRAND_FOOTER_CN = u8"婉婉的爹iOS @ 2026 保留所有权利";
 
 // Informasi dan tautan (tetap mendukung EN/CN).
 //inline constexpr const char* ANDROID_GROUP_TEXT_EN = "Join QQ: 1105978541";

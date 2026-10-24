@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 //  platform_stubs.cpp — 链接自检用的平台符号桩
 // ----------------------------------------------------------------------------
 //  只给 scripts/check_link.ps1 用：在 Windows 上把 C++ 侧全部目标文件链接成
@@ -37,6 +37,7 @@ std::string DeviceCode() { return "0123456789abcdef"; }
 void OpenURL(const std::string &) {}
 void Quit() {}
 void Toast(const std::string &) {}
+void NotifyAuthFailure(const std::string &) {}
 std::string Clipboard() { return std::string(); }
 void SetClipboard(const std::string &) {}
 void RunWithAutoreleasePool(const std::function<void()> &body) { if (body) body(); }

@@ -41,6 +41,9 @@ std::string DeviceCode();
 void OpenURL(const std::string &url);
 void Quit();                       // exit(0)
 void Toast(const std::string &text);  // 屏幕顶部轻提示（不阻塞）
+// 卡密登录失败回调（对齐安卓端）：把失败原因统一拼成「卡密验证失败：<原因>」
+// 再用悬浮轻提示弹出来。reason 为空时用兜底文案。可从后台线程调用。
+void NotifyAuthFailure(const std::string &reason);
 std::string Clipboard();
 
 // 后台线程里调 Foundation（Keychain/UIDevice/路径）时包一层 autorelease pool。

@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -184,11 +185,13 @@ void DrawMenu() {
     // ---- 免费功能（不需要卡密）：采集类 ----
     // 驱动方式必须和付费页一致，这里踩过两次坑：
     //   1) op=11 不是走 VM 派发，它有原生 worker；
-    //   2) 瞬间采集有**两套**系统，真正带"蓝莓"的是新的那套：
+    //   2) 通用「瞬间自动采集 / 瞬间资源采集」两处菜单入口已整块删除，
+    //      现在只有这里的「蓝莓自动采集」还在用同一套 worker：
     //        g_farmSelections[4]（farmNames[] 第 5 项 = Blueberry）
     //        + g_instantFarmingActive + g_instantFarmGeneration
     //        + ExecuteInstantFarmThread()（读 g_farmSelections 决定采什么）
-    //      旧的那套是 g_farmBush/g_farmDynamicBush + ExecuteLegacyInstantFarmThread。
+    //      旧的那套（g_farmBush/g_farmDynamicBush + ExecuteLegacyInstantFarmThread）
+    //      已经没有调用方，函数只作保留。
     //   3) op=10 自动收集气泡走 AutoBubbleLoopThread（条件 g_autoCollectBubbleActive）。
     static constexpr int kBlueberryIndex = 4;   // farmNames[]: Ore/Stone/Mandarin/Raspberry/Blueberry
     static std::atomic<bool> g_berryAuto{false};    // 蓝莓自动采集
@@ -428,10 +431,36 @@ void DrawMenu() {
                                     SMPlatform::SetBreadcrumb("offline:done");
                                     SaveLicenseLocally(use);
                                     SMPlatform::SetBreadcrumb("done");
+                                } else {
+                                    // ---- 卡密登录失败回调（对齐安卓端 Main.cpp 的失败分支）----
+                                    // 1) 清理登录态：卡密缓存/有效期/授权标记一律不保留，
+                                    //    避免出现"验证没过但状态还是已登录"的半登录态。
+                                    Weiyan::Logout();
+                                    // 2) 状态行文案：卡密验证失败：<原因>
+                                    const std::string failReason = r.message.empty()
+                                            ? std::string(u8"未知原因（面板未返回信息）")
+                                            : r.message;
+                                    Weiyan::SetStatus(std::string(u8"卡密验证失败：") + failReason);
+                                    // 3) 悬浮轻提示（Platform.mm 的 NotifyAuthFailure，同文案）
+                                    SMPlatform::NotifyAuthFailure(failReason);
+                                    // 4) 排队中的请求作废，失败态下不再继续派发
+                                    {
+                                        std::lock_guard<std::mutex> lk(invokeMutex);
+                                        invokeQueue.clear();
+                                    }
+                                    SMPlatform::SetBreadcrumb("verify:fail:done");
                                 }
+                            } catch (const std::exception &e) {
+                                Weiyan::Logout();
+                                const std::string failReason = std::string(u8"验证异常：") + e.what();
+                                Weiyan::SetStatus(std::string(u8"卡密验证失败：") + failReason);
+                                SMPlatform::NotifyAuthFailure(failReason);
                             } catch (...) {
-                                Weiyan::SetStatus(u8"验证异常，请重试");
+                                Weiyan::Logout();
+                                Weiyan::SetStatus(u8"卡密验证失败：验证异常（未知错误）");
+                                SMPlatform::NotifyAuthFailure(u8"验证异常（未知错误）");
                             }
+                            // 5) 无论成功失败都恢复「验证卡密」按钮可用状态
                             verifyBusy.store(false);
                         });
                     }).detach();
@@ -550,7 +579,9 @@ void DrawMenu() {
             OpenURL(ANDROID_GROUP_URL);
     } else if (ActiveUI::tab == 3) {
         // ================= 设置（界面缩放 + 卡密接口自查） =================
-        static float pendingScale = 1.0f;
+        // 默认 150%（原默认 100% 的 1.5 倍）；ApplyScale 仍夹紧在 25%–200%。
+        constexpr float kDefaultScale = 1.50f;
+        static float pendingScale = kDefaultScale;
         static bool settingsInitialized = false;
         if (!settingsInitialized) {
             pendingScale = ActiveUI::user_scale;
@@ -568,8 +599,8 @@ void DrawMenu() {
         ImGui::SliderFloat("##ui_scale", &pendingScale, 0.25f, 2.00f, "%.2fx",
                            ImGuiSliderFlags_AlwaysClamp);
         ImGui::TextDisabled("%s", Tr(
-                "Range: 25%%-200%%. Recommended: 85%%-100%%.",
-                u8"范围：25%%-200%%。建议：85%%-100%%。"));
+                "Range: 25%%-200%%. Default: 150%%.",
+                u8"范围：25%%-200%%。默认：150%%。"));
         ImGui::Dummy(ActiveUI::S2(0, 10));
 
         if (ImGui::Button(Tr("APPLY UI SIZE", u8"应用界面大小"),
@@ -581,9 +612,9 @@ void DrawMenu() {
 
         if (ImGui::Button(Tr("RESET TO DEFAULT", u8"恢复默认"),
                           ImVec2(-1.0f, ActiveUI::S(40.f)))) {
-            pendingScale = 1.0f;
-            SaveUiScale(1.0f);
-            g_RequestedUiScale.store(1.0f, std::memory_order_release);
+            pendingScale = kDefaultScale;
+            SaveUiScale(kDefaultScale);
+            g_RequestedUiScale.store(kDefaultScale, std::memory_order_release);
         }
 
         ImGui::Dummy(ActiveUI::S2(0, 8));
@@ -909,82 +940,9 @@ void DrawMenu() {
             ImGui::Separator();
             }
 
-            if (game_sub == 2) {
-            ImGui::Spacing();
-            ActiveUI::Section("O", Tr("Instant Resource Farming", u8"瞬间资源采集"));
-            ImGui::Text(Tr("Select resources to collect instantly:", u8"选择要瞬间采集的资源:"));
-            if (ImGui::BeginListBox(OBFUSCATE("##instant_resource_list"), ImVec2(-1, 360))) {
-                // 选中态：深绿底 + 暖白字 + "✓"前缀。
-                // 原来选中用的是主题的 Header/Hover（焦糖 #9E6830 叠在米色上，字又是深灰），
-                // 看起来就是一块"深褐色"，在米色面板里既不明显也不好读。
-                static const ImVec4 kFarmSelBg = ImVec4(0.118f, 0.463f, 0.235f, 1.00f);
-                static const ImVec4 kFarmSelHover = ImVec4(0.157f, 0.553f, 0.294f, 1.00f);
-                static const ImVec4 kFarmSelActive = ImVec4(0.086f, 0.376f, 0.192f, 1.00f);
-                static const ImVec4 kFarmSelText = ImVec4(1.000f, 0.988f, 0.965f, 1.00f);
-                for (int i = 0; i < NUM_RESOURCES; i++) {
-                    const bool selected = g_farmSelections[i];
-                    char rowLabel[192];
-                    snprintf(rowLabel, sizeof(rowLabel), "%s  %s",
-                             selected ? u8"✓" : u8"·", Tr(farmNames[i], farmNamesZh[i]));
-                    if (selected) {
-                        ImGui::PushStyleColor(ImGuiCol_Header, kFarmSelBg);
-                        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, kFarmSelHover);
-                        ImGui::PushStyleColor(ImGuiCol_HeaderActive, kFarmSelActive);
-                        ImGui::PushStyleColor(ImGuiCol_Text, kFarmSelText);
-                    }
-                    if (ImGui::Selectable(rowLabel, selected,
-                                          ImGuiSelectableFlags_DontClosePopups, ImVec2(0, 50))) {
-                        g_farmSelections[i] = !g_farmSelections[i];
-                    }
-                    if (selected) ImGui::PopStyleColor(4);
-                }
-                ImGui::EndListBox();
-            }
-            ImGui::Spacing();
-
-            float pickupCooldown = g_instantFarmPickupCooldown.load(std::memory_order_relaxed);
-            if (ImGui::SliderFloat(
-                    Tr("Pickup Cooldown", u8"采集冷却"),
-                    &pickupCooldown, 0.3f, 5.0f, "%.2f s")) {
-                g_instantFarmPickupCooldown.store(pickupCooldown, std::memory_order_relaxed);
-            }
-            float nextTargetCooldown = g_instantFarmNextTargetCooldown.load(std::memory_order_relaxed);
-            if (ImGui::SliderFloat(
-                    Tr("Next Target Cooldown", u8"下一目标冷却"),
-                    &nextTargetCooldown, 0.1f, 5.0f, "%.1f s")) {
-                g_instantFarmNextTargetCooldown.store(nextTargetCooldown, std::memory_order_relaxed);
-            }
-            ImGui::Spacing();
-
-            if (g_instantFarmingActive) {
-                if (ImGui::Button(Tr("STOP INSTANT RESOURCE FARM", u8"停止瞬间资源采集"), ImVec2(-1, 70))) {
-                    g_instantFarmingActive = false;
-                    g_instantFarmGeneration.fetch_add(1, std::memory_order_acq_rel);
-                }
-            } else if (ImGui::Button(Tr("START INSTANT RESOURCE FARM", u8"开始瞬间资源采集"), ImVec2(-1, 70))) {
-                bool selected = false;
-                for (int i = 0; i < NUM_RESOURCES; ++i) selected = selected || g_farmSelections[i];
-                if (selected && SesiAktif()) {
-                    g_instantFarmGeneration.fetch_add(1, std::memory_order_acq_rel);
-                    g_instantFarmingActive = true;
-                    std::thread([]() {
-                        if (!SesiAktif()) {
-                            g_instantFarmingActive = false;
-                            return;
-                        }
-                        InvokeRequest req = FetchPayloadSync(WireForOp(OP_INSTANT_FARM_TRIGGER));
-                        if (req.dllName.empty() || req.nameSpace.empty() || req.className.empty()) {
-                            g_instantFarmingActive = false;
-                            return;
-                        }
-                        ExecuteInstantFarmThread(req.dllName, req.nameSpace, req.className);
-                    }).detach();
-                }
-            }
-            ImGui::TextColored(ActiveUI::kMuted, Tr("Scans the selected resource identity and moves to another spawn point when empty.", u8"识别所选资源；当前区域为空时自动前往下一个刷新点。"));
-            ImGui::Spacing();
-            ImGui::Separator();
-            }
+            // 「瞬间资源采集」整块已移除（资源选择列表 + 采集/下一目标冷却 + 开始/停止按钮）。
+            // 种植页现在只剩「自动种植机器人」。底层 ExecuteInstantFarmThread 保留，
+            // 仅供免费功能「蓝莓自动采集」复用，菜单里不再有通用入口。
 
             if (game_sub == 0) {
             ImGui::Spacing();
@@ -1966,52 +1924,8 @@ void DrawMenu() {
         }
 
         if (tab == 5) {
-            ImGui::Spacing();
-            ActiveUI::Section("I", Tr("Instant Auto Farm", u8"瞬间自动采集"));
-            ImGui::Text(Tr("Select resources to farm:", u8"选择要采集的资源:"));
-
-            ImGui::Checkbox(Tr("Trees", u8"树木"), &g_farmTree);
-            ImGui::SameLine();
-            ImGui::Checkbox(Tr("Stone", u8"石头"), &g_farmStone);
-            ImGui::SameLine();
-            ImGui::Checkbox(Tr("Bush", u8"灌木"), &g_farmBush);
-            ImGui::Checkbox(Tr("Meteorite", u8"陨石"), &g_farmMeteorite);
-            ImGui::SameLine();
-            ImGui::Checkbox(Tr("Dynamic Bush", u8"动态灌木"), &g_farmDynamicBush);
-            ImGui::Spacing();
-
-            if (g_legacyInstantFarmingActive) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ActiveUI::kDanger);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.68f, 0.26f, 0.24f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_Text, ActiveUI::kOnAccent);
-                if (ImGui::Button(Tr("Stop Farming", u8"停止采集"), ImVec2(-1, 70))) {
-                    g_legacyInstantFarmingActive = false;
-                    g_legacyInstantFarmGeneration.fetch_add(1, std::memory_order_acq_rel);
-                }
-                ImGui::PopStyleColor();
-            } else if (ImGui::Button(Tr("Start Instant Farm", u8"开始瞬间采集"), ImVec2(-1, 70))) {
-                if ((g_farmTree || g_farmStone || g_farmBush || g_farmMeteorite ||
-                     g_farmDynamicBush) && SesiAktif()) {
-                    g_legacyInstantFarmGeneration.fetch_add(1, std::memory_order_acq_rel);
-                    g_legacyInstantFarmingActive = true;
-                    std::thread([]() {
-                        if (!SesiAktif()) {
-                            g_legacyInstantFarmingActive = false;
-                            return;
-                        }
-                        InvokeRequest req = FetchPayloadSync(WireForOp(OP_INSTANT_FARM_TRIGGER));
-                        if (req.dllName.empty() || req.nameSpace.empty() || req.className.empty()) {
-                            g_legacyInstantFarmingActive = false;
-                            return;
-                        }
-                        ExecuteLegacyInstantFarmThread(req.dllName, req.nameSpace, req.className);
-                    }).detach();
-                }
-            }
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-
+            // 「瞬间自动采集」整块已移除（树木/石头/灌木/陨石/动态灌木 + 开始瞬间采集）。
+            // 该功能不再有任何菜单入口，底层 ExecuteLegacyInstantFarmThread 保留但无调用方。
             ActiveUI::Section("E", Tr("Vehicle Swap", u8"载具替换"));
             ImGui::TextColored(ActiveUI::kOk, Tr("Note: Use only on loading screen", u8"注意：仅在加载界面使用"));
             ImGui::Spacing();

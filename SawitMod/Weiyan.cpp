@@ -1221,6 +1221,9 @@ static Result VerifyCardImpl(const std::string& cardKey) {
            r.ok ? "OK" : r.message.c_str());
     if (!r.ok) {
         LOGI("login raw response: %.300s", raw.c_str());
+        // 失败原因一定要落到状态栏：调用方（菜单）不一定自己 SetStatus。
+        // 与安卓端 Weiyan.cpp 的失败路径保持一致。
+        SetStatus(r.message);
         return r;
     }
 

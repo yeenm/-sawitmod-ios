@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 //  Platform.mm — iOS 平台能力实现
 // ============================================================================
 
@@ -187,6 +187,15 @@ void Quit() {
 void Toast(const std::string &text) {
     // 轻提示放在 Overlay 的独立窗口上，避免和菜单的 GL 视图抢图层。
     SMOverlayShowToast(text);
+}
+
+void NotifyAuthFailure(const std::string &reason) {
+    // 安卓端在卡密验证失败时会把面板返回的原因顶到状态栏/Toast。
+    // iOS 侧统一走这个回调：文案固定前缀 + 原因，后台线程也能安全调用
+    // （SMOverlayShowToast 内部已 dispatch 到主线程）。
+    std::string body = reason;
+    if (body.empty()) body = u8"未知原因（面板未返回信息）";
+    Toast(std::string(u8"卡密验证失败：") + body);
 }
 
 std::string Clipboard() {

@@ -392,12 +392,10 @@ void SMRunUnityFramePump() {
                 }
                 continue;
             }
-            if (req.methodDesc == (const char *) OBFUSCATE("CUSTOM_INSTANT_FARM")) {
-                std::thread([req]() {
-                    ExecuteInstantFarmThread(req.dllName, req.nameSpace, req.className);
-                }).detach();
-                continue;
-            }
+            // 瞬间自动采集的派发入口已断开：菜单里不再有该功能，且这里不再按
+            // CUSTOM_INSTANT_FARM 拉起 ExecuteInstantFarmThread()，避免任何 payload
+            // 通过队列误触发即时采集。底层 worker 函数保留（免费功能「蓝莓自动采集」
+            // 仍直接用 ExecuteInstantFarmThread，不经这条队列）。
             if (req.op == OP_PICK_ALL_PLANT &&
                 req.methodDesc == (const char *) OBFUSCATE("CUSTOM_PICK_ALL_PLANT")) {
                 std::thread([req]() {
