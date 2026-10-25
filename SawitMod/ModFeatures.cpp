@@ -9219,7 +9219,8 @@ void EnsureTeleportAntiCrashPatched() {
 //  流程：① 纯 C++ 安全闸门 → ② invoke → ③ 传送后落地确认（坐标真的变了）。
 //
 //  ⚠️ 线程纪律：
-//    * 闸门不排队、不 sleep、不轮询：立即判定，通过 tp:gate / 拒绝 tp:skip:early。
+//    * 闸门不排队、不 sleep、不轮询：立即判定，通过 tp:gate / 兜底 tp:gate:uptime /
+//      拒绝 tp:skip:early（只在模块加载后前 12 秒内出现）。
 //    * 只有"传送后落地确认"里的 mono 调用走 RunOnUnityThreadSync（对象用完即弃，
 //      不跨帧保存），且每一步都先做 null 检查：类/方法/实例任一为 null 就放弃探测、
 //      直接返回 false —— 宁可不确认落地，也绝不把不确定的指针送进 mono。
@@ -9282,73 +9283,120 @@ static bool SMTpReadSelfPosition(Vector3 &out) {
 }
 
 // ---------------------------------------------------------------------------
-//  传送前安全闸门（纯 C++，零 mono 反射、零 invoke）
+//  传送前安全闸门（零反射探测；只有 uptime 达标后的一次 netId 取值会碰 mono）
 // ---------------------------------------------------------------------------
 //  旧实现（已删）在这里做三件事，正是 tp:pre 崩溃的源头：
 //    * _monoClassFromName(...EntityUtil) + FindMethodInHierarchy("GetSelfPlayer") + invoke
 //    * _monoClassFromName(...LevelObjectManager) + get_Instance/_instance 字段 + invoke
 //    * Dictionary get_Count / entries 数组 + SMMonoHot::ArrayLength / ArrayAddrWithSize
 //  这些探测在加载界面和局内都会崩（说明是探测本身拿到的指针/方法不可信）。
-//  现在只用两个便宜信号，且都是纯 C++：
-//    ① 已知状态：会话有效 + 自身 netId 已知 → 世界确实已经在跑，直接放行；
-//    ② 弱门槛：① 不足以判断时（netId 还是 0 / 会话没热），要求闸门起点已过 30 秒，
-//       否则拒绝本次传送（早期加载阶段硬传送 = 崩在流式加载/AOI/碰撞里）。
+//  现在用三档信号（前两档纯 C++，第三档全程只有一次 mono 调用）：
+//    ① 已知状态：会话有效 + 自身 netId 已知 → 世界确实已经在跑，直接放行 tp:gate；
+//    ② uptime 门槛：时间基准 = 本模块加载时刻（kSMTpBootMs），uptime < 12 秒 → 拒绝；
+//    ③ uptime ≥ 12 秒后，一次性调用 GetPlayerNetIdOnUnityThread() 取自身 netId：
+//       前置闸 _monoImageLoaded("XDTDataAndProtocol") 非空才调、每个进程只调一次；
+//       取到 → tp:gate；仍为 0 → 按 uptime 兜底放行 tp:gate:uptime（不再永久拒绝）。
 // ---------------------------------------------------------------------------
-static constexpr uint64_t kSMTpGateMinUptimeMs = 30000;
+static constexpr uint64_t kSMTpGateMinUptimeMs = 12000;
 
-// 闸门起点 = 帧泵已运行时长基准：第一次进入 SMTpAreaReadyFor 时打点。
-static std::atomic<uint64_t> g_pumpStartMs{0};
+// 时间基准 = 模块加载时刻（steady_clock 毫秒），static 初始化在 dylib 载入时执行一次。
+// ⚠️ 旧版把基准做成"第一次进闸门时 CAS 打点"，等于从第一次点传送开始计时 12/30 秒，
+//    第一次几乎必被拒（面包屑恒为 tp:skip:early）。基准必须早于任何一次传送调用。
+static const uint64_t kSMTpBootMs =
+        (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
 
-// 取闸门起点；CAS 保证多线程下只初始化一次（失败时 expected 被写回真实值）。
-static uint64_t SMTpGateStartMs() {
-    const uint64_t start = g_pumpStartMs.load(std::memory_order_relaxed);
-    if (start != 0) return start;
-    const uint64_t now = SMTpNowMs();
-    uint64_t expected = 0;
-    if (g_pumpStartMs.compare_exchange_strong(expected, now,
-                                             std::memory_order_relaxed,
-                                             std::memory_order_relaxed)) {
-        return now;
+// 一次性 netId 探测开关：GetPlayerNetIdOnUnityThread() 内部有 mono invoke，可能崩，
+// 所以每个进程只尝试一次，且只在 uptime ≥ 12 秒、模块已加载、线程/帧泵条件满足时才尝试。
+static std::atomic<bool> g_smTpNetIdTried{false};
+
+// 尝试一次用 mono 取自身 netId。返回 true = netId 已非 0。
+static bool SMTpFetchPlayerNetIdOnce() {
+    if (g_gardenPlayerNetId != 0) return true;
+    if (g_smTpNetIdTried.load(std::memory_order_relaxed)) return false;
+
+    // ① 先确认模块已加载（_monoImageLoaded 全工程大量使用，相对安全）：
+    //    为空就直接跳过 —— 绝不把未知指针/半加载的 image 送进 mono。
+    if (!_monoImageLoaded) return false;
+    void *img = _monoImageLoaded((const char *) OBFUSCATE("XDTDataAndProtocol"));
+    if (!img) img = _monoImageLoaded((const char *) OBFUSCATE("XDTDataAndProtocol.dll"));
+    if (!img) return false;
+
+    // ② mono invoke 只在 Unity 线程上做（与落地确认同一纪律）；不在 Unity 线程且帧泵
+    //    还没起来时不排队、不阻塞，直接交给 uptime 兜底。
+    const bool onUnityThread = SMTpIsOnUnityThread();
+    if (!onUnityThread && !g_unityFramePumpReady.load(std::memory_order_acquire)) return false;
+
+    // ③ 抢一次性开关：抢不到说明别的线程已经在调，不重复 invoke。
+    if (g_smTpNetIdTried.exchange(true, std::memory_order_relaxed)) {
+        return g_gardenPlayerNetId != 0;
     }
-    return expected;
+
+    if (onUnityThread) {
+        GetPlayerNetIdOnUnityThread();
+    } else {
+        RunOnUnityThreadSync([]() { GetPlayerNetIdOnUnityThread(); });
+    }
+    return g_gardenPlayerNetId != 0;
 }
 
 // 返回 true = 允许传送；false = 拒绝（reason = "early"，调用方打 tp:skip:early）。
-static bool SMTpAreaReadyFor(const char **reasonOut) {
+// reason："gate"（状态已够 / 一次性 netId 探测成功）、"uptime"（12 秒兜底放行）、"early"。
+static bool SMTpAreaReadyFor(const char **reasonOut, uint64_t *uptimeOut = nullptr) {
     if (reasonOut) *reasonOut = "?";
 
     // ① 已知状态够用：会话有效（SesiAktif 纯 C++，Pump 每帧也在调）+ 自身 netId 已解析。
     if (SesiAktif() && g_gardenPlayerNetId != 0) {
-        if (reasonOut) *reasonOut = "state";
+        if (reasonOut) *reasonOut = "gate";
         return true;
     }
 
-    // ② 状态不足以判断 → 弱门槛：距闸门起点（首帧打点）至少 30 秒。
-    const uint64_t startMs = SMTpGateStartMs();
+    // ② 时间基准 = 模块加载时刻（不是第一次点传送），uptime 从模块加载起算。
+    const uint64_t bootMs = kSMTpBootMs;
     const uint64_t nowMs = SMTpNowMs();
-    const uint64_t uptimeMs = (nowMs > startMs) ? (nowMs - startMs) : 0;
+    const uint64_t uptimeMs = (nowMs > bootMs) ? (nowMs - bootMs) : 0;
+    if (uptimeOut) *uptimeOut = uptimeMs;
+
+    // ③ uptime < 12 秒：早期硬传送必崩在流式加载/AOI/碰撞里 → 拒绝本次传送。
     if (uptimeMs < kSMTpGateMinUptimeMs) {
         if (reasonOut) *reasonOut = "early";
         return false;
+    }
+
+    // ④ uptime 够 → 一次性取自身 netId；取到 tp:gate，取不到按 uptime 兜底放行。
+    if (SMTpFetchPlayerNetIdOnce()) {
+        if (reasonOut) *reasonOut = "gate";
+        return true;
     }
     if (reasonOut) *reasonOut = "uptime";
     return true;
 }
 
-// 传送前闸门（立即判定，不排队、不 sleep、不轮询、不碰 mono）。
-//   通过 → 面包屑 tp:gate；时间不足 → tp:skip:early 并拒绝传送。
+// 传送前闸门（立即判定，不排队、不 sleep、不轮询；唯一例外是 uptime ≥ 12 秒后
+// 那一次取 netId 的调用，且每个进程只发生一次）。
+//   状态/探测通过 → tp:gate；uptime 兜底 → tp:gate:uptime；uptime < 12 秒 → tp:skip:early。
 //   pos / timeoutMs 只为兼容既有调用点保留，闸门本身不再使用。
 static bool SMTpWaitAreaReady(Vector3 pos, int timeoutMs) {
     (void) pos;
     (void) timeoutMs;
     const char *reason = "?";
-    if (SMTpAreaReadyFor(&reason)) {
-        SMPlatform::SetBreadcrumbLight("tp:gate");
+    uint64_t uptimeMs = 0;
+    if (SMTpAreaReadyFor(&reason, &uptimeMs)) {
+        if (reason && strcmp(reason, "uptime") == 0) {
+            // 12 秒门槛已过，但一次性 netId 探测没拿到（模块没加载/帧泵没起来/实例还没建）
+            // → 按 uptime 兜底放行，不再永久拒绝传送。
+            SMPlatform::SetBreadcrumbLight("tp:gate:uptime");
+            LOGI("[TeleportFix] gate lolos via uptime (netId=%u, uptime=%llums); teleport dilanjutkan.",
+                 (unsigned) g_gardenPlayerNetId, (unsigned long long) uptimeMs);
+        } else {
+            SMPlatform::SetBreadcrumbLight("tp:gate");
+        }
         return true;
     }
     SMPlatform::SetBreadcrumbLight("tp:skip:early");
-    LOGE("[TeleportFix] gate teleport belum lolos (%s, netId=%u, uptime<%llums); teleport dibatalkan.",
-         reason, (unsigned) g_gardenPlayerNetId, (unsigned long long) kSMTpGateMinUptimeMs);
+    LOGE("[TeleportFix] gate teleport belum lolos (%s, netId=%u, uptime=%llums < %llums); teleport dibatalkan.",
+         reason, (unsigned) g_gardenPlayerNetId, (unsigned long long) uptimeMs,
+         (unsigned long long) kSMTpGateMinUptimeMs);
     return false;
 }
 
@@ -9489,9 +9537,9 @@ bool AutoMoveTransferDirect(Vector3 pos) {
         return false;
     }
 
-    // --- [传送前] 纯 C++ 安全闸门（零 mono 探测；旧的反射探测就是 tp:pre 崩溃点）---
+    // --- [传送前] 安全闸门（旧反射探测已删；uptime 达 12 秒后才一次性取 netId）---
     // 硬传送 = 崩在随后的流式加载/AOI/碰撞处理里，所以闸门不放行就放弃本次传送。
-    // 面包屑由闸门内部打：tp:gate（通过）/ tp:skip:early（时间不足）。
+    // 面包屑由闸门内部打：tp:gate / tp:gate:uptime（通过）/ tp:skip:early（uptime < 12 秒）。
     if (!SMTpWaitAreaReady(pos, 2000)) {
         g_tpLastOutcome.store(kSMTpPreFail, std::memory_order_relaxed);
         LOGE("[TeleportFix] gate tujuan belum lolos; teleport dibatalkan (tidak memaksa).");
