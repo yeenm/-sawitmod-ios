@@ -820,13 +820,15 @@ void DrawMenu() {
                     if (antiBanArmed) SMAntiBanArm();
                 }
             }
-        if (ImGui::Checkbox(OBFUSCATE(u8"反作弊模式 - ANTI-CHEAT"), &g_isAntiCheatActive)) {
+        if (ImGui::Checkbox(OBFUSCATE(u8"反作弊模式 - ANTI-CHEAT（自动拦上报）"), &g_isAntiCheatActive)) {
                 if (g_isAntiCheatActive) {
-                    // iOS 版：托管层 Themis/上报拦截（幂等），原生 RVA 路子只作兜底。
+                    // iOS 侧载没有代码页补丁，这里全部是"调游戏开关 + 写数据面字段"：
+                    // Themis 开关 / Logan 日志 / 输入反作弊采集 / 采集与移动反作弊阈值。
                     SMAntiBanInstall();
                     std::thread(PatchAntiCheatNative).detach();
                 }
             }
+            ImGui::TextDisabled("%s %s", u8"自动拦截状态:", SMAntiBanRuntimeStatus().c_str());
             ImGui::Spacing();
             if (ImGui::Checkbox(Tr("Anti-AFK Mode", u8"防挂机模式"), &g_isAntiAfkActive)) {
                 if (g_isAntiAfkActive) {

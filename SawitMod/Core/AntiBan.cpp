@@ -363,11 +363,24 @@ void TryFrameHookLocked() {
     LOGI(OBFUSCATE("[AntiBan] GameApp.Update hook %s"), g_frameHookOk ? "ok" : "failed");
 }
 
+int g_rxApplied = 0;
+
+struct RuntimeActionState {
+    bool done;
+    int tries;
+    uint64_t lastTryMs;
+};
+enum { kRxThemis = 0, kRxLogan = 1, kRxInputCheat = 2, kRxConfig = 3, kRxCount = 4 };
+RuntimeActionState g_rx[kRxCount] = {};
+const char *kRxName[kRxCount] = {"themis", "logan", "inputcheat", "cfg"};
+
 void RefreshStatusLocked() {
     char buf[192];
-    snprintf(buf, sizeof(buf), "fields=%d pending=%d armed=%s pump=%s", g_applied, g_pendingLeft,
-             g_armed ? "on" : "off",
-             g_unityFramePumpReady.load(std::memory_order_relaxed) ? "link" : "off");
+    snprintf(buf, sizeof(buf), "fields=%d pending=%d armed=%s pump=%s auto=%d%d%d%d", g_applied,
+             g_pendingLeft, g_armed ? "on" : "off",
+             g_unityFramePumpReady.load(std::memory_order_relaxed) ? "link" : "off",
+             g_rx[kRxThemis].done ? 1 : 0, g_rx[kRxLogan].done ? 1 : 0,
+             g_rx[kRxInputCheat].done ? 1 : 0, g_rx[kRxConfig].done ? 1 : 0);
     g_status = buf;
 }
 
@@ -384,7 +397,257 @@ void InstallOnce() {
     LOGI(OBFUSCATE("[AntiBan] armed table built: %s"), g_status.c_str());
 }
 
-}  // namespace
+
+// ===========================================================================
+//  运行时数据面「拦上报 / 过检测」（侧载 iOS 上真实可执行的防封面）
+// ---------------------------------------------------------------------------
+//  侧载 iOS 的 __TEXT 受代码签名保护，Android 那套「方法体写 RET / mov w0,#0」
+//  在 iOS 上全部失效（FeatureDispatch 的 PatchMethodReturn* 在 Apple 直接返回
+//  false）。能真正落地的只有两类：
+//    ① 调游戏自己暴露的开关 API（游戏自身正常逻辑里也会调）；
+//    ② 写数据面字段（总开关 / 反作弊阈值），由游戏自己的逻辑读取。
+//
+//  四个动作（全部对着反编译的热更源码核对过）：
+//    themis       EngineWrapper.ThemisSDKManager.SetSwitch(false)
+//                 —— 游戏自己在 PackageUpdatePanel 里也是用它关掉 Themis 的
+//    logan        EngineWrapper.LoganManager.open = false
+//                 —— 原生 Logan 日志管道总开关（日志落盘/上传都从这里走）
+//    inputcheat   XDTLevelAndEntity…InputCheatManager.Enable = false
+//                 —— 输入行为反作弊：采集 + "#INPUTANTICHEAT" 上报的总开关（默认 true）
+//    anticheatcfg GameConfig.CollectAntiCheating / MovementAntiCheating 阈值放宽
+//                 —— 与安卓版 Virbox_PatchAntiCheat 相同的字段面处理
+//
+//  每个动作失败只降级不崩：类/方法/实例任一为空就跳过，下一轮重试；成功后
+//  每 15~30 秒复核一次（游戏切场景/重登可能把开关改回去）。
+// ===========================================================================
+uint64_t NowMsRx() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+}
+
+// 只接受真实 mono 方法（AOT 方法句柄不能保证静态/实例与参数类型，盲 invoke 会崩）。
+bool RxMonoMethodFlags(void *method, bool *isStatic) {
+    if (isStatic) *isStatic = false;
+    if (!method || !SMMonoHot::IsMonoMethod(method)) return false;
+    const uint32_t flags = SMMonoHot::MethodGetFlags(method, nullptr);
+    if (isStatic) *isStatic = (flags & 0x10u) != 0;   // MONO_METHOD_ATTR_STATIC
+    return true;
+}
+
+bool RxInvokeVoidBool(void *method, void *instance, bool arg) {
+    if (!method || !_monoRuntimeInvoke) return false;
+    bool v = arg;
+    void *params[1] = {&v};
+    void *exc = nullptr;
+    _monoRuntimeInvoke(method, instance, params, &exc);
+    return exc == nullptr;
+}
+
+void *RxFindMonoClass(const char *imageName, const char *ns, const char *cls) {
+    if (!_monoImageLoaded || !_monoClassFromName) return nullptr;
+    void *img = _monoImageLoaded(imageName);
+    if (!img) return nullptr;
+    return _monoClassFromName(img, ns ? ns : "", cls);
+}
+
+// ---- 动作 1：关掉 Themis 检测开关（游戏自己在更新弹窗里也这么干）----
+bool RxApplyThemisSwitchOff() {
+    void *klass = RxFindMonoClass((const char *) OBFUSCATE("EngineWrapper"), "",
+                                  (const char *) OBFUSCATE("ThemisSDKManager"));
+    if (!klass) return false;
+    void *m = FindMethodInHierarchy(klass, (const char *) OBFUSCATE("SetSwitch"), 1);
+    bool isStatic = false;
+    if (!RxMonoMethodFlags(m, &isStatic) || !isStatic) return false;
+    if (!RxInvokeVoidBool(m, nullptr, false)) return false;
+    SMPlatform::SetBreadcrumbLight("ab:rx:themis-off");
+    return true;
+}
+
+// ---- 动作 2：关掉 Logan 日志总开关（原生管道，日志落盘+上传的总闸）----
+bool RxApplyLoganOff() {
+    void *klass = RxFindMonoClass((const char *) OBFUSCATE("EngineWrapper"), "",
+                                  (const char *) OBFUSCATE("LoganManager"));
+    if (!klass) return false;
+    void *m = FindMethodInHierarchy(klass, (const char *) OBFUSCATE("set_open"), 1);
+    bool isStatic = false;
+    if (!RxMonoMethodFlags(m, &isStatic)) return false;
+    if (!isStatic || !RxInvokeVoidBool(m, nullptr, false)) return false;
+    SMPlatform::SetBreadcrumbLight("ab:rx:logan-off");
+    return true;
+}
+
+// ---- 动作 3：关掉输入行为反作弊（采集 + #INPUTANTICHEAT 上报）----
+bool RxApplyInputCheatOff() {
+    void *klass = RxFindMonoClass((const char *) OBFUSCATE("XDTLevelAndEntity"),
+                                  (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.InputCheatManager"),
+                                  (const char *) OBFUSCATE("InputCheatManager"));
+    if (!klass) return false;
+
+    // InputCheatManager : DataModule<InputCheatManager>，单例在父类的静态属性 Instance 上。
+    void *instance = nullptr;
+    void *cur = klass;
+    for (int depth = 0; cur && depth < 5 && !instance; ++depth) {
+        void *getter = _monoClassGetMethodFromName
+                           ? _monoClassGetMethodFromName(cur, (const char *) OBFUSCATE("get_Instance"), 0)
+                           : nullptr;
+        if (!getter) getter = FindMethodInHierarchy(cur, (const char *) OBFUSCATE("get_Instance"), 0);
+        bool staticGetter = false;
+        if (getter && RxMonoMethodFlags(getter, &staticGetter) && staticGetter) {
+            void *exc = nullptr;
+            instance = _monoRuntimeInvoke(getter, nullptr, nullptr, &exc);
+            if (exc) instance = nullptr;
+        }
+        cur = _monoClassGetParent(cur);
+    }
+    if (!instance && GetManagerInstanceNative) {
+        instance = GetManagerInstanceNative((const char *) OBFUSCATE("InputCheatManager"));
+    }
+    if (!instance) return false;
+
+    // 优先走游戏自己的属性 setter（auto-property，一行赋值，最安全）。
+    void *setter = FindMethodInHierarchy(klass, (const char *) OBFUSCATE("set_Enable"), 1);
+    bool setterStatic = false;
+    if (setter && RxMonoMethodFlags(setter, &setterStatic) && !setterStatic) {
+        bool v = false;
+        void *params[1] = {&v};
+        void *exc = nullptr;
+        _monoRuntimeInvoke(setter, instance, params, &exc);
+        if (exc == nullptr) {
+            SMPlatform::SetBreadcrumbLight("ab:rx:inputcheat-off");
+            return true;
+        }
+    }
+    // 兜底：直接写自动属性的 backing field。
+    void *field = _monoClassGetFieldFromName
+                      ? _monoClassGetFieldFromName(klass, (const char *) OBFUSCATE("<Enable>k__BackingField"))
+                      : nullptr;
+    if (field && _monoFieldSetValue) {
+        bool v = false;
+        _monoFieldSetValue(instance, field, &v);
+        SMPlatform::SetBreadcrumbLight("ab:rx:inputcheat-field");
+        return true;
+    }
+    return false;
+}
+
+// ---- 动作 4：放宽游戏内反作弊阈值（采集距离/CD/移速；移动反作弊采样/上报）----
+bool RxApplyAntiCheatConfig() {
+    void *configMgr = GetConfigManagerInstance();
+    if (!configMgr) return false;
+    void *mgrKlass = _monoObjectGetClass(configMgr);
+    if (!mgrKlass) return false;
+    void *getGameConfig = FindMethodInHierarchy(mgrKlass, (const char *) OBFUSCATE("get_GameConfig"), 0);
+    if (!getGameConfig) return false;
+    void *exc = nullptr;
+    void *gameConfig = _monoRuntimeInvoke(getGameConfig, configMgr, nullptr, &exc);
+    if (!gameConfig || exc) return false;
+
+    int applied = 0;
+    auto instanceFieldObject = [&](void *ownerKlass, void *owner, const char *name) -> void * {
+        void *field = FindFieldInHierarchy(ownerKlass, name);
+        if (!field || !_monoFieldGetValue) return nullptr;
+        void *value = nullptr;
+        _monoFieldGetValue(owner, field, &value);
+        return value;
+    };
+    auto setFloat = [&](void *ownerKlass, void *owner, const char *name, float v) {
+        void *field = FindFieldInHierarchy(ownerKlass, name);
+        if (field && _monoFieldSetValue) {
+            _monoFieldSetValue(owner, field, &v);
+            ++applied;
+        }
+    };
+    auto setBool = [&](void *ownerKlass, void *owner, const char *name, bool v) {
+        void *field = FindFieldInHierarchy(ownerKlass, name);
+        if (field && _monoFieldSetValue) {
+            _monoFieldSetValue(owner, field, &v);
+            ++applied;
+        }
+    };
+    auto setInt = [&](void *ownerKlass, void *owner, const char *name, int v) {
+        void *field = FindFieldInHierarchy(ownerKlass, name);
+        if (field && _monoFieldSetValue) {
+            _monoFieldSetValue(owner, field, &v);
+            ++applied;
+        }
+    };
+
+    void *gameConfigKlass = _monoObjectGetClass(gameConfig);
+    // CollectAntiCheating：采集距离/无CD/移速可达性（与安卓版逐字段一致）
+    void *collect = instanceFieldObject(gameConfigKlass, gameConfig,
+                                        (const char *) OBFUSCATE("CollectAntiCheating"));
+    if (collect) {
+        void *ck = _monoObjectGetClass(collect);
+        setFloat(ck, collect, (const char *) OBFUSCATE("Distance"), 9999.0f);
+        setFloat(ck, collect, (const char *) OBFUSCATE("CloseDist"), 9999.0f);
+        setBool(ck, collect, (const char *) OBFUSCATE("IsNoCdInCloseDist"), true);
+        setFloat(ck, collect, (const char *) OBFUSCATE("MaxSpeed"), 9999.0f);
+        setFloat(ck, collect, (const char *) OBFUSCATE("SpeedTolerance"), 9999.0f);
+        setFloat(ck, collect, (const char *) OBFUSCATE("Slack"), 9999.0f);
+        setBool(ck, collect, (const char *) OBFUSCATE("WarnOnly"), true);
+    }
+    // MovementAntiCheating：移动速度采样/异常比例/上报间隔（PC 3.2.5 新增，安卓旧版没有）
+    void *movement = instanceFieldObject(gameConfigKlass, gameConfig,
+                                         (const char *) OBFUSCATE("MovementAntiCheating"));
+    if (movement) {
+        void *mk = _monoObjectGetClass(movement);
+        setFloat(mk, movement, (const char *) OBFUSCATE("SpeedThresholdWalk"), 9999.0f);
+        setFloat(mk, movement, (const char *) OBFUSCATE("SpeedThresholdOnVehicle"), 9999.0f);
+        setFloat(mk, movement, (const char *) OBFUSCATE("AbnormalRatio"), 9999.0f);
+        setInt(mk, movement, (const char *) OBFUSCATE("ReportInterval"), 3600);
+    }
+    if (applied > 0) {
+        SMPlatform::SetBreadcrumbLight("ab:rx:cfg");
+        return true;
+    }
+    return false;
+}
+
+bool RxTry(int index) {
+    switch (index) {
+        case kRxThemis: return RxApplyThemisSwitchOff();
+        case kRxLogan: return RxApplyLoganOff();
+        case kRxInputCheat: return RxApplyInputCheatOff();
+        case kRxConfig: return RxApplyAntiCheatConfig();
+        default: return false;
+    }
+}
+
+// 当前线程是不是 Unity 主线程（运行时动作会 invoke 游戏方法，必须主线程）。
+bool RxOnUnityThread() {
+    const std::thread::id unity = g_unityThreadId.load(std::memory_order_relaxed);
+    return unity != std::thread::id() && std::this_thread::get_id() == unity;
+}
+
+// 执行（或复核）运行时动作。forceAll=true 时忽略节流、立即全跑一遍。
+void ApplyRuntimeActionsLocked(bool forceAll) {
+    if (!forceAll && !g_isAntiCheatActive) return;
+    // 方法 invoke 只能在 Unity 线程做；启动早期（Bootstrap 后台线程）先只做字段写，
+    // 等悬浮窗的第一帧（主线程）由 SMAntiBanTick 自动补跑这些动作。
+    if (!forceAll && !RxOnUnityThread()) return;
+    const uint64_t now = NowMsRx();
+    for (int i = 0; i < kRxCount; ++i) {
+        RuntimeActionState &state = g_rx[i];
+        const uint64_t intervalMs = state.done ? (i == kRxConfig ? 30000ULL : 15000ULL)
+                                               : (i == kRxConfig ? 3000ULL : 1500ULL);
+        if (!forceAll && state.lastTryMs != 0 && now - state.lastTryMs < intervalMs) continue;
+        state.lastTryMs = now;
+        if (state.tries < 1000000000) ++state.tries;
+        if (RxTry(i)) {
+            if (!state.done) {
+                state.done = true;
+                ++g_rxApplied;
+                LOGI(OBFUSCATE("[AntiBan] runtime action ok: %s"), kRxName[i]);
+            }
+        } else if (state.tries == 1 || (state.tries % 10) == 0) {
+            LOGI(OBFUSCATE("[AntiBan] runtime action pending: %s (tries=%d)"), kRxName[i],
+                 state.tries);
+        }
+    }
+}
+
+}
 
 // ============================================================================
 //  对外接口
@@ -420,18 +683,10 @@ void SMAntiBanTick() {
     if (!lastMs.compare_exchange_strong(prev, nowMs, std::memory_order_relaxed)) return;
 
     std::lock_guard<std::mutex> lk(g_mtx);
-    bool anyPending = false;
-    for (const Pending &p : g_pending) {
-        if (!p.done && p.tries < kMaxTries) {
-            anyPending = true;
-            break;
-        }
-    }
-    if (!anyPending && g_frameHookOk) return;
-
     AttachThread();
     ApplyPendingLocked();
     TryFrameHookLocked();
+    ApplyRuntimeActionsLocked(false);
     RefreshStatusLocked();
 }
 
@@ -441,6 +696,7 @@ void SMAntiBanArm() {
     g_isAntiCheatActive = true;
     AttachThread();
     ApplyPendingLocked();
+    ApplyRuntimeActionsLocked(false);
     RefreshStatusLocked();
     LOGI(OBFUSCATE("[AntiBan] armed: %s"), g_status.c_str());
 }
@@ -448,6 +704,30 @@ void SMAntiBanArm() {
 bool SMAntiBanArmed() {
     std::lock_guard<std::mutex> lk(g_mtx);
     return g_armed;
+}
+
+int SMAntiBanApplyRuntimeOnce() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    AttachThread();
+    ApplyRuntimeActionsLocked(true);
+    RefreshStatusLocked();
+    int n = 0;
+    for (int i = 0; i < kRxCount; ++i) {
+        if (g_rx[i].done) ++n;
+    }
+    return n;
+}
+
+std::string SMAntiBanRuntimeStatus() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    std::string out;
+    for (int i = 0; i < kRxCount; ++i) {
+        if (!out.empty()) out += " ";
+        out += kRxName[i];
+        out += "=";
+        out += g_rx[i].done ? "ok" : (g_rx[i].tries > 0 ? "wait" : "idle");
+    }
+    return out;
 }
 
 std::string SMAntiBanStatus() {

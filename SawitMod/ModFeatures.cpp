@@ -3,6 +3,7 @@
 #include "IL2CPP/MonoHot.h"
 #include "IL2CPP/MonoCompat.h"
 #include "App/Platform.h"
+#include "Core/AntiBan.h"
 #include "Includes/obfuscate.h"
 #include "VirboxTargets.h"
 #include "Includes/Dobby/dobby.h"
@@ -6953,144 +6954,22 @@ void *ExtractColorLutTextureNative(void *drawingConfigInst) {
 }
 
 extern "C" VIRBOX_TARGET_ATTR void Virbox_PatchAntiCheat() {
-        _monoThreadAttach(_monoGetRootDomain());
-
-        // 1. èŽ·å– ConfigManager å®žä¾‹
-        void *configMgr = GetConfigManagerInstance();
-        if (!configMgr) return;
-
-        void *mgrKlass = _monoObjectGetClass(configMgr);
-
-        void *getGameConfigMeth = nullptr;
-        void *currentMgr = mgrKlass;
-        while (currentMgr != nullptr) {
-            getGameConfigMeth = _monoClassGetMethodFromName(currentMgr, (const char *) OBFUSCATE(
-                    "get_GameConfig"), 0);
-            if (getGameConfigMeth) break;
-            currentMgr = _monoClassGetParent(currentMgr);
-        }
-        if (!getGameConfigMeth) return;
-
-        void *exc = nullptr;
-        void *gameConfigInst = _monoRuntimeInvoke(getGameConfigMeth, configMgr, nullptr, &exc);
-        if (!gameConfigInst || exc) return;
-
-        void *gameConfigKlass = _monoObjectGetClass(gameConfigInst);
-
-        // 2. æŸ¥æ‰¾ CollectAntiCheating å­—æ®µ
-        void *f_antiCheat = nullptr;
-        void *currentCfg = gameConfigKlass;
-        while (currentCfg != nullptr) {
-            f_antiCheat = _monoClassGetFieldFromName(currentCfg, (const char *) OBFUSCATE(
-                    "CollectAntiCheating"));
-            if (f_antiCheat) break;
-            currentCfg = _monoClassGetParent(currentCfg);
-        }
-        if (!f_antiCheat) return;
-
-        // 3. èŽ·å– CollectAntiCheating çš„å®žä¾‹
-        void *antiCheatInst = nullptr;
-        _monoFieldGetValue(gameConfigInst, f_antiCheat, &antiCheatInst);
-        if (!antiCheatInst) return;
-
-        void *antiCheatKlass = _monoObjectGetClass(antiCheatInst);
-
-        // =========================================================
-        // 4. è¾…åŠ©å‡½æ•°ï¼šæ ¹æ®å­—æ®µåç§°å†™å…¥ Float æˆ– Bool
-        // =========================================================
-        auto SetFloatField = [&](const char *fieldName, float value) {
-            void *field = nullptr;
-            void *currentKlass = antiCheatKlass;
-            while (currentKlass != nullptr) {
-                field = _monoClassGetFieldFromName(currentKlass, fieldName);
-                if (field) break;
-                currentKlass = _monoClassGetParent(currentKlass);
-            }
-            if (field) {
-                int offset = _monoFieldGetOffset(field);
-                *(float *) ((uint8_t *) antiCheatInst + offset) = value;
-            }
-        };
-
-        auto SetBoolField = [&](const char *fieldName, bool value) {
-            void *field = nullptr;
-            void *currentKlass = antiCheatKlass;
-            while (currentKlass != nullptr) {
-                field = _monoClassGetFieldFromName(currentKlass, fieldName);
-                if (field) break;
-                currentKlass = _monoClassGetParent(currentKlass);
-            }
-            if (field) {
-                int offset = _monoFieldGetOffset(field);
-                *(bool *) ((uint8_t *) antiCheatInst + offset) = value;
-            }
-        };
-
-        // =========================================================
-        // 5. æš´åŠ›ç¯¡æ”¹æ‰€æœ‰åä½œå¼Šæ ¡éªŒå­—æ®µ (Sapu Bersih Semua Field!)
-        // =========================================================
-
-        // é‡‡é›†è·ç¦»æ”¹æˆå…¨å›¾èŒƒå›´
-        SetFloatField((const char *) OBFUSCATE("Distance"), 9999.0f);
-
-        // æ— CDè·ç¦»æ”¹æˆå…¨å›¾èŒƒå›´
-        SetFloatField((const char *) OBFUSCATE("CloseDist"), 9999.0f);
-
-        // ç¡®ä¿â€œè·ç¦»è¿‘æ—¶æ— CDâ€è¿™ä¸ªå¼€å…³æ˜¯å¼€ç€çš„
-        SetBoolField((const char *) OBFUSCATE("IsNoCdInCloseDist"), true);
-
-        // å°†æœ€å¤§åˆæ³•ç§»é€Ÿä¸Šé™æ”¹åˆ°æžå¤§ï¼Œé˜²æ­¢çž¬ç§»/åŠ é€Ÿè¢«æ‹‰å›ž
-        SetFloatField((const char *) OBFUSCATE("MaxSpeed"), 9999.0f);
-
-        // é€Ÿåº¦å®¹å·®ä¸Žå†—ä½™å…¨éƒ¨å¼€åˆ°æœ€å¤§
-        SetFloatField((const char *) OBFUSCATE("SpeedTolerance"), 9999.0f);
-        SetFloatField((const char *) OBFUSCATE("Slack"), 9999.0f);
-
-        // (safety lock) set intercept mode to warn-only
-        SetBoolField((const char *) OBFUSCATE("WarnOnly"), true);
-        // Contoh pemanggilan
-        PatchMethodReturnFalse(
-                OBFUSCATE("XDTLevelAndEntity"),
-                OBFUSCATE("XDTLevelAndEntity.BaseSystem.InputCheatManager"),
-                OBFUSCATE("InputCheatManager"),
-                OBFUSCATE("get_Enable"),
-                0
-        );
-        PatchMethodReturnFalse(
-                (const char *) OBFUSCATE("XDKWPerf"),
-                (const char *) OBFUSCATE("XDKWPerf"),
-                (const char *) OBFUSCATE("XDKWPerfManager"),
-                (const char *) OBFUSCATE("CheckCondition"),
-                0
-        );
-
-        // Memaksa InitPlayer selalu false agar data UID Anda tidak pernah dikirim
-        PatchMethodReturnFalse(
-                (const char *) OBFUSCATE("XDKWPerf"),
-                (const char *) OBFUSCATE("XDKWPerf"),
-                (const char *) OBFUSCATE("XDKWPerfManager"),
-                (const char *) OBFUSCATE("InitPlayer"),
-                1
-        );
-
-        // Memaksa KwBegin selalu false untuk menghentikan profiler
-        PatchMethodReturnFalse(
-                (const char *) OBFUSCATE("XDKWPerf"),
-                (const char *) OBFUSCATE("XDKWPerf"),
-                (const char *) OBFUSCATE("XDKWPerfManager"),
-                (const char *) OBFUSCATE("KwBegin"),
-                1
-        );
-        ExecuteDynamic(
-                (const char *) OBFUSCATE("EngineWrapper"),
-                "",
-                (const char *) OBFUSCATE("ThemisSDKManager"),
-                (const char *) OBFUSCATE("SetSwitch"),
-                (const char *) OBFUSCATE(
-                        "false"),                 // Kirim parameter angka 999999 dalam bentuk string
-                true                      // isStatic = true
-        );
-        LOGI((const char *) OBFUSCATE("[+] Bypass Anti-Cheat å®Œç¾ŽæˆåŠŸï¼æ‰€æœ‰å‚æ•°å·²è¢«å¤¸å¤§ã€‚"));
+    // 侧载 iOS 上 inline patch 全部失效（__TEXT 受代码签名保护），所以这里只做
+    // 「调游戏自己的开关 + 写数据面字段」。具体四个动作在 Core/AntiBan.cpp：
+    //   themis(SetSwitch false) / logan(open=false) / InputCheatManager.Enable=false /
+    //   GameConfig 反作弊阈值。
+    // 这个入口可能被菜单线程或云端载荷 worker 线程调用：统一封送到 Unity 线程。
+    auto body = []() {
+        SMAntiBanInstall();
+        SMAntiBanArm();
+        const int applied = SMAntiBanApplyRuntimeOnce();
+        LOGI(OBFUSCATE("[AntiBan] data-plane actions applied: %d/4"), applied);
+    };
+    if (g_unityFramePumpReady.load(std::memory_order_acquire)) {
+        RunOnUnityThreadSync(body);
+    } else {
+        body();
+    }
 }
 
 void PatchAntiCheatNative() {

@@ -31,8 +31,16 @@ bool SMAntiBanHookFramePump();
 void SMAntiBanArm();
 bool SMAntiBanArmed();
 
-// 渲染线程每秒调用：重试启动时因程序集未加载而 miss 的补丁。
+// 渲染线程每秒调用：重试启动时因程序集未加载而 miss 的补丁，并自动执行运行时
+// 数据面「拦上报 / 过检测」动作。
 void SMAntiBanTick();
+
+// 立即执行一次「运行时数据面」动作（Themis 开关 / Logan / 输入反作弊 / 反作弊阈值）。
+// 必须在 Unity 线程调用（内部假定已在 Unity 线程，不再封送）。返回生效动作数（0..4）。
+int SMAntiBanApplyRuntimeOnce();
+
+// 运行时动作状态串（菜单/日志用，例如 "themis=ok logan=ok input=wait cfg=ok"）。
+std::string SMAntiBanRuntimeStatus();
 
 // 运行期状态/统计（菜单展示用）：fields=N pending=M pump=link|off。
 // 注：侧载 iOS 无法 inline patch，本模块只做数据面拦截。

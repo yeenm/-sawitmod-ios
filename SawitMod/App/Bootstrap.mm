@@ -211,6 +211,9 @@ void BootstrapThread() {
 
     // 3.5) 防封/过检测：按托管类名打补丁（Themis/日志/举报上报）+ 帧泵兜底。
     SMAntiBanInstall();
+    // 尽早启用防封：这里是 il2cpp 刚就绪的时点，先把数据面字段写上；
+    // 会 invoke 游戏方法的运行时动作会被封遏到悬浮窗第一帧（Unity 主线程）自动补跑。
+    SMAntiBanArm();
 
     // 4) 帧泵：侧载 iOS 没有 JIT/可写代码页，Dobby inline hook 不可行；
     //    改由 OverlayWindow 的 CADisplayLink（主线程 == Unity 主线程）每帧驱动
