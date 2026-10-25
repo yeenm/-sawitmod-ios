@@ -252,11 +252,11 @@ static const char *RecentStepsFilePath() {
 static void PersistRecentSteps() {
     // 在锁内取一份 ring 快照（8 条 snprintf，微秒级），再在锁外写文件，
     // 避免和热路径上的打点抢锁时把 fopen 也包进临界区。
-    std::string lines[8];
+    std::string lines[12];
     int n = 0;
     {
         std::lock_guard<std::mutex> lk(g_bcMutex);
-        n = BreadcrumbRingDump(lines, 8);
+        n = BreadcrumbRingDump(lines, 12);
     }
     if (n <= 0) return;
     FILE *fp = fopen(RecentStepsFilePath(), "w");
@@ -332,18 +332,7 @@ void SetBreadcrumbLight(const std::string &step) {
         fclose(fp);
     }
 
-    // 再把「最近 8 条」覆盖写进 recent_steps.txt：闪退重启后 ring 已清空，
-    // 菜单只能靠这个文件把上次运行的步骤显示出来。节流 200ms（只丢中间态，
-    // 每次写都是整段 ring 快照，不会丢关键的最后一步太多——ring 里有 16 条）。
-    static std::atomic<long long> lastPersistMs{0};
-    const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-    long long prevMs = lastPersistMs.load(std::memory_order_relaxed);
-    if (prevMs != 0 && nowMs - prevMs < 200) return;
-    if (!lastPersistMs.compare_exchange_strong(prevMs, nowMs, std::memory_order_relaxed) &&
-        nowMs - prevMs < 200) {
-        return;  // 另一个线程刚写过，这一笔合并掉
-    }
+    // 崩溃前最后几步一条都不能丢：每次打点都整段覆盖写 recent_steps.txt
     PersistRecentSteps();
 }
 
