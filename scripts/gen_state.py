@@ -28,6 +28,7 @@ SKIP = {
     "g_MenuRect", "g_MinRect", "g_MenuBoundsMutex", "g_MenuMinimized",
     "g_RequestedUiScale", "g_RealScreenWidth", "g_RealScreenHeight",
     "g_AppInForeground", "g_GameWorldReady", "g_unityFramePumpReady",
+    "g_premiumWoodOnePass",
 }
 
 HEAD = """// ============================================================================

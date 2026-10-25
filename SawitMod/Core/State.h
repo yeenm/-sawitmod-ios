@@ -582,6 +582,8 @@ extern int g_fishBaitStackCount;
 
 // --- Instant Farm ---
 inline constexpr int NUM_RESOURCES = 18;
+// 优质木材在 farmNames/allResourceVectors 里的下标（第 18 项，iOS 新增）
+inline constexpr int kPremiumWoodIndex = 17;
 extern bool g_autoFarmActive;
 extern bool g_farmSelections[NUM_RESOURCES];
 extern const char *farmNames[NUM_RESOURCES];
@@ -596,6 +598,9 @@ extern std::atomic<uint64_t> g_instantFarmGeneration;
 extern std::atomic<uint64_t> g_instantFarmWorkerLease;
 extern std::atomic<float> g_instantFarmPickupCooldown;
 extern std::atomic<float> g_instantFarmNextTargetCooldown;
+// 优质木材：一轮固定坐标全部走完后自动停止（避免立刻把 40 个点再传送一遍）。
+// 默认 true；菜单「游戏 -> 种植 -> 瞬间资源采集」可关。
+extern bool g_premiumWoodOnePass;
 extern bool g_legacyInstantFarmingActive;
 extern std::atomic<uint64_t> g_legacyInstantFarmGeneration;
 extern std::atomic<uint64_t> g_legacyInstantFarmWorkerLease;

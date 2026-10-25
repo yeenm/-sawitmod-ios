@@ -5937,7 +5937,30 @@ void ExecuteInstantFarmThread(
             // Koordinat preset hanya menjadi titik pembuka streaming. Target panen
             // selalu berasal dari hasil scan entity runtime setelah tiba di area.
             if (mustMoveToWaypoint) {
-                if (searchPointIndex >= searchPoints.size()) searchPointIndex = 0;
+                if (searchPointIndex >= searchPoints.size()) {
+                    // Premium Wood 只跑一轮：只勾选了优质木材时，40 个固定点全部走完
+                    // 就自动停 —— 树有刷新/冷却，立刻重跑整轮只会「空传送一遍全部坐标」
+                    // （用户反馈的重复循环）。勾了别的资源则照旧循环。
+                    bool onlyPremiumWood = g_farmSelections[kPremiumWoodIndex];
+                    if (onlyPremiumWood) {
+                        for (int i = 0; i < NUM_RESOURCES; ++i) {
+                            if (i != kPremiumWoodIndex && g_farmSelections[i]) {
+                                onlyPremiumWood = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (onlyPremiumWood && g_premiumWoodOnePass) {
+                        LOGI("[InstantFarm] Premium Wood sweep selesai (%zu point); auto-stop.\n",
+                             searchPoints.size());
+                        SMPlatform::SetBreadcrumbLight("farm:wood-done");
+                        g_instantFarmingActive = false;
+                        g_instantFarmGeneration.fetch_add(1, std::memory_order_acq_rel);
+                        SMPlatform::Toast(u8"优质木材：一轮采集完成，已自动停止");
+                        break;
+                    }
+                    searchPointIndex = 0;
+                }
                 currentWaypointNumber = searchPointIndex + 1;
                 currentWaypoint = searchPoints[searchPointIndex++];
                 LOGI("[InstantFarm] WAYPOINT move %zu/%zu resource='%s' mode=%s pos=(%.2f, %.2f, %.2f).\n",

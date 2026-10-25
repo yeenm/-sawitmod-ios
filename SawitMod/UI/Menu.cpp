@@ -590,6 +590,19 @@ void DrawMenu() {
         ImGui::TextDisabled("%s %.2f | %s %.2f", Tr("Device", u8"设备"),
                             ActiveUI::device_dpi, Tr("Current", u8"当前"), ActiveUI::dpi);
 
+        ImGui::Dummy(ActiveUI::S2(0, 10));
+        ActiveUI::Section("T", Tr("TOUCH / WINDOW DIAGNOSTICS", u8"触摸 / 窗口诊断"));
+        ImGui::TextWrapped("%s", SMOverlay::TouchDebugString().c_str());
+        ImGui::Dummy(ActiveUI::S2(0, 6));
+        if (ImGui::Button(Tr("HIDE OVERLAY 10s (test game touch)",
+                             u8"隐藏悬浮层 10 秒（测试游戏触摸）"),
+                          ImVec2(-1.0f, ActiveUI::S(42.f)))) {
+            SMOverlay::HideOverlayForSeconds(10);
+        }
+        ImGui::TextDisabled("%s", Tr(
+                "Buttons work while hidden => overlay eats touches; still dead => not overlay.",
+                u8"隐藏期间游戏按钮能点 = 悬浮层吃触摸；还是不能点 = 与悬浮层无关。"));
+
     } else if (!cardVerified) {
         // 功能页（未验证）：免费功能始终可用，会员功能给提示
         DrawFreeFeatures();
@@ -954,6 +967,12 @@ void DrawMenu() {
                     &nextTargetCooldown, 0.1f, 5.0f, "%.1f s")) {
                 g_instantFarmNextTargetCooldown.store(nextTargetCooldown, std::memory_order_relaxed);
             }
+            ImGui::Spacing();
+
+            // 优质木材：40 个固定点跑完一轮就停，避免每轮把全部坐标重复传送一遍。
+            ImGui::Checkbox(Tr("Premium Wood: stop after one sweep",
+                               u8"优质木材：采完一轮自动停止"),
+                            &g_premiumWoodOnePass);
             ImGui::Spacing();
 
             if (g_instantFarmingActive) {

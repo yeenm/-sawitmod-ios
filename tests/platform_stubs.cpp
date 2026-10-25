@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 //  platform_stubs.cpp — 链接自检用的平台符号桩
 // ----------------------------------------------------------------------------
 //  只给 scripts/check_link.ps1 用：在 Windows 上把 C++ 侧全部目标文件链接成
@@ -102,6 +102,22 @@ extern "C" unsigned int _dyld_image_count(void) { return 0; }
 extern "C" const char *_dyld_get_image_name(unsigned int) { return nullptr; }
 extern "C" const void *_dyld_get_image_header(unsigned int) { return nullptr; }
 extern "C" intptr_t _dyld_get_image_vmaddr_slide(unsigned int) { return 0; }
+
+// ---- SMOverlay（iOS 悬浮窗口；Windows 自检只做链接桩）----
+#include "App/OverlayWindow.h"
+namespace SMOverlay {
+bool Start() { return false; }
+void Stop() {}
+bool IsRunning() { return false; }
+float WidthPx() { return 0.0f; }
+float HeightPx() { return 0.0f; }
+float Scale() { return 1.0f; }
+bool PointInsideMenu(float, float) { return false; }
+std::string TouchDebugString() { return std::string("stub"); }
+void HideOverlayForSeconds(int) {}
+void ShowToast(const std::string &) {}
+void SetForeground(bool) {}
+}  // namespace SMOverlay
 
 // ---- SMAlert ----
 #include "App/Alert.h"

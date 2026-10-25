@@ -311,6 +311,9 @@ std::string g_prevCrashHead;
 
 bool libLoaded = false;
 
+// 优质木材：一轮 40 个固定点走完就自动停止（菜单可关）。
+bool g_premiumWoodOnePass = true;
+
 // Instant Farm 的 18 种资源：顺序必须与 NUM_RESOURCES / g_farmSelections 一致。
 // 最后一项 Premium Wood（优质木材）是 iOS 新增：坐标表在 ModFeatures.cpp 的
 // premiumWoodCoords，走 FIXED 路点 + SendAttackTreeCommand 砍树采集。

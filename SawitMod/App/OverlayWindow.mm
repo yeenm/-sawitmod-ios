@@ -49,6 +49,14 @@ static BOOL g_started = NO;
 static UIWindow *g_window = nil;
 static UIView *g_glView = nil;
 static CADisplayLink *g_link = nil;
+// 游戏自己的窗口（overlay 创建前/后的 key window）：定期确保它仍然是 key。
+static UIWindow *g_gameWindow = nil;
+// 触摸排查：临时隐藏悬浮层（隐藏期间游戏触摸应完全正常）。
+static std::atomic<uint64_t> g_hideUntilMs{0};
+// 触摸排查：窗口层命中统计（菜单内 / 菜单外穿透）。
+static std::atomic<int> g_touchMenuHits{0};
+static std::atomic<int> g_touchPassThrough{0};
+static std::atomic<int> g_lastHitWasMenu{0};
 static id g_lifecycleObservers[2] = {nil, nil};
 static id g_orientationObserver = nil;
 static BOOL g_orientationStarted = NO;
@@ -110,6 +118,24 @@ static UIWindowScene *SMFindWindowScene(void) {
     return nil;
 }
 
+static uint64_t SMMonotonicMs(void) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+}
+
+// 窗口坐标（window point）-> renderbuffer 像素 -> 菜单命中。
+// 关键：窗口层自己算，完全不依赖 GLView 的 pointInside/hitTest，也不受
+// GLView 旋转/缩放影响（先 convert 到 GLView 坐标系再乘像素比例）。
+static bool SMPointInsideMenuInWindow(CGPoint point) {
+    if (!g_imguiReady || !g_glView || g_width <= 0) return false;
+    const CGPoint local = [g_glView convertPoint:point fromView:nil];
+    const CGFloat scale = (g_glView.bounds.size.width > 1.0)
+                              ? (CGFloat) g_width / g_glView.bounds.size.width
+                              : (CGFloat) [UIScreen mainScreen].scale;
+    return SMOverlay::PointInsideMenu((float)(local.x * scale), (float)(local.y * scale));
+}
+
 // ---------------------------------------------------------------------------
 //  渲染
 // ---------------------------------------------------------------------------
@@ -147,6 +173,21 @@ static void SMCreateFramebuffer(UIView *view) {
 }
 
 static void SMRenderFrame(void) {
+    // [触摸排查] 用户点了"隐藏悬浮层 N 秒"：期间窗口彻底 hidden，游戏触摸不受任何影响。
+    {
+        const uint64_t until = g_hideUntilMs.load(std::memory_order_relaxed);
+        const bool hide = until != 0 && SMMonotonicMs() < until;
+        if (g_window && g_window.hidden != hide) g_window.hidden = hide;
+        if (hide) return;
+    }
+    // 每 ~2 秒确认游戏窗口还是 key window（注入后个别机型会丢 key，导致游戏输入异常）。
+    {
+        static int keyCheckCounter = 0;
+        if ((++keyCheckCounter % 120) == 0 && g_gameWindow) {
+            UIWindow *kw = [UIApplication sharedApplication].keyWindow;
+            if (kw != g_gameWindow) [g_gameWindow makeKeyWindow];
+        }
+    }
     if (!g_ctx || !g_glView || g_width <= 0 || g_height <= 0) return;
     if (!g_AppInForeground.load()) return;
 
@@ -329,16 +370,27 @@ static void SMRenderFrame(void) {
 - (BOOL)canBecomeKeyWindow { return NO; }
 - (BOOL)canBecomeFocused { return NO; }
 
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    (void)event;
+    return SMPointInsideMenuInWindow(point) ? YES : NO;
+}
+
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    // 注意：本窗口的 rootViewController.view 就是 SMGLView 本身。
-    // 菜单内的触摸会让 super 返回 GLView —— 那正是我们要的结果，不能再把它当成
-    // "没命中"丢掉（之前这里把 rootViewController.view 一起 return nil，导致菜单
-    // 看得见但点不动）。菜单外时 GLView 的 pointInside 返回 NO，super 会返回
-    // window 自己，下面这条就能把触摸放行给游戏窗口。
-    if (hit == self) {
+    // 先在窗口层按菜单矩形判一次：菜单外直接返回 nil（穿透给游戏窗口），
+    // 不再依赖 GLView 的 pointInside —— iPad 上 GLView 的像素换算/旋转跟手机不同，
+    // 一旦比例算错就会把整屏都当成菜单，游戏按键全部点不动。
+    if (!SMPointInsideMenuInWindow(point)) {
+        ++g_touchPassThrough;
+        g_lastHitWasMenu.store(0);
         return nil;
     }
+    UIView *hit = [super hitTest:point withEvent:event];
+    // 本窗口的 rootViewController.view 就是 SMGLView；菜单内命中 GLView 才是想要的。
+    if (!hit || hit == self) {
+        return nil;
+    }
+    ++g_touchMenuHits;
+    g_lastHitWasMenu.store(1);
     return hit;
 }
 @end
@@ -586,11 +638,13 @@ bool Start() {
     }
     [EAGLContext setCurrentContext:g_ctx];
 
-    // 先记住游戏自己的 key window，浮层显示后要把 key 还回去。
+    // 先记住游戏自己的 key window，浮层显示后要把 key 还回去；同时记下来给
+    // SMRenderFrame 定期校验（个别 iPad 上注入后游戏窗口会丢 key，表现为游戏输入异常）。
     UIWindow *previousKeyWindow = nil;
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
         if (w.isKeyWindow) { previousKeyWindow = w; break; }
     }
+    g_gameWindow = previousKeyWindow;
 
     SMOverlayWindow *window = [[SMOverlayWindow alloc] initWithWindowScene:scene];
     window.frame = scene.coordinateSpace.bounds;
@@ -600,7 +654,13 @@ bool Start() {
     window.hidden = NO;
     g_window = window;
 
-    SMInstallOrientationOverride();
+    // 方向覆盖只在 iPhone 上装：iPad 版游戏 Info.plist 本身就是 landscape-only，
+    // hook 返回同一个掩码没有收益；sk 掉可以避免 iPad 多窗口/场景下的副作用。
+    if ([[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPad) {
+        NSLog(@"[SawitMod] iPad: skip orientation override (Info.plist landscape already)");
+    } else {
+        SMInstallOrientationOverride();
+    }
 
     // 把 key window 还给游戏，避免浮层接管方向/状态栏等全局策略。
     if (previousKeyWindow && previousKeyWindow != window) {
@@ -700,6 +760,52 @@ float Scale() {
     UIView *view = g_glView;
     if (view && view.bounds.size.width > 1.0) return (float)g_width / (float)view.bounds.size.width;
     return (float)[UIScreen mainScreen].scale;
+}
+
+void HideOverlayForSeconds(int seconds) {
+    if (seconds < 1) seconds = 1;
+    if (seconds > 60) seconds = 60;
+    g_hideUntilMs.store(SMMonotonicMs() + (uint64_t) seconds * 1000u, std::memory_order_relaxed);
+}
+
+std::string TouchDebugString() {
+    MenuBounds menu{};
+    MenuBounds mini{};
+    {
+        std::lock_guard<std::mutex> lock(g_MenuBoundsMutex);
+        menu = g_MenuRect;
+        mini = g_MinRect;
+    }
+    const BOOL isPad = ([[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPad);
+    const CGSize screen = [UIScreen mainScreen].bounds.size;
+    const CGRect wf = g_window ? g_window.frame : CGRectZero;
+    const CGRect gf = g_glView ? g_glView.frame : CGRectZero;
+    const CGRect gb = g_glView ? g_glView.bounds : CGRectZero;
+    const CGFloat angle = g_glView ? atan2(g_glView.transform.b, g_glView.transform.a) : 0.0;
+    const uint64_t until = g_hideUntilMs.load(std::memory_order_relaxed);
+    const long long hideLeft = (long long) until - (long long) SMMonotonicMs();
+    char buf[768];
+    snprintf(buf, sizeof(buf),
+             "%s / iOS %s\r\n"
+             "screen=%.0fx%.0f@%.1f  fb=%dx%d  imgui=%d  angle=%.0f\r\n"
+             "window %.0f,%.0f %.0fx%.0f\r\n"
+             "glView frame %.0f,%.0f %.0fx%.0f  bounds %.0fx%.0f\r\n"
+             "menu[%d] %.0f,%.0f %.0fx%.0f  mini[%d] %.0f,%.0f %.0fx%.0f\r\n"
+             "hit menu=%d  passthrough=%d  lastMenu=%d  hideLeft=%lldms",
+             isPad ? "iPad" : "iPhone",
+             [[[UIDevice currentDevice] systemVersion] UTF8String],
+             screen.width, screen.height, (double) [UIScreen mainScreen].scale,
+             (int) g_width, (int) g_height, g_imguiReady ? 1 : 0,
+             (double) (angle * 180.0 / M_PI),
+             wf.origin.x, wf.origin.y, wf.size.width, wf.size.height,
+             gf.origin.x, gf.origin.y, gf.size.width, gf.size.height,
+             gb.size.width, gb.size.height,
+             menu.active ? 1 : 0, menu.x, menu.y, menu.w, menu.h,
+             mini.active ? 1 : 0, mini.x, mini.y, mini.w, mini.h,
+             g_touchMenuHits.load(std::memory_order_relaxed),
+             g_touchPassThrough.load(std::memory_order_relaxed),
+             g_lastHitWasMenu.load(std::memory_order_relaxed), hideLeft);
+    return std::string(buf);
 }
 
 bool PointInsideMenu(float px, float py) {

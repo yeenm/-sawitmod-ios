@@ -33,6 +33,13 @@ float Scale();
 // g_MenuRect / g_MinRect —— 这两个矩形由 DrawMenu() 每帧更新。
 bool PointInsideMenu(float px, float py);
 
+// ---- 触摸 / 窗口诊断（iPad 触摸适配排查用）----
+// 多行文本：设备/屏幕/窗口/GLView/framebuffer/菜单矩形/命中计数。
+std::string TouchDebugString();
+// 隐藏悬浮层一段时间（秒），期间游戏自己的触摸应完全正常；到时自动恢复。
+// 用于判断"游戏按钮点不动"是不是悬浮层吃了触摸。
+void HideOverlayForSeconds(int seconds);
+
 // 轻提示（顶部浮层，1.6 秒淡出）。
 void ShowToast(const std::string &text);
 
