@@ -388,14 +388,10 @@ void *g_cachedLevelScriptableConfig = nullptr;
 void *g_cachedPlayerMotionConfig = nullptr;
 void *g_StolenInteractSystem = nullptr;
 
-// 界面缩放：默认 150%（原默认 100% 的 1.5 倍）。用户手动应用过的值存在
-// NSUserDefaults 的 ui_scale_pct 里，优先于这里的默认值。
-inline constexpr int kDefaultUiScalePct = 150;
-
 float LoadSavedUiScale() {
-    const int pct = SMDefaults::GetInt("ui_scale_pct", kDefaultUiScalePct);
+    const int pct = SMDefaults::GetInt("ui_scale_pct", 100);
     float scale = (float)pct / 100.0f;
-    if (scale < 0.25f || scale > 2.0f) scale = (float)kDefaultUiScalePct / 100.0f;
+    if (scale < 0.25f || scale > 2.0f) scale = 1.0f;
     return scale;
 }
 

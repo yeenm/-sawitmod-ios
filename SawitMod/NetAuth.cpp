@@ -1187,21 +1187,6 @@ void StartLicenseHeartbeat(const std::string& license) {
 // =========================================================
 //  LOGIN
 // =========================================================
-// 卡密登录失败回调（对齐安卓端）：
-//   安卓端 VerifyLicenseJNI 的每条失败分支都会把原因顶到 auth_status_msg，
-//   登录按钮那边再 Toast 出来。iOS 这里收敛成一个函数：文案 + 状态色 +
-//   解除 loading + 悬浮轻提示（Platform.mm 的 NotifyAuthFailure）。
-[[maybe_unused]] static void AuthFailCallback(const std::string& reason) {
-    const std::string text = reason.empty()
-        ? std::string(u8"卡密验证失败：未知原因（服务器未返回信息）")
-        : std::string(u8"卡密验证失败：") + reason;
-    auth_status_msg   = text;
-    auth_status_color = ImVec4(172/255.f, 46/255.f, 38/255.f, 1.0f);
-    is_loading        = false;
-    SMPlatform::NotifyAuthFailure(reason);
-    ALOG("%s", text.c_str());
-}
-
 OLLVM_SEC_CRITICAL void VerifyLicenseJNI(const char* licenseKey) {
     std::string license = licenseKey ? licenseKey : "";
 
@@ -1219,14 +1204,17 @@ OLLVM_SEC_CRITICAL void VerifyLicenseJNI(const char* licenseKey) {
     return;
 #else
     if (license.empty()) {
-        AuthFailCallback(u8"请输入卡密");
+        auth_status_msg   = u8"请输入卡密";
+        auth_status_color = ImVec4(172/255.f, 46/255.f, 38/255.f, 1.0f);
+        is_loading = false;
         return;
     }
 
     AuthResult r = Virbox_DoVerify(license);
     if (!r.ok) {
-        // 失败原因（网络 / 状态码 / 面板原文）统一走失败回调：状态行 + 悬浮提示。
-        AuthFailCallback(AuthDisplayMessage(r));
+        auth_status_msg   = AuthDisplayMessage(r);
+        auth_status_color = ImVec4(172/255.f, 46/255.f, 38/255.f, 1.0f);
+        is_loading        = false;
         return;
     }
 
@@ -1235,7 +1223,9 @@ OLLVM_SEC_CRITICAL void VerifyLicenseJNI(const char* licenseKey) {
     std::string catalogJson = ExtractCatalogJson(r);
     if (catalogJson.empty() || !PasangSesi(catalogJson, g_avatarMode)) {
         AkhiriSesiLokal(StatusSesi::Dicabut);
-        AuthFailCallback(u8"会话无效（服务端返回的会话凭据无法安装）");
+        auth_status_msg = u8"会话无效";
+        auth_status_color = ImVec4(172/255.f, 46/255.f, 38/255.f, 1.0f);
+        is_loading = false;
         return;
     }
     SaveLicenseLocally(license_input);

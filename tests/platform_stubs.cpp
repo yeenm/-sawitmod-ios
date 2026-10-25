@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 //  platform_stubs.cpp — 链接自检用的平台符号桩
 // ----------------------------------------------------------------------------
 //  只给 scripts/check_link.ps1 用：在 Windows 上把 C++ 侧全部目标文件链接成
@@ -37,18 +37,11 @@ std::string DeviceCode() { return "0123456789abcdef"; }
 void OpenURL(const std::string &) {}
 void Quit() {}
 void Toast(const std::string &) {}
-void NotifyAuthFailure(const std::string &) {}
 std::string Clipboard() { return std::string(); }
 void SetClipboard(const std::string &) {}
 void RunWithAutoreleasePool(const std::function<void()> &body) { if (body) body(); }
 void SetBreadcrumb(const std::string &) {}
 void SetBreadcrumbLight(const std::string &) {}
-// 菜单主页/崩溃报告都会读「最近 N 条面包屑」：真实实现只存在于 App/Platform.mm，
-// 自检里给一个空环形缓冲（菜单显示「（无）」）即可。
-int BreadcrumbRingDump(std::string *, int) { return 0; }
-// 菜单在环形缓冲为空时会回落到 recent_steps.txt（上次运行持久化的步骤）；
-// 自检环境没有这个文件，返回 0 条即可（菜单显示「（无）」）。
-int LoadRecentStepsFromFile(std::string *, int) { return 0; }
 std::string TakeBreadcrumb() { return std::string(); }
 const char *BreadcrumbCStr() { return ""; }
 bool IsDebuggerAttached() { return false; }

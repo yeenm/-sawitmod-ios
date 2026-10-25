@@ -9135,14 +9135,6 @@ void EnsureTeleportAntiCrashPatched() {
 }
 
 
-// 静态判定 helper（传送相机校正段专用）：mono 实例方法传 nullptr this 会 SIGSEGV。
-// IsMonoMethod 为假 = AOT/il2cpp 方法，flags 不可信 → 不当实例方法处理（按静态传 nullptr）。
-static bool MossMethodIsStatic(void *m) {
-    if (!m) return false;
-    if (!SMMonoHot::IsMonoMethod(m)) return true;  /* AOT 不判 */
-    return (SMMonoHot::MethodGetFlags(m, nullptr) & 0x10u) != 0;
-}
-
 void AutoMoveTransferDirect(Vector3 pos) {
     SMPlatform::SetBreadcrumbLight("tp:auto");
     LOGI("[TeleportFix] AutoMoveTransferDirect dipanggil untuk posisi: %.2f, %.2f, %.2f", pos.x, pos.y, pos.z);
@@ -9206,35 +9198,19 @@ void AutoMoveTransferDirect(Vector3 pos) {
         LOGI("[TeleportFix] AutoMoveTransfer sukses dipanggil ke (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
     }
 
-    // 相机吸附会改写游戏相机控制器状态；实测相机段跑完后仍有概率崩在游戏自己的
-    // 相机更新里（最后面包屑 tp:cam7）。传送本身不需要它，默认关闭。
-    {
-        static const bool kEnableCameraSnap = false;
-        if (!kEnableCameraSnap) {
-            SMPlatform::SetBreadcrumbLight("tp:cam-off");
-            return;
-        }
-    }
     SMPlatform::SetBreadcrumbLight("tp:camera");
-    SMPlatform::SetBreadcrumbLight("tp:cam1");
     // SNAP KAMERA LENGKAP:
     // 1. Panggil EntityHelper.SetCameraLookAt() (untuk lock orientasi Euler)
-    //    mono 实例方法传 nullptr this = SIGSEGV，先判静态标志（AOT 不判，按静态传 nullptr）。
     void *setCameraLookAtMethod = FindMethodInHierarchy(helperClass, (const char *) OBFUSCATE("SetCameraLookAt"), 0);
     if (setCameraLookAtMethod) {
-        if (!MossMethodIsStatic(setCameraLookAtMethod)) {
-            SMPlatform::SetBreadcrumbLight("tp:cam-skip:lookat");
+        void *camExc = nullptr;
+        _monoRuntimeInvoke(setCameraLookAtMethod, nullptr, nullptr, &camExc);
+        if (camExc) {
+            LOGE("[TeleportFix] Exception saat SetCameraLookAt.");
         } else {
-            void *camExc = nullptr;
-            _monoRuntimeInvoke(setCameraLookAtMethod, nullptr, nullptr, &camExc);
-            if (camExc) {
-                LOGE("[TeleportFix] Exception saat SetCameraLookAt.");
-            } else {
-                LOGI("[TeleportFix] SetCameraLookAt sukses dipanggil.");
-            }
+            LOGI("[TeleportFix] SetCameraLookAt sukses dipanggil.");
         }
     }
-    SMPlatform::SetBreadcrumbLight("tp:cam2");
 
     // 2. Akses XDTCameraManager.Instance.CurrentController (FollowCameraController)
     void *camMgrClass = _monoClassFromName(img,
@@ -9247,85 +9223,53 @@ void AutoMoveTransferDirect(Vector3 pos) {
     }
 
     if (camMgrClass) {
-        SMPlatform::SetBreadcrumbLight("tp:cam3");
         void *getInstanceMethod = FindMethodInHierarchy(camMgrClass, (const char *) OBFUSCATE("get_Instance"), 0);
-        // get_Instance 若是实例属性 getter，传 nullptr this 会崩 → 跳过。
-        if (getInstanceMethod && !MossMethodIsStatic(getInstanceMethod)) {
-            SMPlatform::SetBreadcrumbLight("tp:cam-skip:inst");
-        } else if (getInstanceMethod) {
+        if (getInstanceMethod) {
             void *excCam = nullptr;
             void *camMgrInst = _monoRuntimeInvoke(getInstanceMethod, nullptr, nullptr, &excCam);
-            // camMgrInst 必须是 mono 对象：il2cpp 对象喂 mono 实例方法同样 SIGSEGV。
-            void *camMgrMonoKlass = nullptr;
-            if (camMgrInst && !excCam && SMMonoHot::ClassifyObject(camMgrInst, &camMgrMonoKlass)) {
-                SMPlatform::SetBreadcrumbLight("tp:cam4");
+            if (camMgrInst && !excCam) {
                 void *getCurrControllerMethod = FindMethodInHierarchy(camMgrClass, (const char *) OBFUSCATE("get_CurrentController"), 0);
                 if (!getCurrControllerMethod) {
                     getCurrControllerMethod = FindMethodInHierarchy(camMgrClass, (const char *) OBFUSCATE("get_CurrentCameraController"), 0);
                 }
                 void *controller = nullptr;
                 if (getCurrControllerMethod) {
-                    // 实例 accessor 用 camMgrInst 当 this（已确认非空 + 是 mono 对象），静态才传 nullptr。
-                    void *ctrlThis = MossMethodIsStatic(getCurrControllerMethod) ? nullptr : camMgrInst;
                     void *ctrlExc = nullptr;
-                    controller = _monoRuntimeInvoke(getCurrControllerMethod, ctrlThis, nullptr, &ctrlExc);
-                    if (ctrlExc) controller = nullptr;
+                    controller = _monoRuntimeInvoke(getCurrControllerMethod, camMgrInst, nullptr, &ctrlExc);
                 }
                 if (!controller && _monoClassGetFieldFromName && _monoFieldGetValue) {
                     void *f_curr = _monoClassGetFieldFromName(camMgrClass, (const char *) OBFUSCATE("_currentController"));
                     if (f_curr) _monoFieldGetValue(camMgrInst, f_curr, &controller);
                 }
-                SMPlatform::SetBreadcrumbLight("tp:cam5");
 
                 if (controller) {
                     void *controllerClass = _monoObjectGetClass(controller);
-                    void *controllerMonoKlass = nullptr;
-                    // controller 必须是 mono 对象（ClassifyObject 命中），或其类已在 mono 句柄表里；
-                    // 否则等于把跨运行时对象喂给 mono 实例方法 = 随机 SIGSEGV。
-                    if (!SMMonoHot::ClassifyObject(controller, &controllerMonoKlass) &&
-                        !(controllerClass && SMMonoHot::IsMonoClass(controllerClass))) {
-                        SMPlatform::SetBreadcrumbLight("tp:cam-skip:ctrl");
-                    } else {
-                        if (!controllerClass) controllerClass = controllerMonoKlass;
-                        if (controllerClass) {
-                            // A. SetInitialAxisValue(0 params)：实例传 controller，静态传 nullptr（否则 SIGSEGV）
-                            void *mSetInitAxis = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("SetInitialAxisValue"), 0);
-                            if (mSetInitAxis) {
-                                void *aExc = nullptr;
-                                _monoRuntimeInvoke(mSetInitAxis, MossMethodIsStatic(mSetInitAxis) ? nullptr : controller, nullptr, &aExc);
-                            }
+                    if (controllerClass) {
+                        // A. SetInitialAxisValue(0 params)
+                        void *mSetInitAxis = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("SetInitialAxisValue"), 0);
+                        if (mSetInitAxis) {
+                            _monoRuntimeInvoke(mSetInitAxis, controller, nullptr, nullptr);
+                        }
 
-                            // B. PopInit(0 params)
-                            void *mPopInit = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("PopInit"), 0);
-                            if (mPopInit) {
-                                void *bExc = nullptr;
-                                _monoRuntimeInvoke(mPopInit, MossMethodIsStatic(mPopInit) ? nullptr : controller, nullptr, &bExc);
-                            }
+                        // B. PopInit(0 params)
+                        void *mPopInit = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("PopInit"), 0);
+                        if (mPopInit) {
+                            _monoRuntimeInvoke(mPopInit, controller, nullptr, nullptr);
+                        }
 
-                            // C. ResetInterpolationValue(0 params)
-                            void *mResetInterp = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("ResetInterpolationValue"), 0);
-                            if (mResetInterp) {
-                                void *cExc = nullptr;
-                                _monoRuntimeInvoke(mResetInterp, MossMethodIsStatic(mResetInterp) ? nullptr : controller, nullptr, &cExc);
-                                if (!cExc) LOGI("[TeleportFix] ResetInterpolationValue sukses dieksekusi (lerp dihentikan).");
-                            }
-                            SMPlatform::SetBreadcrumbLight("tp:cam6");
+                        // C. ResetInterpolationValue(0 params)
+                        void *mResetInterp = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("ResetInterpolationValue"), 0);
+                        if (mResetInterp) {
+                            _monoRuntimeInvoke(mResetInterp, controller, nullptr, nullptr);
+                            LOGI("[TeleportFix] ResetInterpolationValue sukses dieksekusi (lerp dihentikan).");
+                        }
 
-                            // D. isFirstFrame = true (agar frame berikutnya langsung snap tanpa gliding)
-                            //    字段必须是 BOOLEAN(0x02) 才写 bool；类型不符（int/byte/struct）写下去会踩内存。
-                            void *fieldFirstFrame = _monoClassGetFieldFromName ? _monoClassGetFieldFromName(controllerClass, (const char *) OBFUSCATE("isFirstFrame")) : nullptr;
-                            if (fieldFirstFrame && _monoFieldSetValue) {
-                                void *fieldType = _monoFieldGetType ? _monoFieldGetType(fieldFirstFrame) : nullptr;
-                                const int typeCode = fieldType ? SMMonoHot::TypeGetType(fieldType) : -1;
-                                if (typeCode == 0x02) {  // MONO_TYPE_BOOLEAN
-                                    bool firstFrameVal = true;
-                                    _monoFieldSetValue(controller, fieldFirstFrame, &firstFrameVal);
-                                    LOGI("[TeleportFix] isFirstFrame diset true (kamera snap instan).");
-                                } else {
-                                    SMPlatform::SetBreadcrumbLight("tp:cam-skip:ff");
-                                }
-                            }
-                            SMPlatform::SetBreadcrumbLight("tp:cam7");
+                        // D. isFirstFrame = true (agar frame berikutnya langsung snap tanpa gliding)
+                        void *fieldFirstFrame = _monoClassGetFieldFromName ? _monoClassGetFieldFromName(controllerClass, (const char *) OBFUSCATE("isFirstFrame")) : nullptr;
+                        if (fieldFirstFrame && _monoFieldSetValue) {
+                            bool firstFrameVal = true;
+                            _monoFieldSetValue(controller, fieldFirstFrame, &firstFrameVal);
+                            LOGI("[TeleportFix] isFirstFrame diset true (kamera snap instan).");
                         }
                     }
                 }

@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 //  Platform.mm — iOS 平台能力实现
 // ============================================================================
 
@@ -17,7 +17,6 @@
 #include <cstdio>
 #include <unistd.h>
 #include <atomic>
-#include <chrono>
 #include <pthread.h>
 #include <mutex>
 #include <cstring>
@@ -190,15 +189,6 @@ void Toast(const std::string &text) {
     SMOverlayShowToast(text);
 }
 
-void NotifyAuthFailure(const std::string &reason) {
-    // 安卓端在卡密验证失败时会把面板返回的原因顶到状态栏/Toast。
-    // iOS 侧统一走这个回调：文案固定前缀 + 原因，后台线程也能安全调用
-    // （SMOverlayShowToast 内部已 dispatch 到主线程）。
-    std::string body = reason;
-    if (body.empty()) body = u8"未知原因（面板未返回信息）";
-    Toast(std::string(u8"卡密验证失败：") + body);
-}
-
 std::string Clipboard() {
     NSString *s = [UIPasteboard generalPasteboard].string;
     return UTF8(s);
@@ -232,55 +222,6 @@ int BreadcrumbRingDump(std::string *outLines, int maxLines) {
         snprintf(line, sizeof(line), "%s | %s", g_bcRingTag[slot], g_bcRingMsg[slot]);
         outLines[count++] = line;
     }
-    return count;
-}
-
-// ---- 最近步骤落盘（闪退重启后仍能读到）----
-// 环形缓冲是纯内存态，进程一死就没了；而用户恰恰是崩溃后重启才看菜单。
-// 所以每次轻量打点都顺手把 ring 的最新 8 条覆盖写到 DataDir()/recent_steps.txt。
-// 只 fopen("w")+fputs+fclose，不做 fsync（页缓存就够活过 SIGSEGV/SIGKILL，
-// 又不阻塞每帧热路径）；200ms 内的重复调用直接合并跳过。
-static const char *RecentStepsFilePath() {
-    static std::string path;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        path = DataDir() + "/recent_steps.txt";
-    });
-    return path.c_str();
-}
-
-static void PersistRecentSteps() {
-    // 在锁内取一份 ring 快照（8 条 snprintf，微秒级），再在锁外写文件，
-    // 避免和热路径上的打点抢锁时把 fopen 也包进临界区。
-    std::string lines[12];
-    int n = 0;
-    {
-        std::lock_guard<std::mutex> lk(g_bcMutex);
-        n = BreadcrumbRingDump(lines, 12);
-    }
-    if (n <= 0) return;
-    FILE *fp = fopen(RecentStepsFilePath(), "w");
-    if (!fp) return;
-    for (int i = 0; i < n; ++i) {
-        fputs(lines[i].c_str(), fp);
-        fputc('\n', fp);
-    }
-    fclose(fp);
-}
-
-int LoadRecentStepsFromFile(std::string *outLines, int maxLines) {
-    if (!outLines || maxLines <= 0) return 0;
-    FILE *fp = fopen(RecentStepsFilePath(), "r");
-    if (!fp) return 0;
-    int count = 0;
-    char buf[256];
-    while (count < maxLines && fgets(buf, sizeof(buf), fp)) {
-        size_t n = strlen(buf);
-        while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
-        if (n == 0) continue;  // 跳过空行（上一版留下的多余换行）
-        outLines[count++] = buf;
-    }
-    fclose(fp);
     return count;
 }
 
@@ -331,9 +272,6 @@ void SetBreadcrumbLight(const std::string &step) {
         fputs(step.c_str(), fp);
         fclose(fp);
     }
-
-    // 崩溃前最后几步一条都不能丢：每次打点都整段覆盖写 recent_steps.txt
-    PersistRecentSteps();
 }
 
 std::string TakeBreadcrumb() {
