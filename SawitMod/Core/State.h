@@ -581,7 +581,7 @@ extern int g_fishBaitCurrentStackCount;
 extern int g_fishBaitStackCount;
 
 // --- Instant Farm ---
-inline constexpr int NUM_RESOURCES = 17;
+inline constexpr int NUM_RESOURCES = 18;
 extern bool g_autoFarmActive;
 extern bool g_farmSelections[NUM_RESOURCES];
 extern const char *farmNames[NUM_RESOURCES];

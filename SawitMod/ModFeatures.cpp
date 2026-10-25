@@ -325,11 +325,30 @@ std::vector<std::string> wakameCoords = {
         OBFUSCATE("v3:-35.2|-63.6|50.9"), OBFUSCATE("v3:-13.7|-65.6|50.8"),
         OBFUSCATE("v3:34.8|-45.3|-55.6"), OBFUSCATE("v3:45.2|-40.7|-60.7")};
 
+// Premium Wood（优质木材）：iOS 新增资源，坐标来自用户提供的树点文件
+// （优质木材坐标.txt，共 40 个点）。走 FIXED 路点：传送 -> 扫附近树 ->
+// SendAttackTreeCommand 砍树。
+std::vector<std::string> premiumWoodCoords = {
+        OBFUSCATE("v3:166.8|24.9|34.3"), OBFUSCATE("v3:164.5|25.4|36.4"), OBFUSCATE("v3:167.8|25.9|38.9"),
+        OBFUSCATE("v3:165.7|27.1|43.2"), OBFUSCATE("v3:168.0|27.0|46.2"), OBFUSCATE("v3:166.3|26.9|48.1"),
+        OBFUSCATE("v3:161.3|25.9|51.9"), OBFUSCATE("v3:161.3|25.9|53.4"), OBFUSCATE("v3:164.5|26.3|54.3"),
+        OBFUSCATE("v3:159.8|25.7|55.0"), OBFUSCATE("v3:156.7|25.5|60.7"), OBFUSCATE("v3:158.3|25.6|69.5"),
+        OBFUSCATE("v3:157.6|28.8|88.5"), OBFUSCATE("v3:156.7|28.7|91.3"), OBFUSCATE("v3:163.4|30.1|91.4"),
+        OBFUSCATE("v3:144.6|24.4|109.0"), OBFUSCATE("v3:147.1|24.5|109.4"), OBFUSCATE("v3:147.1|24.8|114.9"),
+        OBFUSCATE("v3:150.0|25.3|118.1"), OBFUSCATE("v3:166.5|23.1|126.8"), OBFUSCATE("v3:185.7|22.2|131.8"),
+        OBFUSCATE("v3:188.8|22.5|142.1"), OBFUSCATE("v3:198.8|22.4|130.7"), OBFUSCATE("v3:194.9|23.3|125.8"),
+        OBFUSCATE("v3:202.8|22.4|133.7"), OBFUSCATE("v3:203.0|21.8|139.1"), OBFUSCATE("v3:206.3|22.0|136.4"),
+        OBFUSCATE("v3:207.8|22.1|132.2"), OBFUSCATE("v3:197.3|27.1|66.6"), OBFUSCATE("v3:194.5|25.7|58.9"),
+        OBFUSCATE("v3:190.2|25.7|56.5"), OBFUSCATE("v3:193.6|25.5|55.9"), OBFUSCATE("v3:192.0|24.8|47.7"),
+        OBFUSCATE("v3:184.8|25.2|38.8"), OBFUSCATE("v3:190.1|25.8|30.9"), OBFUSCATE("v3:197.2|23.2|14.1"),
+        OBFUSCATE("v3:204.0|23.4|22.6"), OBFUSCATE("v3:207.5|23.0|13.1"), OBFUSCATE("v3:206.9|23.4|34.0"),
+        OBFUSCATE("v3:204.4|23.4|36.3")};
+
 std::vector<std::string> *allResourceVectors[] = {
         &oreCoords, &stoneCoords, &mandarinCoords, &raspberryCoords, &blueberryCoords, &appleCoords,
         &oysterCoords, &tallMustardCoords, &blackTruffleCoords, &fiddleheadCoords,
         &pennyBunCoords, &shitakeCoords, &burdockCoords, &mustardGreensCoords,
-        &seaAsparagusCoords, &seaGrapesCoords, &wakameCoords};
+        &seaAsparagusCoords, &seaGrapesCoords, &wakameCoords, &premiumWoodCoords};
 
 const char *GetCookerNameByStaticId(int staticId) {
     switch (staticId) {
@@ -5521,6 +5540,10 @@ static bool IsResourceTypeCompatible(int resourceIndex, int resType) {
     if (resourceIndex == 2) return resType == 1 || resType == 10;
     if (resourceIndex == 5) return resType == 1;
 
+    // 17 = Premium Wood（优质木材）：iOS 新增，坐标表来自用户提供的树点。
+    // 高级树仍走正常砍树协议（resType 1）；少数配置把它报成 Dynamic Collectable(10)。
+    if (resourceIndex == 17) return resType == 1 || resType == 10;
+
     // Raspberry dan Blueberry dapat muncul sebagai Bush biasa (3) maupun
     // Dynamic Collectable (10), tergantung konfigurasi spawn.
     if (resourceIndex == 3 || resourceIndex == 4)
@@ -5647,6 +5670,14 @@ static int ClassifyResourceIdentity(std::string text) {
     if (has("shiitake") || has("shitake") || has("p_gather_shiitake")) return 11;
     if (has("burdock") || has("p_gather_burdock")) return 12;
     if (has("oyster") || has("pleurotus")) return 6;
+    // 优质木材（高级树）：只认非常具体的词，避免普通树/果树被误判成它。
+    // identity 里没有这些词也没关系 —— FIXED 路点会用位置/类型兜底归类。
+    if (has("premium wood") || has("premiumwood") || has("premium_wood") ||
+        has("rare tree") || has("raretree") || has("rare_tree") ||
+        has("fine wood") || has("finewood") || has("fine_wood") ||
+        has("quality wood") || has("qualitywood") || has("quality_wood") ||
+        has("hardwood") || has("hard wood") || has("hard_wood"))
+        return 17;
     if (has("blueberry") || has("p_fruit_blueberry")) return 4;
     if (has("raspberry") || has("p_fruit_raspberry")) return 3;
     if (has("mandarin") || has("orange") || has("p_fruit_citrus")) return 2;
@@ -5687,7 +5718,8 @@ static const char* GetInstantFarmIconSpriteKey(int resourceIndex) {
         "p_fruit_raspberry", "p_fruit_blueberry", "p_fruit_apple",
         "p_gather_pleurotus_00", "p_gather_garlicmustard_00", "p_gather_truffle_00",
         "p_gather_bracken_00", "p_gather_boletus_00", "p_gather_shiitake_00",
-        "p_gather_burdock_00", "p_gather_shepherdspurse_00", "", "", ""
+        "p_gather_burdock_00", "p_gather_shepherdspurse_00", "", "", "",
+        ""   // 17 Premium Wood：不设 iconKey（iconMapped=false → iconConsistent 恒真）
     };
     return resourceIndex >= 0 && resourceIndex < NUM_RESOURCES ? keys[resourceIndex] : "";
 }
@@ -5725,6 +5757,7 @@ static float GetInstantFarmFixedRadius(int resourceIndex) {
         case 1:             return 3.0f; // Stone
         case 2:             return 8.0f; // Mandarin: pivot entity dapat lebih jauh dari titik teleport
         case 5:             return 5.0f; // Apple
+        case 17:            return 8.0f; // Premium Wood: 树 pivot 离传送点更远
         case 14:
         case 15:
         case 16:            return 2.0f; // Resource laut
@@ -6424,6 +6457,9 @@ void ExecuteInstantFarmThread(
                     // NetID utama tetap dicoba dahulu; fallback baru aktif setelah
                     // tiga hit tidak pernah mengubah target menjadi cooldown.
                     const bool mandarinTarget = liveTarget->resourceIndex == 2;
+                    // Premium Wood：不管服务端把高级树报成 Tree(1) 还是 Dynamic
+                    // Collectable(10)，一律用砍树协议；否则会退化成拾取命令白跑。
+                    const bool premiumWoodTarget = liveTarget->resourceIndex == 17;
                     const bool useDictionaryId = mandarinTarget && currentTargetAttempts >= 3 &&
                         liveTarget->dictionaryKey != 0 &&
                         liveTarget->dictionaryKey != liveTarget->entityId;
@@ -6433,7 +6469,7 @@ void ExecuteInstantFarmThread(
                     void* commandExc = nullptr;
                     const bool underwater = liveTarget->resourceIndex >= 14 &&
                         liveTarget->resourceIndex <= 16;
-                    if (mandarinTarget) {
+                    if (mandarinTarget || premiumWoodTarget) {
                         // Identitas resource lebih dapat dipercaya daripada resType pada
                         // Mandarin Android; beberapa spawn melaporkannya sebagai type 10.
                         if (!sendAttackTree) return;

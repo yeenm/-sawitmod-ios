@@ -1967,51 +1967,8 @@ void DrawMenu() {
 
         if (tab == 5) {
             ImGui::Spacing();
-            ActiveUI::Section("I", Tr("Instant Auto Farm", u8"瞬间自动采集"));
-            ImGui::Text(Tr("Select resources to farm:", u8"选择要采集的资源:"));
-
-            ImGui::Checkbox(Tr("Trees", u8"树木"), &g_farmTree);
-            ImGui::SameLine();
-            ImGui::Checkbox(Tr("Stone", u8"石头"), &g_farmStone);
-            ImGui::SameLine();
-            ImGui::Checkbox(Tr("Bush", u8"灌木"), &g_farmBush);
-            ImGui::Checkbox(Tr("Meteorite", u8"陨石"), &g_farmMeteorite);
-            ImGui::SameLine();
-            ImGui::Checkbox(Tr("Dynamic Bush", u8"动态灌木"), &g_farmDynamicBush);
-            ImGui::Spacing();
-
-            if (g_legacyInstantFarmingActive) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ActiveUI::kDanger);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.68f, 0.26f, 0.24f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_Text, ActiveUI::kOnAccent);
-                if (ImGui::Button(Tr("Stop Farming", u8"停止采集"), ImVec2(-1, 70))) {
-                    g_legacyInstantFarmingActive = false;
-                    g_legacyInstantFarmGeneration.fetch_add(1, std::memory_order_acq_rel);
-                }
-                ImGui::PopStyleColor();
-            } else if (ImGui::Button(Tr("Start Instant Farm", u8"开始瞬间采集"), ImVec2(-1, 70))) {
-                if ((g_farmTree || g_farmStone || g_farmBush || g_farmMeteorite ||
-                     g_farmDynamicBush) && SesiAktif()) {
-                    g_legacyInstantFarmGeneration.fetch_add(1, std::memory_order_acq_rel);
-                    g_legacyInstantFarmingActive = true;
-                    std::thread([]() {
-                        if (!SesiAktif()) {
-                            g_legacyInstantFarmingActive = false;
-                            return;
-                        }
-                        InvokeRequest req = FetchPayloadSync(WireForOp(OP_INSTANT_FARM_TRIGGER));
-                        if (req.dllName.empty() || req.nameSpace.empty() || req.className.empty()) {
-                            g_legacyInstantFarmingActive = false;
-                            return;
-                        }
-                        ExecuteLegacyInstantFarmThread(req.dllName, req.nameSpace, req.className);
-                    }).detach();
-                }
-            }
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-
+            // 旧版「瞬间自动采集」（树木/石头/灌木/陨石/动态灌木）已移除：
+            // 采集统一走「游戏 -> 种植 -> 瞬间资源采集」那一套。
             ActiveUI::Section("E", Tr("Vehicle Swap", u8"载具替换"));
             ImGui::TextColored(ActiveUI::kOk, Tr("Note: Use only on loading screen", u8"注意：仅在加载界面使用"));
             ImGui::Spacing();

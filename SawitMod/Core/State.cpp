@@ -311,19 +311,21 @@ std::string g_prevCrashHead;
 
 bool libLoaded = false;
 
-// Instant Farm 的 17 种资源：顺序必须与 NUM_RESOURCES / g_farmSelections 一致。
+// Instant Farm 的 18 种资源：顺序必须与 NUM_RESOURCES / g_farmSelections 一致。
+// 最后一项 Premium Wood（优质木材）是 iOS 新增：坐标表在 ModFeatures.cpp 的
+// premiumWoodCoords，走 FIXED 路点 + SendAttackTreeCommand 砍树采集。
 const char *farmNames[NUM_RESOURCES] = {
     OBFUSCATE("Ore"), OBFUSCATE("Stone"), OBFUSCATE("Mandarin"), OBFUSCATE("Raspberry"),
     OBFUSCATE("Blueberry"), OBFUSCATE("Apple"),
     OBFUSCATE("Oyster"), OBFUSCATE("Tall Mustard"), OBFUSCATE("Black Truffle"),
     OBFUSCATE("Fiddlehead"), OBFUSCATE("Penny Bun"), OBFUSCATE("Shitake"),
     OBFUSCATE("Burdock"), OBFUSCATE("Mustard Greens"), OBFUSCATE("Sea Asparagus"),
-    OBFUSCATE("Sea Grapes"), OBFUSCATE("Wakame")};
+    OBFUSCATE("Sea Grapes"), OBFUSCATE("Wakame"), OBFUSCATE("Premium Wood")};
 
 const char *farmNamesZh[NUM_RESOURCES] = {
     u8"矿石", u8"石头", u8"柑橘", u8"树莓", u8"蓝莓", u8"苹果",
     u8"平菇", u8"高荠", u8"黑松露", u8"蕨菜", u8"牛肝菌", u8"香菇",
-    u8"口蘑", u8"荠菜", u8"海芦笋", u8"海葡萄", u8"海带"};
+    u8"口蘑", u8"荠菜", u8"海芦笋", u8"海葡萄", u8"海带", u8"优质木材"};
 
 // 12 个家园传送点：g_homeCoords 由 ModFeatures.cpp 定义（那里是完整坐标表），
 // 这里只保留 ownerNetId 数组。
