@@ -9058,6 +9058,12 @@ void SetAutoFishHoverNative(bool enable) {
 // PATCH TELEPORT ABNORMAL LOG & ANTI-CRASH / ANTI-BLACK-SCREEN
 // =========================================================
 void EnsureTeleportAntiCrashPatched() {
+#if defined(__APPLE__)
+    // 侧载 iOS：__TEXT 受代码签名保护、mono 方法体是解释器入口，写方法体 RET 只会
+    // 把游戏方法写坏（实测「传送采集」崩在 tp:auto 的补丁阶段）。传送链路已改走
+    // 游戏原生 AutoMoveTransfer，不再需要这些补丁 —— 这里直接返回，一行代码页都不碰。
+    return;
+#endif
     static std::atomic<bool> s_patched{ false };
     if (s_patched.load(std::memory_order_relaxed)) return;
 
@@ -9208,306 +9214,168 @@ void EnsureTeleportAntiCrashPatched() {
 
 
 // ===========================================================================
-//  传送前后"等就绪"（Android/PC 版一直有这段流程，iOS 版此前完全缺失）
+//  传送（iOS 安全版）—— 与 PC 版 HeartopiaComplete.Teleport.cs 的权威路径对齐
 // ---------------------------------------------------------------------------
-//  ⚠️ 崩溃根因（已修）：旧版 SMTpAreaReadyFor 在传送前用 mono 反射猜"区块加载好没"，
-//  探测链是 EntityUtil.GetSelfPlayer() / LevelObjectManager._instance._dictionary /
-//  get_Count。iOS 上这些类/方法/实例指针在加载界面和局内都不可信（vtable 未就绪、
-//  实例未建、方法被裁剪），一 invoke 就崩，面包屑永远停在 tp:pre。
-//  现在传送前闸门 = 纯 C++ 原子读 + SesiAktif()，一行 mono 都不碰，任何线程直接调用。
+//  PC 版唯一的传送原语（也是游戏自己用的那一个）：
+//      EntityHelper.AutoMoveTransfer(Vector3)
+//  游戏侧实现（XDTLevelAndEntity.Utils.EntityHelper，反编译核对）：
+//      EntityManager.Instance.selfPlayer
+//          .GetComponent<LocalPlayerComponent>()
+//          .Transfer(pos, entity.rotation.eulerAngles, 0, checkCollision:false)
+//  静态、单参、内部全是托管代码，相机与位置同步由游戏自己处理。
 //
-//  流程：① 纯 C++ 安全闸门 → ② invoke → ③ 传送后落地确认（坐标真的变了）。
+//  iOS 版此前「所有传送一用就闪退」的四类根因，本段全部拆掉：
+//   ① 线程（主因）：云端载荷（HOME / PLAYER / 传送目录）在 worker 线程里派发，
+//      FeatureDispatch 旧代码直接调 AutoMoveTransferDirect —— 在非 Unity 线程
+//      里碰游戏对象 = 随机 SIGSEGV。现在统一走 AutoMoveTransferNative 的
+//      RunOnUnityThreadSync 封送（FeatureDispatch 已同步改回 Native 入口）。
+//   ② 相机吸附块：传送后改写 XDTCameraManager / FollowCameraController 的插值
+//      状态与 isFirstFrame，实测游戏自己的相机更新在下一帧就崩（tp:cam7）。
+//      PC 版传送不做这一步 —— 整块删除。
+//   ③ 反崩溃 inline patch（往游戏方法体首字节写 RET）：侧载 iOS 的 __TEXT 受
+//      代码签名保护、mono 方法体是解释器入口，写下去只会把游戏方法写坏。
+//      传送链路不再调用 EnsureTeleportAntiCrashPatched；FeatureDispatch 里的
+//      补丁函数在 Apple 上统一 return false。
+//   ④ 传送前后的 mono 反射探针（GetSelfPlayer / get_position / 字典遍历轮询）：
+//      对象未稳定时探测本身就会崩（旧版 tp:pre 即此）。现在只做一次
+//      「零 invoke 的签名自检」，是否成功以 invoke 有没有抛异常为准。
 //
-//  ⚠️ 线程纪律：
-//    * 闸门不排队、不 sleep、不轮询：立即判定，通过 tp:gate / 兜底 tp:gate:uptime /
-//      拒绝 tp:skip:early（只在模块加载后前 12 秒内出现）。
-//    * 只有"传送后落地确认"里的 mono 调用走 RunOnUnityThreadSync（对象用完即弃，
-//      不跨帧保存），且每一步都先做 null 检查：类/方法/实例任一为 null 就放弃探测、
-//      直接返回 false —— 宁可不确认落地，也绝不把不确定的指针送进 mono。
-//    * 200ms×N 的 sleep 轮询只在"调用线程不是 Unity 线程"时做。在 Unity 线程上
-//      sleep 会让游戏停帧，真正的等待放在调用线程侧。
+//  线程纪律：所有 *_Direct 函数只允许在 Unity 线程执行（由 Native 入口封送）。
 // ===========================================================================
-static bool SMTpIsOnUnityThread() {
-    const std::thread::id unityThread = g_unityThreadId.load(std::memory_order_relaxed);
-    return unityThread != std::thread::id() && std::this_thread::get_id() == unityThread;
+
+// 帧泵（= iOS 主线程 / Unity 线程）是否已经在跑。RunOnUnityThreadSync 的队列
+// 由它消费；没跑起来就排队 = 调用方白等 20 秒，所以传送前先用纯 C++ 信号查一次。
+static bool SMTpPumpAlive() {
+    return g_unityThreadId.load(std::memory_order_relaxed) != std::thread::id();
 }
 
-static uint64_t SMTpNowMs() {
-    return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
-// 读自身坐标：EntityUtil.GetSelfPlayer() → get_position()（Vector3 boxed，unbox 后 memcpy 12 字节）。
-// ⚠️ 全链路 null 检查：EntityUtil 类 / GetSelfPlayer 方法 / 返回实例 / get_position 方法，
-//    任一为 null 都直接返回 false，绝不把可疑指针送进 mono（iOS 上一 invoke 就崩）。
-static bool SMTpReadSelfPosition(Vector3 &out) {
-    if (!_monoImageLoaded || !_monoClassFromName || !_monoRuntimeInvoke ||
-        !_monoObjectGetClass || !_monoObjectUnbox) {
-        return false;
-    }
-
-    void *img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity"));
-    if (!img) img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
-    if (!img) return false;
-
-    void *utilKlass = _monoClassFromName(img,
-                                         (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"),
-                                         (const char *) OBFUSCATE("EntityUtil"));
-    if (!utilKlass) return false;   // ① EntityUtil 类为 null
-
-    void *m_getSelf = FindMethodInHierarchy(utilKlass, (const char *) OBFUSCATE("GetSelfPlayer"), 0);
-    if (!m_getSelf) return false;   // ② GetSelfPlayer 方法为 null → 不调用
-
-    void *exc = nullptr;
-    void *self = _monoRuntimeInvoke(m_getSelf, nullptr, nullptr, &exc);
-    if (!self || exc) return false; // ③ 返回对象为 null（世界/实体还没建好）
-
-    void *klass = _monoObjectGetClass(self);
-    if (!klass) return false;       // ④ 实例的类为 null
-
-    void *m_getPos = FindMethodInHierarchy(klass, (const char *) OBFUSCATE("get_position"), 0);
-    if (!m_getPos) return false;    // ⑤ get_position 方法为 null → 不调用
-
-    void *posExc = nullptr;
-    void *boxedPos = _monoRuntimeInvoke(m_getPos, self, nullptr, &posExc);
-    if (!boxedPos || posExc) return false;  // ⑥ boxed Vector3 为 null
-
-    void *raw = _monoObjectUnbox(boxedPos);
-    if (!raw) return false;                 // ⑦ unbox 失败
-
-    Vector3 v{0.0f, 0.0f, 0.0f};
-    memcpy(&v, raw, sizeof(float) * 3);
-    if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z)) return false;
-    out = v;
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-//  传送前安全闸门（零反射探测；只有 uptime 达标后的一次 netId 取值会碰 mono）
-// ---------------------------------------------------------------------------
-//  旧实现（已删）在这里做三件事，正是 tp:pre 崩溃的源头：
-//    * _monoClassFromName(...EntityUtil) + FindMethodInHierarchy("GetSelfPlayer") + invoke
-//    * _monoClassFromName(...LevelObjectManager) + get_Instance/_instance 字段 + invoke
-//    * Dictionary get_Count / entries 数组 + SMMonoHot::ArrayLength / ArrayAddrWithSize
-//  这些探测在加载界面和局内都会崩（说明是探测本身拿到的指针/方法不可信）。
-//  现在用三档信号（前两档纯 C++，第三档全程只有一次 mono 调用）：
-//    ① 已知状态：会话有效 + 自身 netId 已知 → 世界确实已经在跑，直接放行 tp:gate；
-//    ② uptime 门槛：时间基准 = 本模块加载时刻（kSMTpBootMs），uptime < 12 秒 → 拒绝；
-//    ③ uptime ≥ 12 秒后，一次性调用 GetPlayerNetIdOnUnityThread() 取自身 netId：
-//       前置闸 _monoImageLoaded("XDTDataAndProtocol") 非空才调、每个进程只调一次；
-//       取到 → tp:gate；仍为 0 → 按 uptime 兜底放行 tp:gate:uptime（不再永久拒绝）。
-// ---------------------------------------------------------------------------
-static constexpr uint64_t kSMTpGateMinUptimeMs = 12000;
-
-// 时间基准 = 模块加载时刻（steady_clock 毫秒），static 初始化在 dylib 载入时执行一次。
-// ⚠️ 旧版把基准做成"第一次进闸门时 CAS 打点"，等于从第一次点传送开始计时 12/30 秒，
-//    第一次几乎必被拒（面包屑恒为 tp:skip:early）。基准必须早于任何一次传送调用。
-static const uint64_t kSMTpBootMs =
-        (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-
-// 一次性 netId 探测开关：GetPlayerNetIdOnUnityThread() 内部有 mono invoke，可能崩，
-// 所以每个进程只尝试一次，且只在 uptime ≥ 12 秒、模块已加载、线程/帧泵条件满足时才尝试。
-static std::atomic<bool> g_smTpNetIdTried{false};
-
-// 尝试一次用 mono 取自身 netId。返回 true = netId 已非 0。
-static bool SMTpFetchPlayerNetIdOnce() {
-    if (g_gardenPlayerNetId != 0) return true;
-    if (g_smTpNetIdTried.load(std::memory_order_relaxed)) return false;
-
-    // ① 先确认模块已加载（_monoImageLoaded 全工程大量使用，相对安全）：
-    //    为空就直接跳过 —— 绝不把未知指针/半加载的 image 送进 mono。
-    if (!_monoImageLoaded) return false;
-    void *img = _monoImageLoaded((const char *) OBFUSCATE("XDTDataAndProtocol"));
-    if (!img) img = _monoImageLoaded((const char *) OBFUSCATE("XDTDataAndProtocol.dll"));
-    if (!img) return false;
-
-    // ② mono invoke 只在 Unity 线程上做（与落地确认同一纪律）；不在 Unity 线程且帧泵
-    //    还没起来时不排队、不阻塞，直接交给 uptime 兜底。
-    const bool onUnityThread = SMTpIsOnUnityThread();
-    if (!onUnityThread && !g_unityFramePumpReady.load(std::memory_order_acquire)) return false;
-
-    // ③ 抢一次性开关：抢不到说明别的线程已经在调，不重复 invoke。
-    if (g_smTpNetIdTried.exchange(true, std::memory_order_relaxed)) {
-        return g_gardenPlayerNetId != 0;
-    }
-
-    if (onUnityThread) {
-        GetPlayerNetIdOnUnityThread();
-    } else {
-        RunOnUnityThreadSync([]() { GetPlayerNetIdOnUnityThread(); });
-    }
-    return g_gardenPlayerNetId != 0;
-}
-
-// 返回 true = 允许传送；false = 拒绝（reason = "early"，调用方打 tp:skip:early）。
-// reason："gate"（状态已够 / 一次性 netId 探测成功）、"uptime"（12 秒兜底放行）、"early"。
-static bool SMTpAreaReadyFor(const char **reasonOut, uint64_t *uptimeOut = nullptr) {
+// 传送前闸门：纯 C++、不碰 mono、不 sleep、不排队。
+// 只要求帧泵在跑（能把 invoke 封送到 Unity 线程）。游戏侧 AutoMoveTransfer 自己
+// 会判 EntityManager / selfPlayer 是否就绪（null 直接 return），所以这里不再做
+// 「区块加载好没」的反射探测 —— 那正是旧版 tp:pre 的崩溃点。
+static bool SMTpGate(const char **reasonOut) {
     if (reasonOut) *reasonOut = "?";
-
-    // ① 已知状态够用：会话有效（SesiAktif 纯 C++，Pump 每帧也在调）+ 自身 netId 已解析。
-    if (SesiAktif() && g_gardenPlayerNetId != 0) {
-        if (reasonOut) *reasonOut = "gate";
-        return true;
-    }
-
-    // ② 时间基准 = 模块加载时刻（不是第一次点传送），uptime 从模块加载起算。
-    const uint64_t bootMs = kSMTpBootMs;
-    const uint64_t nowMs = SMTpNowMs();
-    const uint64_t uptimeMs = (nowMs > bootMs) ? (nowMs - bootMs) : 0;
-    if (uptimeOut) *uptimeOut = uptimeMs;
-
-    // ③ uptime < 12 秒：早期硬传送必崩在流式加载/AOI/碰撞里 → 拒绝本次传送。
-    if (uptimeMs < kSMTpGateMinUptimeMs) {
-        if (reasonOut) *reasonOut = "early";
+    if (!SMTpPumpAlive()) {
+        if (reasonOut) *reasonOut = "no-pump";
         return false;
     }
-
-    // ④ uptime 够 → 一次性取自身 netId；取到 tp:gate，取不到按 uptime 兜底放行。
-    if (SMTpFetchPlayerNetIdOnce()) {
-        if (reasonOut) *reasonOut = "gate";
-        return true;
-    }
-    if (reasonOut) *reasonOut = "uptime";
+    if (reasonOut) *reasonOut = "ok";
     return true;
 }
 
-// 传送前闸门（立即判定，不排队、不 sleep、不轮询；唯一例外是 uptime ≥ 12 秒后
-// 那一次取 netId 的调用，且每个进程只发生一次）。
-//   状态/探测通过 → tp:gate；uptime 兜底 → tp:gate:uptime；uptime < 12 秒 → tp:skip:early。
-//   pos / timeoutMs 只为兼容既有调用点保留，闸门本身不再使用。
+// 闸门包装：打面包屑（通过 tp:gate / 拒绝 tp:skip:<reason>），不做任何等待。
+// pos / timeoutMs 只为兼容既有调用点保留。
 static bool SMTpWaitAreaReady(Vector3 pos, int timeoutMs) {
     (void) pos;
     (void) timeoutMs;
     const char *reason = "?";
-    uint64_t uptimeMs = 0;
-    if (SMTpAreaReadyFor(&reason, &uptimeMs)) {
-        if (reason && strcmp(reason, "uptime") == 0) {
-            // 12 秒门槛已过，但一次性 netId 探测没拿到（模块没加载/帧泵没起来/实例还没建）
-            // → 按 uptime 兜底放行，不再永久拒绝传送。
-            SMPlatform::SetBreadcrumbLight("tp:gate:uptime");
-            LOGI("[TeleportFix] gate lolos via uptime (netId=%u, uptime=%llums); teleport dilanjutkan.",
-                 (unsigned) g_gardenPlayerNetId, (unsigned long long) uptimeMs);
-        } else {
-            SMPlatform::SetBreadcrumbLight("tp:gate");
-        }
+    if (SMTpGate(&reason)) {
+        SMPlatform::SetBreadcrumbLight("tp:gate");
         return true;
     }
-    SMPlatform::SetBreadcrumbLight("tp:skip:early");
-    LOGE("[TeleportFix] gate teleport belum lolos (%s, netId=%u, uptime=%llums < %llums); teleport dibatalkan.",
-         reason, (unsigned) g_gardenPlayerNetId, (unsigned long long) uptimeMs,
-         (unsigned long long) kSMTpGateMinUptimeMs);
+    SMPlatform::SetBreadcrumbLight(std::string("tp:skip:") + reason);
+    LOGE("[TeleportFix] gate teleport belum lolos (%s); teleport dibatalkan.", reason);
     return false;
 }
 
-// 落地确认：自身坐标进入目标 2.0m 内算落地。同样只在非 Unity 线程上轮询。
-static bool SMTpWaitLanded(Vector3 pos, int timeoutMs, float *outDistance = nullptr) {
-    const bool onUnityThread = SMTpIsOnUnityThread();
-    const uint64_t deadline = SMTpNowMs() + (uint64_t) timeoutMs;
-    float distance = 0.0f;
-    for (;;) {
-        bool landed = false;
-        RunOnUnityThreadSync([&]() {
-            Vector3 selfPos{0.0f, 0.0f, 0.0f};
-            if (!SMTpReadSelfPosition(selfPos)) return;
-            distance = GetVector3Distance(selfPos, pos);
-            landed = distance < 2.0f;
-        });
-        if (landed) {
-            if (outDistance) *outDistance = distance;
-            LOGI("[TeleportFix] landing terkonfirmasi, jarak ke target %.2f m.", distance);
-            return true;
-        }
-        if (onUnityThread) {
-            // 同一帧内读不到新坐标是正常的（位移由游戏 update 应用），交给调用线程轮询。
-            if (outDistance) *outDistance = distance;
-            return false;
-        }
-        if (SMTpNowMs() >= deadline) {
-            if (outDistance) *outDistance = distance;
-            LOGE("[TeleportFix] landing timeout %d ms, jarak ke target %.2f m.", timeoutMs, distance);
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
+// 方法是否 mono 静态方法（MONO_METHOD_ATTR_STATIC = 0x10）。
+// 实例方法传 nullptr this 会 SIGSEGV；AOT 方法不走本链路。
+static bool SMTpMethodIsStatic(void *method) {
+    if (!method || !SMMonoHot::IsMonoMethod(method)) return false;
+    const uint32_t flags = SMMonoHot::MethodGetFlags(method, nullptr);
+    return (flags & 0x10u) != 0;
 }
 
-// 实体传送的落地确认：每次重新按 netId 解析目标实体（绝不跨帧保存 mono 对象），
-// 用目标实体 get_position 与自身坐标比对。
-// ⚠️ 全链路 null 检查：Entities 类 / GetAnyEntity 方法 / 返回实体 / 实体类 /
-//    get_position 方法 / boxed Vector3 / unbox 结果，任一为 null 都放弃本次探测。
-static bool SMTpWaitNearEntity(uint32_t entityNetId, int timeoutMs) {
-    if (entityNetId == 0) return false;
-    if (!_monoImageLoaded || !_monoClassFromName || !_monoRuntimeInvoke ||
-        !_monoObjectGetClass || !_monoObjectUnbox) {
+// 校验 EntityHelper.AutoMoveTransfer(Vector3)：
+//   mono 静态方法、返回 void、恰好 1 个参数、参数是 UnityEngine.Vector3
+//   （12 字节值类型，MONO_TYPE_VALUETYPE = 0x11）。
+// 读不到任何一项都返回 false —— 这是防「iOS 版本方法表变化 → 把 12 字节 Vector3
+// 当别的参数盲调 → SIGSEGV」的唯一保险（宁可不传送，也不盲调）。
+static bool SMTpCheckAutoMoveSignature(void *method, std::string *sigOut) {
+    if (sigOut) *sigOut = "non-mono";
+    if (!SMTpMethodIsStatic(method)) return false;
+    void *sig = SMMonoHot::MethodSignature(method);
+    if (!sig) {
+        if (sigOut) *sigOut = "no-sig";
         return false;
     }
-    const bool onUnityThread = SMTpIsOnUnityThread();
-    const uint64_t deadline = SMTpNowMs() + (uint64_t) timeoutMs;
-    float distance = 0.0f;
-    for (;;) {
-        bool near = false;
-        RunOnUnityThreadSync([&]() {
-            void *img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity"));
-            if (!img) img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
-            if (!img) return;
-
-            void *entitiesKlass = _monoClassFromName(img,
-                                                    (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"),
-                                                    (const char *) OBFUSCATE("Entities"));
-            if (!entitiesKlass) return;     // ① Entities 类为 null
-
-            void *m_getAny = FindMethodInHierarchy(entitiesKlass, (const char *) OBFUSCATE("GetAnyEntity"), 1);
-            if (!m_getAny) return;          // ② GetAnyEntity 方法为 null → 不调用
-
-            uint32_t argNetId = entityNetId;
-            void *args[] = {&argNetId};
-            void *exc = nullptr;
-            void *target = _monoRuntimeInvoke(m_getAny, nullptr, args, &exc);
-            if (!target || exc) return;     // ③ 返回实体为 null
-
-            void *targetKlass = _monoObjectGetClass(target);
-            if (!targetKlass) return;       // ④ 实体的类为 null
-
-            void *m_getPos = FindMethodInHierarchy(targetKlass, (const char *) OBFUSCATE("get_position"), 0);
-            if (!m_getPos) return;          // ⑤ get_position 方法为 null → 不调用
-
-            void *posExc = nullptr;
-            void *boxedPos = _monoRuntimeInvoke(m_getPos, target, nullptr, &posExc);
-            if (!boxedPos || posExc) return; // ⑥ boxed Vector3 为 null
-
-            void *raw = _monoObjectUnbox(boxedPos);
-            if (!raw) return;                // ⑦ unbox 失败
-
-            Vector3 targetPos{0.0f, 0.0f, 0.0f};
-            memcpy(&targetPos, raw, sizeof(float) * 3);
-            if (!std::isfinite(targetPos.x) || !std::isfinite(targetPos.y) ||
-                !std::isfinite(targetPos.z)) {
-                return;
-            }
-
-            Vector3 selfPos{0.0f, 0.0f, 0.0f};
-            if (!SMTpReadSelfPosition(selfPos)) return;
-            distance = GetVector3Distance(selfPos, targetPos);
-            near = distance < 2.0f;
-        });
-        if (near) {
-            LOGI("[TeleportFix] entity landing terkonfirmasi, jarak %.2f m.", distance);
-            return true;
-        }
-        if (onUnityThread) return false;
-        if (SMTpNowMs() >= deadline) {
-            LOGE("[TeleportFix] entity landing timeout %d ms, jarak %.2f m.", timeoutMs, distance);
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    void *retType = SMMonoHot::SignatureGetReturnType(sig);
+    const int retCode = retType ? SMMonoHot::TypeGetType(retType) : -1;
+    if (retCode != 0x01) {   // MONO_TYPE_VOID
+        if (sigOut) *sigOut = "ret";
+        return false;
     }
+    void *iter = nullptr;
+    void *param0 = SMMonoHot::SignatureGetParams(sig, &iter);
+    if (!param0) {
+        if (sigOut) *sigOut = "argc0";
+        return false;
+    }
+    if (SMMonoHot::SignatureGetParams(sig, &iter) != nullptr) {
+        if (sigOut) *sigOut = "argc2";
+        return false;
+    }
+    const int typeCode = SMMonoHot::TypeGetType(param0);
+    char buf[48];
+    snprintf(buf, sizeof(buf), "s1a1t%02x", (typeCode < 0 || typeCode > 0xff) ? 0xff : typeCode);
+    if (sigOut) *sigOut = buf;
+    if (typeCode != 0x11) return false;   // MONO_TYPE_VALUETYPE（struct 值类型）
+    void *paramClass = SMMonoHot::ClassFromMonoType(param0);
+    if (!paramClass) {
+        if (sigOut) *sigOut = "ptype";
+        return false;
+    }
+    const char *clsName = SMMonoHot::ClassGetName(paramClass);
+    const char *nsName = SMMonoHot::ClassGetNamespace(paramClass);
+    if (!clsName || strcmp(clsName, "Vector3") != 0) {
+        if (sigOut) *sigOut = "ptype-name";
+        return false;
+    }
+    if (nsName && *nsName && strcmp(nsName, "UnityEngine") != 0) {
+        if (sigOut) *sigOut = "ptype-ns";
+        return false;
+    }
+    return true;
 }
 
+// 校验 EntityHelper.Transfer2Entity(uint)：mono 静态、返回 void、1 个整数参数（I4/U4）。
+static bool SMTpCheckEntityTransferSignature(void *method, std::string *sigOut) {
+    if (sigOut) *sigOut = "non-mono";
+    if (!SMTpMethodIsStatic(method)) return false;
+    void *sig = SMMonoHot::MethodSignature(method);
+    if (!sig) {
+        if (sigOut) *sigOut = "no-sig";
+        return false;
+    }
+    void *retType = SMMonoHot::SignatureGetReturnType(sig);
+    if (!retType || SMMonoHot::TypeGetType(retType) != 0x01) {
+        if (sigOut) *sigOut = "ret";
+        return false;
+    }
+    void *iter = nullptr;
+    void *param0 = SMMonoHot::SignatureGetParams(sig, &iter);
+    if (!param0) {
+        if (sigOut) *sigOut = "argc0";
+        return false;
+    }
+    if (SMMonoHot::SignatureGetParams(sig, &iter) != nullptr) {
+        if (sigOut) *sigOut = "argc2";
+        return false;
+    }
+    const int typeCode = SMMonoHot::TypeGetType(param0);
+    char buf[48];
+    snprintf(buf, sizeof(buf), "s1a1t%02x", (typeCode < 0 || typeCode > 0xff) ? 0xff : typeCode);
+    if (sigOut) *sigOut = buf;
+    return typeCode == 0x08 || typeCode == 0x09;   // MONO_TYPE_I4 / MONO_TYPE_U4
+}
+
+// --- 游戏原生瞬移入口：EntityHelper.AutoMoveTransfer(Vector3) ---
+// 只允许在 Unity 线程调用（AutoMoveTransferNative / Transfer2EntityNative 负责封送）。
+// 成功判据 = invoke 返回且没有托管异常；不做相机吸附、不做落地反射探针（见文件头）。
 bool AutoMoveTransferDirect(Vector3 pos) {
     SMPlatform::SetBreadcrumbLight("tp:auto");
     g_tpLastOutcome.store(kSMTpNone, std::memory_order_relaxed);
-    LOGI("[TeleportFix] AutoMoveTransferDirect dipanggil untuk posisi: %.2f, %.2f, %.2f", pos.x, pos.y, pos.z);
+    LOGI("[TeleportFix] AutoMoveTransferDirect pos=(%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
 
     SMPlatform::SetBreadcrumbLight("tp:att");
     if (_monoGetRootDomain && _monoThreadAttach) {
@@ -9516,55 +9384,48 @@ bool AutoMoveTransferDirect(Vector3 pos) {
     }
     SMPlatform::SetBreadcrumbLight("tp:att-done");
 
-    // Pastikan patch anti-crash aktif sebelum transfer
-    SMPlatform::SetBreadcrumbLight("tp:patch");
-    EnsureTeleportAntiCrashPatched();
+    // 明确不做 inline patch：EnsureTeleportAntiCrashPatched 在 Apple 上已是 no-op。
+    SMPlatform::SetBreadcrumbLight("tp:patch-off");
 
-    // Cari EntityHelper.AutoMoveTransfer(Vector3) di XDTLevelAndEntity
     void *img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity"));
+    if (!img) img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
     if (!img) {
-        img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
-    }
-    if (!img) {
+        SMPlatform::SetBreadcrumbLight("tp:no-img");
         LOGE("[TeleportFix] AutoMoveTransferDirect GAGAL: image XDTLevelAndEntity tidak ditemukan.");
         return false;
     }
 
     SMPlatform::SetBreadcrumbLight("tp:helper");
-    void *helperClass = _monoClassFromName(img, (const char *) OBFUSCATE("XDTLevelAndEntity.Utils"), (const char *) OBFUSCATE("EntityHelper"));
+    void *helperClass = _monoClassFromName(img,
+            (const char *) OBFUSCATE("XDTLevelAndEntity.Utils"),
+            (const char *) OBFUSCATE("EntityHelper"));
     if (!helperClass) {
+        SMPlatform::SetBreadcrumbLight("tp:no-helper");
         LOGE("[TeleportFix] AutoMoveTransferDirect GAGAL: EntityHelper class tidak ditemukan.");
         return false;
     }
 
-    // --- [传送前] 安全闸门（旧反射探测已删；uptime 达 12 秒后才一次性取 netId）---
-    // 硬传送 = 崩在随后的流式加载/AOI/碰撞处理里，所以闸门不放行就放弃本次传送。
-    // 面包屑由闸门内部打：tp:gate / tp:gate:uptime（通过）/ tp:skip:early（uptime < 12 秒）。
-    if (!SMTpWaitAreaReady(pos, 2000)) {
-        g_tpLastOutcome.store(kSMTpPreFail, std::memory_order_relaxed);
-        LOGE("[TeleportFix] gate tujuan belum lolos; teleport dibatalkan (tidak memaksa).");
-        return false;
-    }
-
     SMPlatform::SetBreadcrumbLight("tp:method");
-    void *autoMoveMethod = FindMethodInHierarchy(helperClass, (const char *) OBFUSCATE("AutoMoveTransfer"), 1);
+    void *autoMoveMethod = FindMethodInHierarchy(helperClass,
+            (const char *) OBFUSCATE("AutoMoveTransfer"), 1);
     if (!autoMoveMethod) {
-        LOGE("[TeleportFix] AutoMoveTransferDirect GAGAL: AutoMoveTransfer method tidak ditemukan.");
+        SMPlatform::SetBreadcrumbLight("tp:no-method");
+        g_tpLastOutcome.store(kSMTpInvokeFail, std::memory_order_relaxed);
+        LOGE("[TeleportFix] AutoMoveTransferDirect GAGAL: AutoMoveTransfer(1) tidak ditemukan.");
         return false;
     }
 
-    // 先看签名：如果是实例方法(s0)就不能传 nullptr，直接跳过并记录。
-    SMPlatform::SetBreadcrumbLight("tp:sig:" + CompactMethodSig(autoMoveMethod));
-    {
-        const uint32_t mf = SMMonoHot::MethodGetFlags(autoMoveMethod, nullptr);
-        if (SMMonoHot::IsMonoMethod(autoMoveMethod) && (mf & 0x10u) == 0) {
-            SMPlatform::SetBreadcrumbLight("tp:skip:s0");
-            g_tpLastOutcome.store(kSMTpInvokeFail, std::memory_order_relaxed);
-            return false;
-        }
+    // 零 invoke 的签名自检：不是 mono 静态单参 Vector3 就放弃，绝不盲调。
+    SMPlatform::SetBreadcrumbLight("tp:sig");
+    std::string sig;
+    if (!SMTpCheckAutoMoveSignature(autoMoveMethod, &sig)) {
+        SMPlatform::SetBreadcrumbLight("tp:sig-bad:" + sig);
+        g_tpLastOutcome.store(kSMTpInvokeFail, std::memory_order_relaxed);
+        LOGE("[TeleportFix] AutoMoveTransferDirect GAGAL: signature tidak cocok (%s).", sig.c_str());
+        return false;
     }
+    SMPlatform::SetBreadcrumbLight("tp:sig:" + sig);
 
-    // Panggil sebagai static method (instance = nullptr)
     Vector3 targetPos = pos;
     void *args[] = { &targetPos };
     SMPlatform::SetBreadcrumbLight("tp:invoke");
@@ -9572,125 +9433,25 @@ bool AutoMoveTransferDirect(Vector3 pos) {
     _monoRuntimeInvoke(autoMoveMethod, nullptr, args, &exc);
     SMPlatform::SetBreadcrumbLight("tp:invoke-done");
 
-    const bool invokeOk = (exc == nullptr);
     if (exc) {
-        LOGE("[TeleportFix] Exception saat AutoMoveTransfer.");
-    } else {
-        LOGI("[TeleportFix] AutoMoveTransfer sukses dipanggil ke (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
-    }
-
-    // --- [传送后] 落地确认（invoke 返回后立刻做；Unity 线程上只单探，见文件头说明）---
-    bool landOk = false;
-    if (invokeOk) {
-        landOk = SMTpWaitLanded(pos, 2000);
-        if (landOk) {
-            SMPlatform::SetBreadcrumbLight("tp:land");
-        } else if (SMTpIsOnUnityThread()) {
-            // 同一帧内还读不到新坐标（位移由游戏 update 应用）→ 不是超时，
-            // 真正的 2 秒轮询在 AutoMoveTransferNative 的调用线程侧完成。
-            SMPlatform::SetBreadcrumbLight("tp:land-pending");
-        } else {
-            SMPlatform::SetBreadcrumbLight("tp:land-timeout");
-        }
-        if (!landOk) LOGE("[TeleportFix] landing belum terkonfirmasi (posisi belum masuk 2.0m).");
-    }
-
-    SMPlatform::SetBreadcrumbLight("tp:camera");
-    // SNAP KAMERA LENGKAP:
-    // 1. Panggil EntityHelper.SetCameraLookAt() (untuk lock orientasi Euler)
-    void *setCameraLookAtMethod = FindMethodInHierarchy(helperClass, (const char *) OBFUSCATE("SetCameraLookAt"), 0);
-    if (setCameraLookAtMethod) {
-        void *camExc = nullptr;
-        _monoRuntimeInvoke(setCameraLookAtMethod, nullptr, nullptr, &camExc);
-        if (camExc) {
-            LOGE("[TeleportFix] Exception saat SetCameraLookAt.");
-        } else {
-            LOGI("[TeleportFix] SetCameraLookAt sukses dipanggil.");
-        }
-    }
-
-    // 2. Akses XDTCameraManager.Instance.CurrentController (FollowCameraController)
-    void *camMgrClass = _monoClassFromName(img,
-        (const char *) OBFUSCATE("ScriptsRefactory.LevelAndEntity.BaseSystem.CameraManager"),
-        (const char *) OBFUSCATE("XDTCameraManager"));
-    if (!camMgrClass) {
-        camMgrClass = _monoClassFromName(img,
-            (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.CameraManager"),
-            (const char *) OBFUSCATE("XDTCameraManager"));
-    }
-
-    if (camMgrClass) {
-        void *getInstanceMethod = FindMethodInHierarchy(camMgrClass, (const char *) OBFUSCATE("get_Instance"), 0);
-        if (getInstanceMethod) {
-            void *excCam = nullptr;
-            void *camMgrInst = _monoRuntimeInvoke(getInstanceMethod, nullptr, nullptr, &excCam);
-            if (camMgrInst && !excCam) {
-                void *getCurrControllerMethod = FindMethodInHierarchy(camMgrClass, (const char *) OBFUSCATE("get_CurrentController"), 0);
-                if (!getCurrControllerMethod) {
-                    getCurrControllerMethod = FindMethodInHierarchy(camMgrClass, (const char *) OBFUSCATE("get_CurrentCameraController"), 0);
-                }
-                void *controller = nullptr;
-                if (getCurrControllerMethod) {
-                    void *ctrlExc = nullptr;
-                    controller = _monoRuntimeInvoke(getCurrControllerMethod, camMgrInst, nullptr, &ctrlExc);
-                }
-                if (!controller && _monoClassGetFieldFromName && _monoFieldGetValue) {
-                    void *f_curr = _monoClassGetFieldFromName(camMgrClass, (const char *) OBFUSCATE("_currentController"));
-                    if (f_curr) _monoFieldGetValue(camMgrInst, f_curr, &controller);
-                }
-
-                if (controller) {
-                    void *controllerClass = _monoObjectGetClass(controller);
-                    if (controllerClass) {
-                        // A. SetInitialAxisValue(0 params)
-                        void *mSetInitAxis = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("SetInitialAxisValue"), 0);
-                        if (mSetInitAxis) {
-                            _monoRuntimeInvoke(mSetInitAxis, controller, nullptr, nullptr);
-                        }
-
-                        // B. PopInit(0 params)
-                        void *mPopInit = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("PopInit"), 0);
-                        if (mPopInit) {
-                            _monoRuntimeInvoke(mPopInit, controller, nullptr, nullptr);
-                        }
-
-                        // C. ResetInterpolationValue(0 params)
-                        void *mResetInterp = FindMethodInHierarchy(controllerClass, (const char *) OBFUSCATE("ResetInterpolationValue"), 0);
-                        if (mResetInterp) {
-                            _monoRuntimeInvoke(mResetInterp, controller, nullptr, nullptr);
-                            LOGI("[TeleportFix] ResetInterpolationValue sukses dieksekusi (lerp dihentikan).");
-                        }
-
-                        // D. isFirstFrame = true (agar frame berikutnya langsung snap tanpa gliding)
-                        void *fieldFirstFrame = _monoClassGetFieldFromName ? _monoClassGetFieldFromName(controllerClass, (const char *) OBFUSCATE("isFirstFrame")) : nullptr;
-                        if (fieldFirstFrame && _monoFieldSetValue) {
-                            bool firstFrameVal = true;
-                            _monoFieldSetValue(controller, fieldFirstFrame, &firstFrameVal);
-                            LOGI("[TeleportFix] isFirstFrame diset true (kamera snap instan).");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 返回给上层：就绪 + 落地确认都通过才算成功。
-    if (!invokeOk) {
+        SMPlatform::SetBreadcrumbLight("tp:fail:exc");
         g_tpLastOutcome.store(kSMTpInvokeFail, std::memory_order_relaxed);
+        LOGE("[TeleportFix] Exception saat AutoMoveTransfer.");
         return false;
     }
-    if (!landOk) {
-        g_tpLastOutcome.store(kSMTpLandFail, std::memory_order_relaxed);
-        return false;
-    }
+
     g_tpLastOutcome.store(kSMTpOk, std::memory_order_relaxed);
+    SMPlatform::SetBreadcrumbLight("tp:ok");
+    LOGI("[TeleportFix] AutoMoveTransfer ok -> (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
     return true;
 }
 
+// --- 实体传送：先取目标实体坐标走 AutoMoveTransfer（与 PC 版一致），
+//     取不到坐标才退 EntityHelper.Transfer2Entity(netId)（游戏自己的封装）。 ---
 void Transfer2EntityDirect(uint32_t entityNetId) {
     SMPlatform::SetBreadcrumbLight("tp:entity");
     if (entityNetId == 0) return;
-    LOGI("[TeleportFix] Transfer2EntityDirect dipanggil untuk entityNetId: %u", entityNetId);
+    LOGI("[TeleportFix] Transfer2EntityDirect netId=%u", entityNetId);
 
     if (_monoGetRootDomain && _monoThreadAttach) {
         void *domain = _monoGetRootDomain();
@@ -9699,103 +9460,98 @@ void Transfer2EntityDirect(uint32_t entityNetId) {
 
     void *img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity"));
     if (!img) img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
-    if (!img) { LOGE("[TeleportFix] Transfer2EntityDirect: XDTLevelAndEntity belum diload."); return; }
+    if (!img) {
+        SMPlatform::SetBreadcrumbLight("tp:entity-no-img");
+        LOGE("[TeleportFix] Transfer2EntityDirect: XDTLevelAndEntity belum diload.");
+        return;
+    }
 
-    // 1. Coba ambil posisi target entity
-    void *entitiesKlass = _monoClassFromName(img, (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"), (const char *) OBFUSCATE("Entities"));
-    void *m_getAny = entitiesKlass ? FindMethodInHierarchy(entitiesKlass, (const char *) OBFUSCATE("GetAnyEntity"), 1) : nullptr;
-    void *targetEntity = nullptr;
-    if (m_getAny) {
+    // 1) 目标实体坐标（读不到就走游戏自带的 Transfer2Entity）
+    void *entitiesKlass = _monoClassFromName(img,
+            (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"),
+            (const char *) OBFUSCATE("Entities"));
+    void *m_getAny = entitiesKlass
+            ? FindMethodInHierarchy(entitiesKlass, (const char *) OBFUSCATE("GetAnyEntity"), 1)
+            : nullptr;
+    if (m_getAny && SMTpMethodIsStatic(m_getAny)) {
         uint32_t netId = entityNetId;
         void *args[] = { &netId };
         void *exc = nullptr;
-        targetEntity = _monoRuntimeInvoke(m_getAny, nullptr, args, &exc);
-        if (exc) LOGE("[TeleportFix] Exception saat GetAnyEntity.");
-    } else {
-        LOGE("[TeleportFix] GetAnyEntity method tidak ditemukan.");
-    }
-
-    if (targetEntity) {
-        void *entKlass = _monoObjectGetClass(targetEntity);
-        void *m_getPos = entKlass ? FindMethodInHierarchy(entKlass, (const char *) OBFUSCATE("get_position"), 0) : nullptr;
-        if (m_getPos) {
-            void *exc = nullptr;
-            void *boxedPos = _monoRuntimeInvoke(m_getPos, targetEntity, nullptr, &exc);
-            if (boxedPos && !exc) {
-                Vector3 targetPos = *(Vector3 *) _monoObjectUnbox(boxedPos);
-                LOGI("[TeleportFix] Berhasil mendapatkan posisi target: %.2f, %.2f, %.2f. Menggunakan AutoMoveTransferDirect.", targetPos.x, targetPos.y, targetPos.z);
-                const bool moved = AutoMoveTransferDirect(targetPos);
-                // [新增] 落地确认：目标实体的 get_position 与自身当前位置比对
-                // （每次按 netId 重新解析实体，绝不跨帧保存 mono 对象）。
-                if (SMTpWaitNearEntity(entityNetId, 2000)) {
-                    SMPlatform::SetBreadcrumbLight("tp:entity-land");
-                    return;
+        void *targetEntity = _monoRuntimeInvoke(m_getAny, nullptr, args, &exc);
+        if (targetEntity && !exc) {
+            void *entKlass = _monoObjectGetClass(targetEntity);
+            void *m_getPos = entKlass
+                    ? FindMethodInHierarchy(entKlass, (const char *) OBFUSCATE("get_position"), 0)
+                    : nullptr;
+            if (m_getPos) {
+                void *posExc = nullptr;
+                void *boxedPos = _monoRuntimeInvoke(m_getPos, targetEntity, nullptr, &posExc);
+                void *raw = (boxedPos && !posExc) ? _monoObjectUnbox(boxedPos) : nullptr;
+                if (raw) {
+                    Vector3 targetPos{0.0f, 0.0f, 0.0f};
+                    memcpy(&targetPos, raw, sizeof(float) * 3);
+                    if (std::isfinite(targetPos.x) && std::isfinite(targetPos.y) &&
+                        std::isfinite(targetPos.z)) {
+                        LOGI("[TeleportFix] entity pos=(%.2f, %.2f, %.2f)",
+                             targetPos.x, targetPos.y, targetPos.z);
+                        AutoMoveTransferDirect(targetPos);
+                        return;
+                    }
                 }
-                SMPlatform::SetBreadcrumbLight("tp:entity-timeout");
-                LOGE("[TeleportFix] entity landing timeout (netId=%u).", entityNetId);
-                if (moved) return;   // invoke 已经生效：不要再叠一次 fallback 传送
-            } else {
-                LOGE("[TeleportFix] Exception atau null saat get_position dari entity.");
             }
-        } else {
-            LOGE("[TeleportFix] Method get_position tidak ditemukan di targetEntity.");
         }
-    } else {
-        LOGI("[TeleportFix] targetEntity tidak ditemukan untuk netId: %u", entityNetId);
+    } else if (m_getAny) {
+        SMPlatform::SetBreadcrumbLight("tp:entity-any-skip");
     }
 
-    // Fallback ke method lama jika targetEntity belum ter-resolve
-    LOGI("[TeleportFix] FALLBACK: Menggunakan EntityHelper.Transfer2Entity(%u) karena posisi tidak didapat.", entityNetId);
-    EnsureTeleportAntiCrashPatched();
-    void *klass = _monoClassFromName(img, (const char *) OBFUSCATE("XDTLevelAndEntity.Utils"), (const char *) OBFUSCATE("EntityHelper"));
-    if (!klass) return;
-    void *m_transfer = FindMethodInHierarchy(klass, (const char *) OBFUSCATE("Transfer2Entity"), 1);
-    if (!m_transfer) { LOGE("[TeleportFix] EntityHelper.Transfer2Entity method tidak ditemukan."); return; }
+    // 2) 兜底：EntityHelper.Transfer2Entity(netId)（游戏实现 = GetAnyEntity + TransferAndLookAt）
+    SMPlatform::SetBreadcrumbLight("tp:entity-fallback");
+    void *helperClass = _monoClassFromName(img,
+            (const char *) OBFUSCATE("XDTLevelAndEntity.Utils"),
+            (const char *) OBFUSCATE("EntityHelper"));
+    if (!helperClass) {
+        SMPlatform::SetBreadcrumbLight("tp:entity-no-helper");
+        return;
+    }
+    void *m_transfer = FindMethodInHierarchy(helperClass,
+            (const char *) OBFUSCATE("Transfer2Entity"), 1);
+    if (!m_transfer) {
+        SMPlatform::SetBreadcrumbLight("tp:entity-no-method");
+        LOGE("[TeleportFix] EntityHelper.Transfer2Entity(1) tidak ditemukan.");
+        return;
+    }
+    std::string sig;
+    if (!SMTpCheckEntityTransferSignature(m_transfer, &sig)) {
+        SMPlatform::SetBreadcrumbLight("tp:entity-sig-bad:" + sig);
+        LOGE("[TeleportFix] Transfer2Entity signature tidak cocok (%s).", sig.c_str());
+        return;
+    }
     uint32_t netId = entityNetId;
     void *args[] = { &netId };
     void *exc = nullptr;
+    SMPlatform::SetBreadcrumbLight("tp:entity-invoke");
     _monoRuntimeInvoke(m_transfer, nullptr, args, &exc);
-    if (exc) { LOGE("[TeleportFix] Exception saat invoke EntityHelper.Transfer2Entity."); return; }
-
-    // [新增] fallback 传送后同样做落地/位置确认
-    if (SMTpWaitNearEntity(entityNetId, 2000)) {
-        SMPlatform::SetBreadcrumbLight("tp:entity-land");
-    } else {
-        SMPlatform::SetBreadcrumbLight("tp:entity-timeout");
-        LOGE("[TeleportFix] entity landing timeout setelah fallback (netId=%u).", entityNetId);
+    if (exc) {
+        SMPlatform::SetBreadcrumbLight("tp:entity-exc");
+        LOGE("[TeleportFix] Exception saat invoke EntityHelper.Transfer2Entity.");
+        return;
     }
+    SMPlatform::SetBreadcrumbLight("tp:entity-ok");
+    LOGI("[TeleportFix] EntityHelper.Transfer2Entity ok (netId=%u).", entityNetId);
 }
 
+// --- 对外入口：负责闸门 + 封送到 Unity 线程。所有传送 UI/循环都必须走这两个。 ---
 bool AutoMoveTransferNative(Vector3 pos) {
-    // 传送前纯 C++ 安全闸门（立即判定：不 sleep、不排队、不碰 mono）。
     if (!SMTpWaitAreaReady(pos, 2000)) {
         g_tpLastOutcome.store(kSMTpPreFail, std::memory_order_relaxed);
         return false;
     }
-
-    bool directOk = false;
-    RunOnUnityThreadSync([pos, &directOk]() {
-        directOk = AutoMoveTransferDirect(pos);
-    });
-
-    const int outcome = g_tpLastOutcome.load(std::memory_order_relaxed);
-    if (outcome == kSMTpPreFail || outcome == kSMTpInvokeFail) return false;
-    if (directOk) {
-        // Direct 内部已经确认落地（同一帧就能读到新坐标的情形）。
-        SMPlatform::SetBreadcrumbLight("tp:land");
-        g_tpLastOutcome.store(kSMTpOk, std::memory_order_relaxed);
-        return true;
-    }
-
-    // [新增] 落地确认：Unity 线程里只能单探，真正的 2 秒轮询放在调用线程这边。
-    if (!SMTpWaitLanded(pos, 2000)) {
-        SMPlatform::SetBreadcrumbLight("tp:land-timeout");
-        g_tpLastOutcome.store(kSMTpLandFail, std::memory_order_relaxed);
-        return false;
-    }
-    SMPlatform::SetBreadcrumbLight("tp:land");
-    g_tpLastOutcome.store(kSMTpOk, std::memory_order_relaxed);
-    return true;
+    SMPlatform::SetBreadcrumbLight("tp:marshal");
+    bool ok = false;
+    RunOnUnityThreadSync([pos, &ok]() { ok = AutoMoveTransferDirect(pos); });
+    if (!ok && g_tpLastOutcome.load(std::memory_order_relaxed) == kSMTpNone)
+        g_tpLastOutcome.store(kSMTpPreFail, std::memory_order_relaxed);
+    return ok;
 }
 
 void ManualTeleportNative(Vector3 pos) {
@@ -9804,9 +9560,9 @@ void ManualTeleportNative(Vector3 pos) {
 
 void Transfer2EntityNative(uint32_t entityNetId) {
     if (entityNetId == 0) return;
-    RunOnUnityThreadSync([entityNetId]() {
-        Transfer2EntityDirect(entityNetId);
-    });
+    if (!SMTpWaitAreaReady(Vector3{0.0f, 0.0f, 0.0f}, 2000)) return;
+    SMPlatform::SetBreadcrumbLight("tp:entity-marshal");
+    RunOnUnityThreadSync([entityNetId]() { Transfer2EntityDirect(entityNetId); });
 }
 
 Vector3 GetSelfPositionNative() {

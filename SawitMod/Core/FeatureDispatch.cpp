@@ -91,6 +91,13 @@ bool PatchMethodReturnInt(const char *asmName, const char *ns, const char *clsNa
 // agar sama dengan versi PC, tetapi instruksi yang benar adalah RET.
 bool PatchMethodReturnNop(const char *asmName, const char *ns, const char *clsName,
                           const char *methodName, int paramCount) {
+#if defined(__APPLE__)
+    // 侧载 iOS：__TEXT 受代码签名保护、mono 方法体是解释器入口。往方法体首字节写
+    // RET 只会把游戏方法写坏（实测「传送采集」崩在 tp:auto 的补丁阶段）。所有
+    // 依赖方法体补丁的功能在 iOS 上一律按「补丁未生效」降级。
+    (void)asmName; (void)ns; (void)clsName; (void)methodName; (void)paramCount;
+    return false;
+#endif
     if (!_monoImageLoaded || !_monoClassFromName ||
         !_monoClassGetMethodFromName || !_monoCompileMethod) {
         LOGE("[PatchReturnNop] Mono API belum siap");
@@ -194,6 +201,11 @@ void AutoPatchReturnNopNative() {
 
 bool PatchMethodReturnTrue(const char *asmName, const char *ns, const char *clsName,
                            const char *methodName, int paramCount) {
+#if defined(__APPLE__)
+    // 同 PatchMethodReturnNop：侧载 iOS 上不写方法体（__TEXT 签名保护）。
+    (void)asmName; (void)ns; (void)clsName; (void)methodName; (void)paramCount;
+    return false;
+#endif
     try {
         void *img = _monoImageLoaded(asmName);
         std::string assemblyWithDll;
@@ -353,9 +365,8 @@ extern "C" VIRBOX_TARGET_ATTR void *Virbox_ExecuteDynamic(
         methodName = methodName.substr(0, parenPos);
     }
 
-    if (methodName == (const char *) OBFUSCATE("AutoMoveTransfer") || methodName == (const char *) OBFUSCATE("Transfer2Entity")) {
-        EnsureTeleportAntiCrashPatched();
-    }
+    // 传送不在这里做任何 inline patch：侧载 iOS 的 __TEXT 受签名保护，写 RET 只会
+    // 把游戏方法写坏（EnsureTeleportAntiCrashPatched 在 Apple 上已是 no-op）。
 
     if (className == (const char *) OBFUSCATE("EntityHelper") && methodName == (const char *) OBFUSCATE("AutoMoveTransfer")) {
         Vector3 targetPos = { 0.0f, 0.0f, 0.0f };
@@ -373,7 +384,11 @@ extern "C" VIRBOX_TARGET_ATTR void *Virbox_ExecuteDynamic(
         try { if (nums.size() > 1) targetPos.y = std::stof(nums[1]); } catch (...) {}
         try { if (nums.size() > 2) targetPos.z = std::stof(nums[2]); } catch (...) {}
 
-        AutoMoveTransferDirect(targetPos);
+        // 传送必须封送到 Unity 线程再碰 mono / 游戏对象：这条路径通常跑在菜单的
+        // worker 线程（FetchAndExecute 用 std::thread detach 派发），在非 Unity 线程
+        // 里直接 invoke AutoMoveTransfer = 随机 SIGSEGV。AutoMoveTransferNative 内部
+        // 用 RunOnUnityThreadSync 封送；若当前已在 Unity 线程则自检后就地执行。
+        AutoMoveTransferNative(targetPos);
         return nullptr;
     }
 
@@ -381,7 +396,10 @@ extern "C" VIRBOX_TARGET_ATTR void *Virbox_ExecuteDynamic(
         uint32_t netId = 0;
         try { if (!paramInput.empty()) netId = (uint32_t)std::stoul(paramInput); } catch (...) {}
         if (netId != 0) {
-            Transfer2EntityDirect(netId);
+            // 同上：只在最外层封送一次（Transfer2EntityNative -> RunOnUnityThreadSync
+            // -> Transfer2EntityDirect；内层再调 AutoMoveTransferDirect 时已经在
+            // Unity 线程上下文里，不再套第二层，避免白等一个 pump 周期）。
+            Transfer2EntityNative(netId);
             return nullptr;
         }
     }
