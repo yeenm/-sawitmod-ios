@@ -9592,7 +9592,15 @@ bool AutoMoveTransferDirect(Vector3 pos) {
     bool landOk = false;
     if (invokeOk) {
         landOk = SMTpWaitLanded(pos, 2000);
-        SMPlatform::SetBreadcrumbLight(landOk ? "tp:land" : "tp:land-timeout");
+        if (landOk) {
+            SMPlatform::SetBreadcrumbLight("tp:land");
+        } else if (SMTpIsOnUnityThread()) {
+            // 同一帧内还读不到新坐标（位移由游戏 update 应用）→ 不是超时，
+            // 真正的 2 秒轮询在 AutoMoveTransferNative 的调用线程侧完成。
+            SMPlatform::SetBreadcrumbLight("tp:land-pending");
+        } else {
+            SMPlatform::SetBreadcrumbLight("tp:land-timeout");
+        }
         if (!landOk) LOGE("[TeleportFix] landing belum terkonfirmasi (posisi belum masuk 2.0m).");
     }
 
