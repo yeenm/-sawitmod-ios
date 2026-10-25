@@ -49,6 +49,19 @@ static void *AndroidMonoArrayNew(void *domain, void *byteKlass, size_t count);
 static int CountBackpackItemTotalByStaticId(int targetStaticId);
 static void *GetLocalPlayerInstance();
 
+// ---------------------------------------------------------------------------
+//  传送阶段结果（供上层区分"区域没就绪被放弃" / "invoke 失败" / "落地确认超时"）。
+//  只存阶段码，不存任何 mono 对象指针 —— 对象用完即弃，绝不跨帧保存。
+// ---------------------------------------------------------------------------
+enum SMTeleportOutcome : int {
+    kSMTpNone = 0,        // 还没走完一次传送流程
+    kSMTpPreFail = 1,     // 传送前区域就绪检查超时/未就绪 → 主动放弃
+    kSMTpInvokeFail = 2,  // AutoMoveTransfer invoke 抛异常
+    kSMTpLandFail = 3,    // 传送后落地确认超时（坐标没到目标 2.0m 内）
+    kSMTpOk = 4,          // 就绪 + 落地确认都通过
+};
+static std::atomic<int> g_tpLastOutcome{kSMTpNone};
+
 struct ESPCachedMethods {
     bool isInitialized = false;
     void *m_GetPlayer = nullptr;
@@ -5724,9 +5737,63 @@ static uint64_t InstantFarmNowMs() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// --- 采集循环的传送节流 / 熔断（只由采集 worker 线程访问）---
+// iOS 版传送崩在"生效后游戏处理位置变更"，所以采集这种每几秒传一次的循环必须
+//   ① 传送成功后 1500ms 内不再传（给流式加载/AOI 留时间）；
+//   ② 连续 2 次落地确认失败就停掉本轮传送（把 waypoint 视为已到达），避免反复崩。
+static std::atomic<uint64_t> g_farmTpCooldownUntilMs{0};
+static int g_farmTpLandFailCount = 0;
+static bool g_farmTpDisabled = false;
+
 static bool InstantFarmMoveToSearchPoint(const std::string& dllName, const Vector3& point) {
     (void)dllName;
-    return AutoMoveTransferNative(point);
+    SMPlatform::SetBreadcrumbLight("farm:move-pre");
+
+    // 熔断：本轮采集已经连续两次落地失败 → 不再传送，waypoint 当作"已到达"
+    // （上层会直接去扫当前区域，不会再触发崩溃链路）。
+    if (g_farmTpDisabled) {
+        SMPlatform::SetBreadcrumbLight("farm:tp-disabled");
+        return true;
+    }
+
+    // 冷却：传送成功后 1500ms 内不再传送。分片等待，STOP 仍然立即生效。
+    uint64_t now = InstantFarmNowMs();
+    const uint64_t cooldownUntil = g_farmTpCooldownUntilMs.load(std::memory_order_relaxed);
+    if (cooldownUntil > now) {
+        SMPlatform::SetBreadcrumbLight("farm:tp-cooldown");
+        while (now < cooldownUntil && g_instantFarmingActive) {
+            const uint64_t slice = (cooldownUntil - now < 50) ? (cooldownUntil - now) : 50;
+            usleep((useconds_t) slice * 1000u);
+            now = InstantFarmNowMs();
+        }
+        if (!g_instantFarmingActive) return false;
+    }
+
+    const bool moved = AutoMoveTransferNative(point);
+    const int outcome = g_tpLastOutcome.load(std::memory_order_relaxed);
+    if (moved && outcome == kSMTpOk) {
+        // 传送成功落地：记冷却时间戳，清零连续失败计数。
+        g_farmTpCooldownUntilMs.store(InstantFarmNowMs() + 1500, std::memory_order_relaxed);
+        g_farmTpLandFailCount = 0;
+        SMPlatform::SetBreadcrumbLight("farm:move-land");
+        return true;
+    }
+
+    // invoke 真的发生过（不是"区域没就绪被放弃"）也算一次落地失败：先冷却再计数。
+    if (outcome == kSMTpLandFail) {
+        g_farmTpCooldownUntilMs.store(InstantFarmNowMs() + 1500, std::memory_order_relaxed);
+        ++g_farmTpLandFailCount;
+        SMPlatform::SetBreadcrumbLight("farm:tp-land-fail");
+        LOGE("[InstantFarm] teleport land-confirm gagal (%d kali berturut-turut).",
+             g_farmTpLandFailCount);
+        if (g_farmTpLandFailCount >= 2) {
+            g_farmTpDisabled = true;
+            SMPlatform::SetBreadcrumbLight("farm:tp-disabled");
+            LOGI("[InstantFarm] teleport dimatikan untuk putaran ini (waypoint dianggap tercapai).");
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool InstantFarmUsesAreaScanner(int resourceIndex) {
@@ -5772,6 +5839,11 @@ void ExecuteInstantFarmThread(
             dllName = dllName.substr(0, dllName.length() - 4);
         }
         PatchGatherConfigNative();
+
+        // 新一轮采集：重置传送冷却/熔断状态（上一轮的失败不该永久禁用传送）。
+        g_farmTpCooldownUntilMs.store(0, std::memory_order_relaxed);
+        g_farmTpLandFailCount = 0;
+        g_farmTpDisabled = false;
 
         std::string selectedNames;
         for (int i = 0; i < NUM_RESOURCES; ++i) {
@@ -9135,8 +9207,313 @@ void EnsureTeleportAntiCrashPatched() {
 }
 
 
-void AutoMoveTransferDirect(Vector3 pos) {
+// ===========================================================================
+//  传送前后"等就绪"（Android/PC 版一直有这段流程，iOS 版此前完全缺失）
+// ---------------------------------------------------------------------------
+//  崩溃点不在 invoke，而在传送生效后游戏处理位置变更（流式加载 / AOI / 碰撞）。
+//  所以这里补三段：① 传送前区域就绪 → ② invoke → ③ 落地确认（坐标真的变了）。
+//
+//  ⚠️ 线程纪律：
+//    * 所有 mono 调用一律走 RunOnUnityThreadSync（类/方法/实例用完即弃，不跨帧保存）。
+//    * 200ms×N 的 sleep 轮询只在"调用线程不是 Unity 线程"时做。在 Unity 线程上
+//      sleep 会让游戏停帧，流式加载永远推进不了 → 2 秒必然超时。菜单传送本来就走
+//      Unity 线程（FramePump 里扣 invokeQueue），那一路只单探一次：没就绪就放弃
+//      本次传送（绝不硬传送），真正的等待放在 AutoMoveTransferNative 的调用线程侧。
+// ===========================================================================
+static bool SMTpIsOnUnityThread() {
+    const std::thread::id unityThread = g_unityThreadId.load(std::memory_order_relaxed);
+    return unityThread != std::thread::id() && std::this_thread::get_id() == unityThread;
+}
+
+static uint64_t SMTpNowMs() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// EntityUtil.GetSelfPlayer()（静态 0 参）。nullptr = 世界/实体还没就绪。
+static void *SMTpSelfEntity() {
+    void *img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity"));
+    if (!img) img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
+    if (!img) return nullptr;
+    void *utilKlass = _monoClassFromName(img,
+                                         (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"),
+                                         (const char *) OBFUSCATE("EntityUtil"));
+    if (!utilKlass) return nullptr;
+    void *m_getSelf = FindMethodInHierarchy(utilKlass, (const char *) OBFUSCATE("GetSelfPlayer"), 0);
+    if (!m_getSelf) return nullptr;
+    void *exc = nullptr;
+    void *self = _monoRuntimeInvoke(m_getSelf, nullptr, nullptr, &exc);
+    return exc ? nullptr : self;
+}
+
+// 读自身坐标：GetSelfPlayer() → get_position()（Vector3 boxed，unbox 后 memcpy 12 字节）。
+static bool SMTpReadSelfPosition(Vector3 &out) {
+    void *self = SMTpSelfEntity();
+    if (!self) return false;
+    void *klass = _monoObjectGetClass(self);
+    void *m_getPos = klass ? FindMethodInHierarchy(klass, (const char *) OBFUSCATE("get_position"), 0)
+                           : nullptr;
+    if (m_getPos) {
+        void *exc = nullptr;
+        void *boxedPos = _monoRuntimeInvoke(m_getPos, self, nullptr, &exc);
+        void *raw = (boxedPos && !exc && _monoObjectUnbox) ? _monoObjectUnbox(boxedPos) : nullptr;
+        if (raw) {
+            Vector3 v{0.0f, 0.0f, 0.0f};
+            memcpy(&v, raw, sizeof(float) * 3);
+            if (std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z)) {
+                out = v;
+                return true;
+            }
+        }
+    }
+    // 退化：外面还包了一层(带 _entity)时用现成的 NativeGetPosition。
+    const Vector3 fallback = NativeGetPosition(self);
+    if (std::isfinite(fallback.x) && std::isfinite(fallback.y) && std::isfinite(fallback.z) &&
+        (fallback.x != 0.0f || fallback.y != 0.0f || fallback.z != 0.0f)) {
+        out = fallback;
+        return true;
+    }
+    return false;
+}
+
+// 传送前置：目标点所在区块/实体是否已经加载（必须在 Unity 线程调用）。
+//   ① 自身实体拿不到 → 明确未就绪（退化路径，也是最后一道门槛）；
+//   ② LevelObjectManager._instance._dictionary 里有 level object → 区块已加载；
+//      逐对象算距离每探一次要几百次 invoke，开销过高，这里用"表里有对象"做代理；
+//   ③ 类/字段拿不到（UI 还没建、不同场景）→ 视为就绪，只靠 ① 兜底，不误伤传送。
+static bool SMTpAreaReadyFor(const char **reasonOut) {
+    if (reasonOut) *reasonOut = "?";
+    if (!SMTpSelfEntity()) {
+        if (reasonOut) *reasonOut = "self";
+        return false;
+    }
+
+    void *imgLevel = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity"));
+    if (!imgLevel) imgLevel = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
+    void *imgData = _monoImageLoaded((const char *) OBFUSCATE("XDTDataAndProtocol"));
+    void *lomKlass = nullptr;
+    static const char *kLomNamespaces[] = {"ScriptsRefactory.LevelAndEntity",
+                                           "XDTLevelAndEntity",
+                                           "XDTLevelAndEntity.Core.Level"};
+    for (const char *ns : kLomNamespaces) {
+        if (!lomKlass && imgLevel)
+            lomKlass = _monoClassFromName(imgLevel, ns,
+                                          (const char *) OBFUSCATE("LevelObjectManager"));
+        if (!lomKlass && imgData)
+            lomKlass = _monoClassFromName(imgData, ns,
+                                          (const char *) OBFUSCATE("LevelObjectManager"));
+        if (lomKlass) break;
+    }
+    if (!lomKlass) {
+        if (reasonOut) *reasonOut = "no-lom";
+        return true;
+    }
+
+    void *lomInst = nullptr;
+    void *m_getInstance = FindMethodInHierarchy(lomKlass, (const char *) OBFUSCATE("get_Instance"), 0);
+    if (m_getInstance) {
+        void *exc = nullptr;
+        lomInst = _monoRuntimeInvoke(m_getInstance, nullptr, nullptr, &exc);
+        if (exc) lomInst = nullptr;
+    }
+    if (!lomInst) {
+        void *f_instance = FindFieldInHierarchy(lomKlass, (const char *) OBFUSCATE("_instance"));
+        if (f_instance && _monoClassGetVTable && _monoFieldStaticGetValue) {
+            void *vtable = _monoClassGetVTable(_monoGetRootDomain(), lomKlass);
+            if (vtable) _monoFieldStaticGetValue(vtable, f_instance, &lomInst);
+        }
+    }
+    if (!lomInst) {
+        // 类在但实例没建：给不出证据，交给 ① 兜底，不阻断传送。
+        if (reasonOut) *reasonOut = "no-inst";
+        return true;
+    }
+
+    void *lomInstKlass = _monoObjectGetClass(lomInst);
+    void *f_dictionary = lomInstKlass
+                         ? FindFieldInHierarchy(lomInstKlass, (const char *) OBFUSCATE("_dictionary"))
+                         : nullptr;
+    if (!f_dictionary) {
+        if (reasonOut) *reasonOut = "no-dict-field";
+        return true;
+    }
+    void *dictObj = nullptr;
+    _monoFieldGetValue(lomInst, f_dictionary, &dictObj);
+    if (!dictObj) {
+        if (reasonOut) *reasonOut = "dict-null";
+        return false;
+    }
+
+    int count = -1;
+    void *dictKlass = _monoObjectGetClass(dictObj);
+    void *m_count = dictKlass ? FindMethodInHierarchy(dictKlass, (const char *) OBFUSCATE("get_Count"), 0)
+                              : nullptr;
+    if (m_count) {
+        void *exc = nullptr;
+        void *boxedCount = _monoRuntimeInvoke(m_count, dictObj, nullptr, &exc);
+        if (boxedCount && !exc && _monoObjectUnbox)
+            count = *(int *) _monoObjectUnbox(boxedCount);
+    }
+    if (count < 0) {
+        // 退化：直接数 entries 数组（不依赖 get_Count）。
+        void *f_entries = dictKlass ? FindFieldInHierarchy(dictKlass, (const char *) OBFUSCATE("entries"))
+                                    : nullptr;
+        if (!f_entries && dictKlass)
+            f_entries = FindFieldInHierarchy(dictKlass, (const char *) OBFUSCATE("_entries"));
+        void *entriesArr = nullptr;
+        if (f_entries) _monoFieldGetValue(dictObj, f_entries, &entriesArr);
+        if (entriesArr) {
+            const int length = SMMonoHot::ArrayLength(entriesArr);
+            uint8_t *data = (uint8_t *) SMMonoHot::ArrayAddrWithSize(entriesArr, SZ_DICT_ENTRY, 0);
+            if (data && length > 0 && length <= 200000) {
+                count = 0;
+                for (int i = 0; i < length && count < 64; ++i) {
+                    if (*(int *) (data + (i * SZ_DICT_ENTRY)) >= 0 &&
+                        *(void **) (data + (i * SZ_DICT_ENTRY) + 16) != nullptr) {
+                        ++count;
+                    }
+                }
+            }
+        }
+    }
+    if (count <= 0) {
+        if (reasonOut) *reasonOut = "no-object";
+        return false;
+    }
+    if (reasonOut) *reasonOut = "ok";
+    return true;
+}
+
+// 轮询区域就绪：200ms 一次、最多 timeoutMs。Unity 线程上只探一次（见文件头说明）。
+static bool SMTpWaitAreaReady(Vector3 pos, int timeoutMs) {
+    const bool onUnityThread = SMTpIsOnUnityThread();
+    const uint64_t deadline = SMTpNowMs() + (uint64_t) timeoutMs;
+    int probes = 0;
+    for (;;) {
+        bool ready = false;
+        const char *reason = "?";
+        RunOnUnityThreadSync([&]() { ready = SMTpAreaReadyFor(&reason); });
+        ++probes;
+        if (ready) {
+            if (probes > 1) LOGI("[TeleportFix] area siap setelah %d probe.", probes);
+            return true;
+        }
+        if (onUnityThread) {
+            LOGE("[TeleportFix] area belum siap (%s) di Unity thread; teleport (%.2f, %.2f, %.2f) dibatalkan.",
+                 reason, pos.x, pos.y, pos.z);
+            return false;
+        }
+        if (SMTpNowMs() >= deadline) {
+            LOGE("[TeleportFix] area belum siap (%s) setelah %d ms; teleport (%.2f, %.2f, %.2f) dibatalkan.",
+                 reason, timeoutMs, pos.x, pos.y, pos.z);
+            return false;
+        }
+        SMPlatform::SetBreadcrumbLight("tp:pre-wait");
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+}
+
+// 落地确认：自身坐标进入目标 2.0m 内算落地。同样只在非 Unity 线程上轮询。
+static bool SMTpWaitLanded(Vector3 pos, int timeoutMs, float *outDistance = nullptr) {
+    const bool onUnityThread = SMTpIsOnUnityThread();
+    const uint64_t deadline = SMTpNowMs() + (uint64_t) timeoutMs;
+    float distance = 0.0f;
+    for (;;) {
+        bool landed = false;
+        RunOnUnityThreadSync([&]() {
+            Vector3 selfPos{0.0f, 0.0f, 0.0f};
+            if (!SMTpReadSelfPosition(selfPos)) return;
+            distance = GetVector3Distance(selfPos, pos);
+            landed = distance < 2.0f;
+        });
+        if (landed) {
+            if (outDistance) *outDistance = distance;
+            LOGI("[TeleportFix] landing terkonfirmasi, jarak ke target %.2f m.", distance);
+            return true;
+        }
+        if (onUnityThread) {
+            // 同一帧内读不到新坐标是正常的（位移由游戏 update 应用），交给调用线程轮询。
+            if (outDistance) *outDistance = distance;
+            return false;
+        }
+        if (SMTpNowMs() >= deadline) {
+            if (outDistance) *outDistance = distance;
+            LOGE("[TeleportFix] landing timeout %d ms, jarak ke target %.2f m.", timeoutMs, distance);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+}
+
+// 实体传送的落地确认：每次重新按 netId 解析目标实体（绝不跨帧保存 mono 对象），
+// 用目标实体 get_position 与自身坐标比对。
+static bool SMTpWaitNearEntity(uint32_t entityNetId, int timeoutMs) {
+    if (entityNetId == 0) return false;
+    const bool onUnityThread = SMTpIsOnUnityThread();
+    const uint64_t deadline = SMTpNowMs() + (uint64_t) timeoutMs;
+    float distance = 0.0f;
+    for (;;) {
+        bool near = false;
+        RunOnUnityThreadSync([&]() {
+            void *img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity"));
+            if (!img) img = _monoImageLoaded((const char *) OBFUSCATE("XDTLevelAndEntity.dll"));
+            if (!img) return;
+            void *entitiesKlass = _monoClassFromName(img,
+                                                    (const char *) OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"),
+                                                    (const char *) OBFUSCATE("Entities"));
+            void *m_getAny = entitiesKlass
+                             ? FindMethodInHierarchy(entitiesKlass, (const char *) OBFUSCATE("GetAnyEntity"), 1)
+                             : nullptr;
+            if (!m_getAny) return;
+            uint32_t argNetId = entityNetId;
+            void *args[] = {&argNetId};
+            void *exc = nullptr;
+            void *target = _monoRuntimeInvoke(m_getAny, nullptr, args, &exc);
+            if (!target || exc) return;
+
+            Vector3 targetPos{0.0f, 0.0f, 0.0f};
+            bool haveTargetPos = false;
+            void *targetKlass = _monoObjectGetClass(target);
+            void *m_getPos = targetKlass
+                             ? FindMethodInHierarchy(targetKlass, (const char *) OBFUSCATE("get_position"), 0)
+                             : nullptr;
+            if (m_getPos) {
+                void *posExc = nullptr;
+                void *boxedPos = _monoRuntimeInvoke(m_getPos, target, nullptr, &posExc);
+                void *raw = (boxedPos && !posExc && _monoObjectUnbox) ? _monoObjectUnbox(boxedPos) : nullptr;
+                if (raw) {
+                    memcpy(&targetPos, raw, sizeof(float) * 3);
+                    haveTargetPos = std::isfinite(targetPos.x) && std::isfinite(targetPos.y) &&
+                                    std::isfinite(targetPos.z);
+                }
+            }
+            if (!haveTargetPos) {
+                targetPos = NativeGetPosition(target);
+                haveTargetPos = (targetPos.x != 0.0f || targetPos.y != 0.0f || targetPos.z != 0.0f);
+            }
+            if (!haveTargetPos) return;
+
+            Vector3 selfPos{0.0f, 0.0f, 0.0f};
+            if (!SMTpReadSelfPosition(selfPos)) return;
+            distance = GetVector3Distance(selfPos, targetPos);
+            near = distance < 2.0f;
+        });
+        if (near) {
+            LOGI("[TeleportFix] entity landing terkonfirmasi, jarak %.2f m.", distance);
+            return true;
+        }
+        if (onUnityThread) return false;
+        if (SMTpNowMs() >= deadline) {
+            LOGE("[TeleportFix] entity landing timeout %d ms, jarak %.2f m.", timeoutMs, distance);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+}
+
+bool AutoMoveTransferDirect(Vector3 pos) {
     SMPlatform::SetBreadcrumbLight("tp:auto");
+    g_tpLastOutcome.store(kSMTpNone, std::memory_order_relaxed);
     LOGI("[TeleportFix] AutoMoveTransferDirect dipanggil untuk posisi: %.2f, %.2f, %.2f", pos.x, pos.y, pos.z);
 
     SMPlatform::SetBreadcrumbLight("tp:att");
@@ -9157,21 +9534,32 @@ void AutoMoveTransferDirect(Vector3 pos) {
     }
     if (!img) {
         LOGE("[TeleportFix] AutoMoveTransferDirect GAGAL: image XDTLevelAndEntity tidak ditemukan.");
-        return;
+        return false;
     }
 
     SMPlatform::SetBreadcrumbLight("tp:helper");
     void *helperClass = _monoClassFromName(img, (const char *) OBFUSCATE("XDTLevelAndEntity.Utils"), (const char *) OBFUSCATE("EntityHelper"));
     if (!helperClass) {
         LOGE("[TeleportFix] AutoMoveTransferDirect GAGAL: EntityHelper class tidak ditemukan.");
-        return;
+        return false;
     }
+
+    // --- [传送前] 区域就绪检查（目标区块/实体没加载时绝不放行）---
+    // 硬传送 = 崩在随后的流式加载/AOI/碰撞处理里，所以这里宁可放弃本次传送。
+    SMPlatform::SetBreadcrumbLight("tp:pre");
+    if (!SMTpWaitAreaReady(pos, 2000)) {
+        SMPlatform::SetBreadcrumbLight("tp:pre-timeout");
+        g_tpLastOutcome.store(kSMTpPreFail, std::memory_order_relaxed);
+        LOGE("[TeleportFix] area tujuan belum siap; teleport dibatalkan (tidak memaksa).");
+        return false;
+    }
+    SMPlatform::SetBreadcrumbLight("tp:pre-ok");
 
     SMPlatform::SetBreadcrumbLight("tp:method");
     void *autoMoveMethod = FindMethodInHierarchy(helperClass, (const char *) OBFUSCATE("AutoMoveTransfer"), 1);
     if (!autoMoveMethod) {
         LOGE("[TeleportFix] AutoMoveTransferDirect GAGAL: AutoMoveTransfer method tidak ditemukan.");
-        return;
+        return false;
     }
 
     // 先看签名：如果是实例方法(s0)就不能传 nullptr，直接跳过并记录。
@@ -9180,7 +9568,8 @@ void AutoMoveTransferDirect(Vector3 pos) {
         const uint32_t mf = SMMonoHot::MethodGetFlags(autoMoveMethod, nullptr);
         if (SMMonoHot::IsMonoMethod(autoMoveMethod) && (mf & 0x10u) == 0) {
             SMPlatform::SetBreadcrumbLight("tp:skip:s0");
-            return;
+            g_tpLastOutcome.store(kSMTpInvokeFail, std::memory_order_relaxed);
+            return false;
         }
     }
 
@@ -9192,10 +9581,19 @@ void AutoMoveTransferDirect(Vector3 pos) {
     _monoRuntimeInvoke(autoMoveMethod, nullptr, args, &exc);
     SMPlatform::SetBreadcrumbLight("tp:invoke-done");
 
+    const bool invokeOk = (exc == nullptr);
     if (exc) {
         LOGE("[TeleportFix] Exception saat AutoMoveTransfer.");
     } else {
         LOGI("[TeleportFix] AutoMoveTransfer sukses dipanggil ke (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
+    }
+
+    // --- [传送后] 落地确认（invoke 返回后立刻做；Unity 线程上只单探，见文件头说明）---
+    bool landOk = false;
+    if (invokeOk) {
+        landOk = SMTpWaitLanded(pos, 2000);
+        SMPlatform::SetBreadcrumbLight(landOk ? "tp:land" : "tp:land-timeout");
+        if (!landOk) LOGE("[TeleportFix] landing belum terkonfirmasi (posisi belum masuk 2.0m).");
     }
 
     SMPlatform::SetBreadcrumbLight("tp:camera");
@@ -9276,6 +9674,18 @@ void AutoMoveTransferDirect(Vector3 pos) {
             }
         }
     }
+
+    // 返回给上层：就绪 + 落地确认都通过才算成功。
+    if (!invokeOk) {
+        g_tpLastOutcome.store(kSMTpInvokeFail, std::memory_order_relaxed);
+        return false;
+    }
+    if (!landOk) {
+        g_tpLastOutcome.store(kSMTpLandFail, std::memory_order_relaxed);
+        return false;
+    }
+    g_tpLastOutcome.store(kSMTpOk, std::memory_order_relaxed);
+    return true;
 }
 
 void Transfer2EntityDirect(uint32_t entityNetId) {
@@ -9315,8 +9725,16 @@ void Transfer2EntityDirect(uint32_t entityNetId) {
             if (boxedPos && !exc) {
                 Vector3 targetPos = *(Vector3 *) _monoObjectUnbox(boxedPos);
                 LOGI("[TeleportFix] Berhasil mendapatkan posisi target: %.2f, %.2f, %.2f. Menggunakan AutoMoveTransferDirect.", targetPos.x, targetPos.y, targetPos.z);
-                AutoMoveTransferDirect(targetPos);
-                return;
+                const bool moved = AutoMoveTransferDirect(targetPos);
+                // [新增] 落地确认：目标实体的 get_position 与自身当前位置比对
+                // （每次按 netId 重新解析实体，绝不跨帧保存 mono 对象）。
+                if (SMTpWaitNearEntity(entityNetId, 2000)) {
+                    SMPlatform::SetBreadcrumbLight("tp:entity-land");
+                    return;
+                }
+                SMPlatform::SetBreadcrumbLight("tp:entity-timeout");
+                LOGE("[TeleportFix] entity landing timeout (netId=%u).", entityNetId);
+                if (moved) return;   // invoke 已经生效：不要再叠一次 fallback 传送
             } else {
                 LOGE("[TeleportFix] Exception atau null saat get_position dari entity.");
             }
@@ -9338,13 +9756,50 @@ void Transfer2EntityDirect(uint32_t entityNetId) {
     void *args[] = { &netId };
     void *exc = nullptr;
     _monoRuntimeInvoke(m_transfer, nullptr, args, &exc);
-    if (exc) LOGE("[TeleportFix] Exception saat invoke EntityHelper.Transfer2Entity.");
+    if (exc) { LOGE("[TeleportFix] Exception saat invoke EntityHelper.Transfer2Entity."); return; }
+
+    // [新增] fallback 传送后同样做落地/位置确认
+    if (SMTpWaitNearEntity(entityNetId, 2000)) {
+        SMPlatform::SetBreadcrumbLight("tp:entity-land");
+    } else {
+        SMPlatform::SetBreadcrumbLight("tp:entity-timeout");
+        LOGE("[TeleportFix] entity landing timeout setelah fallback (netId=%u).", entityNetId);
+    }
 }
 
 bool AutoMoveTransferNative(Vector3 pos) {
-    RunOnUnityThreadSync([pos]() {
-        AutoMoveTransferDirect(pos);
+    // [新增] 传送前先等区域就绪：这里的等待发生在调用线程（采集/任务/钓鱼 worker），
+    // Unity 线程继续跑帧，流式加载才有机会在 2 秒内完成。
+    SMPlatform::SetBreadcrumbLight("tp:pre");
+    if (!SMTpWaitAreaReady(pos, 2000)) {
+        SMPlatform::SetBreadcrumbLight("tp:pre-timeout");
+        g_tpLastOutcome.store(kSMTpPreFail, std::memory_order_relaxed);
+        return false;
+    }
+    SMPlatform::SetBreadcrumbLight("tp:pre-ok");
+
+    bool directOk = false;
+    RunOnUnityThreadSync([pos, &directOk]() {
+        directOk = AutoMoveTransferDirect(pos);
     });
+
+    const int outcome = g_tpLastOutcome.load(std::memory_order_relaxed);
+    if (outcome == kSMTpPreFail || outcome == kSMTpInvokeFail) return false;
+    if (directOk) {
+        // Direct 内部已经确认落地（同一帧就能读到新坐标的情形）。
+        SMPlatform::SetBreadcrumbLight("tp:land");
+        g_tpLastOutcome.store(kSMTpOk, std::memory_order_relaxed);
+        return true;
+    }
+
+    // [新增] 落地确认：Unity 线程里只能单探，真正的 2 秒轮询放在调用线程这边。
+    if (!SMTpWaitLanded(pos, 2000)) {
+        SMPlatform::SetBreadcrumbLight("tp:land-timeout");
+        g_tpLastOutcome.store(kSMTpLandFail, std::memory_order_relaxed);
+        return false;
+    }
+    SMPlatform::SetBreadcrumbLight("tp:land");
+    g_tpLastOutcome.store(kSMTpOk, std::memory_order_relaxed);
     return true;
 }
 

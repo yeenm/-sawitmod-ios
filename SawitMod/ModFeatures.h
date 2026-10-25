@@ -200,7 +200,8 @@ void ExecutePlayerScanner();
 
 // --- Teleportation & Movement ---
 void EnsureTeleportAntiCrashPatched();
-void AutoMoveTransferDirect(Vector3 pos);
+// 传送主路径：区域就绪 + 落地确认都通过才返回 true（iOS 版缺的"等就绪"流程）。
+bool AutoMoveTransferDirect(Vector3 pos);
 bool AutoMoveTransferNative(Vector3 pos);
 void Transfer2EntityDirect(uint32_t entityNetId);
 Vector3 GetSelfPositionNative();
