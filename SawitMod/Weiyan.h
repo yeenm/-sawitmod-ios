@@ -24,6 +24,9 @@ namespace Weiyan {
 
     struct Result {
         bool ok = false;
+        // 面板判「设备码不匹配」时置位：登录层据此用历史设备码回退重试；
+        // 卡密本身的问题（不存在/过期/冻结）不重试。
+        bool deviceMismatch = false;
         std::string message;      // 给用户看的中文提示
         std::string ktype;        // single（次数卡）/ vip（时间卡）/ 空=面板未给
         int remaining = -1;       // 单码剩余可登录次数

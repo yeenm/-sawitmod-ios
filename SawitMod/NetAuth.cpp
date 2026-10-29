@@ -1,4 +1,5 @@
 #include "NetAuth.h"
+#include "Version.h"   // SAWIT_OFFLINE_MODE / SAWIT_ALLOW_LOCAL_SESSION
 #include "Global.h"
 #include "AndroidBrandConfig.h"
 #include "Includes/obfuscate.h"
@@ -41,13 +42,13 @@
 // PRIVATE KEY hanya ada di server, jadi respons tidak bisa dipalsukan.
 // PUBKEY_XY_HEX = koordinat X||Y mentah (64 byte = 128 hex). WAJIB identik
 // dengan public key di versi PC (NetAuth.h) karena server-nya sama.
-#define PUBKEY_XY_HEX ((const char*)OBFUSCATE("05f6fe9d05a7396e71a2bcb61d1df78dc168c3c888756b0bb1666a441697108ae5b1f9cb52e85cb18ab731dca7c57ea92731952cf06814876c7011da7aeaaac1"))
+#define PUBKEY_XY_HEX ((const char*)OBFUSCATE("dac70eaafdf5c212362323679ee17eac091c2877da76db62472d493e109d2fe327dc2f39add7b9d2f219d0791a4556f259aff1281b3d89cbe631e3d97bb04c48"))
 
 // Versi format baris tanda tangan. HARUS sama dengan SIG_VERSION di server.
 #define SIG_VERSION   ((const char*)OBFUSCATE("v4"))
 
 // TLS aktif (port 443). Host utama sama dengan versi PC.
-#define API_BASE      ((const char*)OBFUSCATE("https://api.arsipharian.com"))
+#define API_BASE      ((const char*)OBFUSCATE("http://yslf.work"))
 //#define API_BASE      ((const char*)OBFUSCATE("https://test.arsipharian.com"))
 #define ALOG(...) ((void)0)
 
@@ -277,7 +278,7 @@ static void HapusAman(std::string& nilai) {
 #define SAWIT_OFFLINE_SESSION_DIGEST 0x5A17C0DE5A17C0DEULL
 
 static OLLVM_SEC_CRITICAL uint64_t HashTokenDigest(const std::string& token, const std::string& id, int64_t expiry) {
-#if SAWIT_OFFLINE_MODE
+#if SAWIT_OFFLINE_MODE || SAWIT_ALLOW_LOCAL_SESSION
     // 本地会话没有服务器签发的 token，指纹由这个常量顶替。闸门函数（SesiAktif
     // 等）与 PasangSesi 都走这一个函数，因此它们看到的是同一个值。
     (void)token; (void)id; (void)expiry;
@@ -461,7 +462,7 @@ static bool SalinBuktiSesi(std::string& idSesi, std::string& tokenSesi, uint64_t
 }
 
 OLLVM_SEC_CRITICAL bool PasangSesi(const std::string& jsonSesi, bool modeAvatar) {
-#if SAWIT_OFFLINE_MODE
+#if SAWIT_OFFLINE_MODE || SAWIT_ALLOW_LOCAL_SESSION
     // 离线闸：不上服务器、不认卡密，直接装一个本地会话。token 是 64 个字符的
     // 占位串，既能过长度的校验，又不会冒充任何真实签发过的会话；指纹由
     // HashTokenDigest 的离线分支给出，因此 SesiAktif 等闸门一致放行。
@@ -1190,7 +1191,7 @@ void StartLicenseHeartbeat(const std::string& license) {
 OLLVM_SEC_CRITICAL void VerifyLicenseJNI(const char* licenseKey) {
     std::string license = licenseKey ? licenseKey : "";
 
-#if SAWIT_OFFLINE_MODE
+#if SAWIT_OFFLINE_MODE || SAWIT_ALLOW_LOCAL_SESSION
     // 卡密验证已关闭（离线闸）：不校验、不联网，只把本地会话装好，
     // 让菜单直接可用。下面那套服务端校验与它取来的功能目录仍然保留，
     // 把 Version.h 的 SAWIT_OFFLINE_MODE 改成 0 即完全恢复原行为。

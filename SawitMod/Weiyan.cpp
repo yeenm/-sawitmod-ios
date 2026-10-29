@@ -6,6 +6,8 @@
 #include "NetAuth.h"         // GetHWIDNative() / Sha256HexNativePublic
 
 #include <arpa/inet.h>
+#include <atomic>
+#include <initializer_list>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -21,6 +23,7 @@
 #include <sstream>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <thread>
 #include <sys/time.h>   // struct timeval / SO_RCVTIMEO（iOS 上不靠传递包含）
 #include <sys/types.h>
 #include <unistd.h>
@@ -44,7 +47,7 @@ void SetNoSigPipe(int fd) {
 // =====================================================================
 //  常量（与原实现同一组，勿改）
 // =====================================================================
-const char* kHostDefault = "wy.llua.cn";
+const char* kHostDefault = "yslf.work";
 const char* kPathDefault = "v2/c84ec01e30ad49897de7c59f5edd4af8";
 // 面板文档里的正式「单码登录」接口：GET/POST /api/?id=kmlogon&app=<应用ID>&data=<密文参数>
 const char* kDocLoginPath = "api/";
@@ -810,6 +813,132 @@ std::string RandomDigits(int n) {
 }
 
 // unix 秒 -> 本地时间字符串
+
+// 在线心跳：GET /api/?id=kmcheck&app=<app>&data=<hex(RC4(params))>
+// 服务端校验卡密/设备/会话状态（是否被封禁、删除、踢下线、解绑）。
+// 失败时客户端立即本地登出，菜单回到未登录状态。
+std::string ApiCallCheck(const std::string& kami, const std::string& device,
+                         JsonMap& out, std::string* rawJson) {
+    EnsureCfg();
+    const long long ts = NowSeconds();
+    const std::string sign = Md5Hex(std::string("kami=") + kami + "&markcode=" + device +
+                                    "&t=" + std::to_string(ts) + "&" + kSalt);
+    const std::string params = std::string("app=") + g_appId +
+                               "&kami=" + kami +
+                               "&markcode=" + device +
+                               "&t=" + std::to_string(ts) +
+                               "&sign=" + sign;
+    const std::string data = UrlEncode(EncodeRequest(params));
+    const std::string target = g_docPath + "?id=kmcheck&app=" + g_appId + "&data=" + data;
+    const std::string body = HttpRequest(g_host, target, "", "", true);
+    if (body.empty()) return u8"网络请求失败";
+    const std::string json = DecodeResponse(body);
+    if (rawJson) *rawJson = json;
+    if (json.empty() || json[0] != '{') return u8"服务器返回异常";
+    if (!JsonParse(json, out)) return u8"响应解析失败";
+    return "";
+}
+
+// =====================================================================
+//  在线心跳：登录成功后每 60 秒向面板报告一次在线状态。
+//  面板侧封禁/删除卡密、解绑设备、踢下线后，最迟 60 秒内客户端自动登出。
+//  网络抖动不误杀（继续下一轮），只有服务端明确拒绝才登出。
+// =====================================================================
+std::atomic<bool> g_hbRun{false};
+std::thread g_hbThread;
+
+void StopHeartbeat() {
+    g_hbRun.store(false);
+    if (g_hbThread.joinable()) g_hbThread.join();
+}
+
+void StartHeartbeat(const std::string& card, const std::string& device) {
+    StopHeartbeat();
+    if (card.empty() || device.empty()) return;
+    g_hbRun.store(true);
+    g_hbThread = std::thread([card, device]() {
+        int wait = 8;  // 登录后 8 秒首跳，避开和登录请求叠在一起
+        while (g_hbRun.load()) {
+            for (int i = 0; i < wait && g_hbRun.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (!g_hbRun.load()) break;
+            wait = 60;
+            JsonMap j;
+            std::string json;
+            const std::string err = ApiCallCheck(card, device, j, &json);
+            if (!err.empty()) {
+                LOGI("weiyan heartbeat network error: %s", err.c_str());
+                continue;  // 网络抖动/服务重启不踢，下一轮继续
+            }
+            const long code = (long)j.Num("code", 0);
+            if (code == kOkCodeOld || code == kOkCodeNew) continue;
+            const std::string reason = j.Str("msg");
+            LOGI("weiyan heartbeat rejected code=%ld reason=%s", code, reason.c_str());
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                g_verified = false;
+                g_card.clear();
+                g_expiresAt = 0;
+                g_remaining = -1;
+                g_durationSec = 0;
+                g_status = reason.empty()
+                        ? u8"卡密已失效，已自动离线"
+                        : (u8"卡密已失效，已自动离线：" + reason);
+            }
+            break;
+        }
+    });
+}
+
+// ---------------------------------------------------------------
+//  登录失败文案 / 设备码不匹配判定（与安卓修复版一致）
+// ---------------------------------------------------------------
+std::string TrimAsciiCopy(std::string s) {
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t'))
+        s.pop_back();
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+    return s;
+}
+
+bool ContainsAny(const std::string& haystack, std::initializer_list<const char*> needles) {
+    for (const char* needle : needles) {
+        if (needle && *needle && haystack.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// 面板失败文案：msg 可能是字符串，也可能嵌在 msg.msg / check / check2 里。
+// 成功时 check/check2 是签名校验串（纯十六进制），要排掉避免误当文案。
+std::string ExtractPanelFailureText(const JsonMap& j) {
+    const char* keys[] = {"msg", "msg.msg", "msg.check", "msg.check2", "check", "check2"};
+    for (const char* key : keys) {
+        std::string value = TrimAsciiCopy(j.Str(std::string(key)));
+        if (value.empty()) continue;
+        if (value.size() > 160) value.resize(160);
+        if (value.find('<') != std::string::npos) continue;
+        if (value.front() == '{' || value.front() == '[') continue;
+        if (value == "0" || value == "1") continue;
+        bool allHex = value.size() >= 16;
+        for (char ch : value) {
+            if (!isxdigit((unsigned char)ch)) { allHex = false; break; }
+        }
+        if (allHex) continue;
+        return value;
+    }
+    return "";
+}
+
+// 面板判「设备码不匹配」？只有这种失败才值得用历史设备码重试。
+bool IsDeviceMismatchFailure(long code, const JsonMap& j) {
+    if (code == 110) return true;                 // 设备不匹配
+    if (code == 105) return true;                 // 设备码为空
+    if (code == 104 || code == 112 || code == 113) return false;  // 签名/时间问题，重试无用
+    const std::string text = ExtractPanelFailureText(j);
+    if (text.empty()) return false;
+    if (ContainsAny(text, {"时间", "timestamp", "签名", "signature", "sign"})) return false;
+    return ContainsAny(text, {"设备", "机器码", "markcode", "device id", "deviceid", "machine code"});
+}
+
 std::string FormatUnixTime(long long sec) {
     if (sec <= 0) return u8"未知";
     const std::time_t tt = (std::time_t)sec;
@@ -870,10 +999,12 @@ bool InterpretLoginResponse(const std::string& json, const std::string& sign,
         return false;
     }
     if (code != kOkCodeOld && code != kOkCodeNew) {
-        std::string msg = j.Str("msg");
+        std::string msg = ExtractPanelFailureText(j);
+        if (msg.empty()) msg = j.Str("msg");
         if (msg.empty()) msg = j.Str("msg.msg");
         if (msg.empty()) msg = u8"卡密验证失败（状态码 " + std::to_string(code) + u8"）";
         r.message = msg;
+        r.deviceMismatch = IsDeviceMismatchFailure(code, j);
         return false;
     }
 
@@ -1078,6 +1209,28 @@ std::string DeviceCode() {
     return uuid;
 }
 
+
+// 登录不匹配时可回退的历史设备码：旧版本写过的文件值 + 当前 Keychain 稳定码。
+// （iOS 没有安卓的 MediaDrm 硬件码，历史绑定基本都在这几个文件里。）
+std::vector<std::string> DeviceCodeLoginCandidates() {
+    std::vector<std::string> out;
+    auto push = [&out](std::string v) {
+        v = TrimAsciiCopy(v);
+        if (v.empty()) return;
+        for (const std::string& existing : out) {
+            if (existing == v) return;
+        }
+        if (out.size() < 8) out.push_back(v);
+    };
+    push(ReadFirstLine(kIdFileOverride));
+    push(ReadFirstLine(kIdFileExt));
+    push(ReadFirstLine(kIdFileAlt));
+    push(ReadFirstLine(kIdFile));
+    push(SMPlatform::DeviceCode());
+    push(SMPlatform::HWID());
+    return out;
+}
+
 std::string LoadSavedCard() {
     std::string km = ReadFirstLine(kKmFile);
     if (km.empty()) km = ReadFirstLine(kKmFileAlt);
@@ -1153,6 +1306,7 @@ void SetStatus(const std::string& message) {
 }
 
 void Logout() {
+    StopHeartbeat();
     std::lock_guard<std::mutex> lk(g_mtx);
     g_verified = false;
     g_card.clear();
@@ -1172,57 +1326,92 @@ static Result VerifyCardImpl(const std::string& cardKey) {
         return r;
     }
 
-    const std::string device = DeviceCode();
-    const long long ts = NowSeconds();
-    const std::string value = RandomDigits(6);
-    const std::string sign = Md5Hex(std::string("kami=") + key + "&markcode=" + device +
-                                    "&t=" + std::to_string(ts) + "&" + kSalt);
-
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         g_lastRaw.clear();
     }
 
-    JsonMap j;
-    std::string json;
-    std::string err;
-    if (UseDocLogin()) {
-        // 面板文档的正式接口：参数加密后放 data=
-        const std::string params = std::string("app=") + AppId() +
-                                   "&kami=" + key +
-                                   "&markcode=" + device +
-                                   "&t=" + std::to_string(ts) +
-                                   "&sign=" + sign +
-                                   "&value=" + value;
-        err = ApiCallDocLogin(params, j, &json);
-    } else {
-        const std::string loginId = LoginId();
-        const std::string plain = std::string("id=") + loginId +
-                                  "&kami=" + key +
-                                  "&markcode=" + device +
-                                  "&t=" + std::to_string(ts) +
-                                  "&sign=" + sign +
-                                  "&value=" + value;
-        err = ApiCall(plain, j, &json, true);
-    }
-    if (!err.empty()) {
-        r.message = err;
-        return r;
+    // 用指定设备码走一次登录（主设备码失败回退、心跳校验都复用这段）
+    auto attempt = [&key](const std::string& device) -> Result {
+        Result out;
+        const long long ts = NowSeconds();
+        const std::string value = RandomDigits(6);
+        const std::string sign = Md5Hex(std::string("kami=") + key + "&markcode=" + device +
+                                        "&t=" + std::to_string(ts) + "&" + kSalt);
+        JsonMap j;
+        std::string json;
+        std::string err;
+        if (UseDocLogin()) {
+            // 面板文档的正式接口：参数加密后放 data=
+            const std::string params = std::string("app=") + AppId() +
+                                       "&kami=" + key +
+                                       "&markcode=" + device +
+                                       "&t=" + std::to_string(ts) +
+                                       "&sign=" + sign +
+                                       "&value=" + value;
+            err = ApiCallDocLogin(params, j, &json);
+        } else {
+            const std::string loginId = LoginId();
+            const std::string plain = std::string("id=") + loginId +
+                                      "&kami=" + key +
+                                      "&markcode=" + device +
+                                      "&t=" + std::to_string(ts) +
+                                      "&sign=" + sign +
+                                      "&value=" + value;
+            err = ApiCall(plain, j, &json, true);
+        }
+        if (!err.empty()) {
+            out.message = err;
+            return out;
+        }
+        std::string raw;
+        InterpretLoginResponse(json, sign, ts, out, raw);
+        out.raw = raw;
+        return out;
+    };
+
+    const std::string primaryDevice = DeviceCode();
+    r = attempt(primaryDevice);
+
+    // 面板判「设备码不匹配」→ 历史上可能绑的是旧版本写下的设备码，逐个回退。
+    // 任何一次成功就把那个码固化成 override，以后登录不再换。
+    if (!r.ok && r.deviceMismatch) {
+        const std::vector<std::string> candidates = DeviceCodeLoginCandidates();
+        int attempted = 0;
+        for (const std::string& candidate : candidates) {
+            if (candidate == primaryDevice) continue;
+            if (attempted >= 3) break;
+            ++attempted;
+            LOGI("weiyan: device mismatch, retry with historical code=%s", candidate.c_str());
+            Result retry = attempt(candidate);
+            if (retry.ok) {
+                WriteLine(kIdFileOverride, candidate);
+                retry.message += u8"（已自动匹配面板绑定的历史设备码，并固定使用）";
+                LOGI("weiyan: bound device code recovered: %s", candidate.c_str());
+                r = retry;
+                break;
+            }
+            if (!retry.deviceMismatch) {
+                // 卡密本身的问题（不存在/过期/冻结/时间不对）——换码没有意义
+                r = retry;
+                break;
+            }
+        }
+        if (!r.ok) {
+            r.message += u8" ｜ 本机设备码：" + primaryDevice +
+                         u8"（把这条发给作者：在面板解绑，或在「设置→设备码」里填面板显示的设备码）";
+        }
     }
 
-    // 响应已解出 JSON —— 交给解析器（同一份逻辑在自检里也被喂过数据）
-    std::string raw;
-    const bool ok = InterpretLoginResponse(json, sign, ts, r, raw);
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        g_lastRaw = raw;
+        g_lastRaw = r.raw;
     }
-    LOGI("login (doc=%d) device=%s -> %s", (int)UseDocLogin(), device.c_str(),
-           r.ok ? "OK" : r.message.c_str());
+    LOGI("login (doc=%d) device=%s -> %s", (int)UseDocLogin(), primaryDevice.c_str(),
+         r.ok ? "OK" : r.message.c_str());
     if (!r.ok) {
-        LOGI("login raw response: %.300s", raw.c_str());
-        // 失败原因一定要落到状态栏：调用方（菜单）不一定自己 SetStatus。
-        // 与安卓端 Weiyan.cpp 的失败路径保持一致。
+        LOGI("login raw response: %.300s", r.raw.c_str());
+        // 失败原因一定要落到状态栏：调用方（菜单）不一定自己 SetStatus
         SetStatus(r.message);
         return r;
     }
@@ -1239,7 +1428,9 @@ static Result VerifyCardImpl(const std::string& cardKey) {
         g_status = r.message;
     }
     LOGI("card verified: ktype=%s remaining=%d expire=%lld",
-           r.ktype.c_str(), r.remaining, r.expiresAt);
+         r.ktype.c_str(), r.remaining, r.expiresAt);
+    // 登录成功后开 60 秒心跳：面板封禁/删除/解绑/踢下线 → 下一次心跳本地自动登出
+    StartHeartbeat(key, DeviceCode());
     return r;
 }
 
