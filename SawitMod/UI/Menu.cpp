@@ -451,7 +451,6 @@ void DrawMenu() {
                                                  : ActiveUI::kErr,
                                "%s", verifyBusy.load() ? u8"正在验证卡密…"
                                                        : Weiyan::StatusMessage().c_str());
-            ImGui::TextDisabled("%s %s", u8"面板:", Weiyan::ApiHost().c_str());
             ImGui::TextDisabled("%s %s", u8"本机设备码:", SMPlatform::DeviceCode().c_str());
             if (!g_prevBreadcrumb.empty() && g_prevBreadcrumb != "done" &&
                 g_prevBreadcrumb != "verify:fail" && g_prevBreadcrumb != "boot") {

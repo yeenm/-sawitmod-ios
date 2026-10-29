@@ -577,6 +577,19 @@ void SMRunUnityFramePump() {
         }
         if (traceFrame) STARTUP_TRACE("F12 mod frame logic complete");
     }
+
+    // 侧载 iOS 上 GameApp.Update 的 Dobby inline hook 装不上（SMOldGameAppUpdate 为
+    // nullptr），所以 SMGameAppUpdate() 里"原版 update 之后"的那段永远不会执行：
+    // 拍鸟 / 南瓜雕刻 / 表情解锁 / 双人互动 / 符号自检的 tick 全挂在那里 —— 表现就是
+    // 菜单显示"已激活/授权 OK"，但状态一直 idle、功能一点不动。
+    // display-link 帧泵每个渲染帧都在主线程跑，这里补跑一次。
+    if (!SMOldGameAppUpdate) {
+        if (g_enableBirdFarm) ProcessBirdWatchingNative();
+        if (g_isAutoPumpkinActive) ProcessPumpkinCarvingOnUpdate();
+        ProcessEmoteUnlockOnUpdate();
+        ProcessFriendInteractUnlockOnUpdate();
+        MaybeRunAutoSymbolProbe();
+    }
 }
 
 void SMGameAppUpdate(void *instance) {

@@ -62,8 +62,6 @@ bool g_autoPumpkinCollect;
 int g_pumpkinDoneCount;
 std::string g_pumpkinStatus;
 std::string g_pumpkinPn;
-int g_pumpkinScore;
-int g_pumpkinScoreCount;
 bool g_isAutoSandActive;
 int g_sandBaseStaticId;
 int g_sandProductId;
@@ -194,12 +192,8 @@ bool g_isHelperCookActive;
 bool g_swimHackActive;
 bool g_skateHackActive;
 bool g_enableBirdFarm;
-float g_birdCatchCooldown;
-float g_birdScanRange;
 std::unordered_set<uint32_t> g_processedBirds;
 std::unordered_map<uint32_t, int> g_birdPhotoAttempts;
-float g_birdMinPhotoDist;
-float g_birdInvokeCooldown;
 BirdTarget g_birdCurrentTarget;
 std::atomic<bool> g_birdRequestPending;
 std::atomic<uint64_t> g_birdResultSequence;
@@ -313,6 +307,17 @@ bool libLoaded = false;
 
 // 优质木材：一轮 40 个固定点走完就自动停止（菜单可关）。
 bool g_premiumWoodOnePass = true;
+
+// ---- 拍鸟农场 / 南瓜雕刻默认值（对齐安卓 Main.cpp；iOS 生成器默认 0 会导致
+//      ResolveBirdTarget 里 distance > g_birdScanRange 恒成立，永远找不到鸟）----
+float g_birdCatchCooldown = 1.5f;
+float g_birdScanRange = 35.0f;
+float g_birdMinPhotoDist = 2.5f;
+float g_birdInvokeCooldown = 1.0f;
+int g_pumpkinScore = 100;
+int g_pumpkinScoreCount = 4;
+
+
 
 // Instant Farm 的 18 种资源：顺序必须与 NUM_RESOURCES / g_farmSelections 一致。
 // 最后一项 Premium Wood（优质木材）是 iOS 新增：坐标表在 ModFeatures.cpp 的
