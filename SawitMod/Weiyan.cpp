@@ -873,6 +873,15 @@ void StartHeartbeat(const std::string& card, const std::string& device) {
             const long code = (long)j.Num("code", 0);
             if (code == kOkCodeOld || code == kOkCodeNew) continue;
             const std::string reason = j.Str("msg");
+            // 面板 kmcheck 对"多设备卡/非首个绑定设备"会回 110/105（设备码不匹配），
+            // 但登录本身是 200 通过的，不能因为心跳这一条就把玩家踢下线。
+            // 只有明确撤销/到期/删除/冻结等才登出。
+            const bool revoke = (code == 106 || code == 107 || code == 108 ||
+                                 code == 109);
+            if (!revoke) {
+                LOGI("weiyan heartbeat ignored code=%ld reason=%s", code, reason.c_str());
+                continue;
+            }
             LOGI("weiyan heartbeat rejected code=%ld reason=%s", code, reason.c_str());
             {
                 std::lock_guard<std::mutex> lk(g_mtx);
