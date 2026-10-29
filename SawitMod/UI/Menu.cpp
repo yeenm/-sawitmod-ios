@@ -1336,12 +1336,23 @@ void DrawMenu() {
                     g_birdFarmStatus = u8"正在授权";
                     std::thread([] {
                         InvokeRequest req = FetchPayloadSync(WireForOp(OP_BIRD_WATCHING));
-                        if (req.dllName.empty() || req.methodDesc.empty()) {
-                            g_birdFarmStatus = u8"授权失败";
+                        if (!req.dllName.empty() && !req.methodDesc.empty()) {
+                            std::lock_guard<std::mutex> lock(invokeMutex);
+                            invokeQueue.push_back(std::move(req));
                             return;
                         }
-                        std::lock_guard<std::mutex> lock(invokeMutex);
-                        invokeQueue.push_back(std::move(req));
+                        // 拍鸟的 payload 只是授权标记，协议类名/方法名全在代码里。
+                        // 载荷缺失但卡密会话已就绪时直接本地授权，否则 iOS 上永远是"授权失败"。
+                        if (SesiAktif()) {
+                            g_birdCurrentTarget = {};
+                            g_birdRequestPending.store(false, std::memory_order_release);
+                            g_birdRetryCount = 0;
+                            g_birdNextActionAt = 0;
+                            g_birdFarmStatus = u8"运行中（本地授权）";
+                            g_enableBirdFarm = true;
+                            return;
+                        }
+                        g_birdFarmStatus = u8"授权失败：请先登录卡密";
                     }).detach();
                 } else {
                     g_birdFarmStatus = u8"待机";
@@ -1354,6 +1365,11 @@ void DrawMenu() {
             ImGui::TextDisabled(u8"状态: %s | 成功: %d | 完成: %d",
                                 g_birdFarmStatus.c_str(), g_birdSuccessCount,
                                 (int) g_processedBirds.size());
+            ImGui::TextDisabled(u8"授权: 卡密=%s 会话=%s 载荷=%s | 距离=%.1f 扫描=%.0f",
+                                Weiyan::IsVerified() ? u8"是" : u8"否",
+                                SesiAktif() ? u8"是" : u8"否",
+                                WireForOp(OP_BIRD_WATCHING).empty() ? u8"缺失" : u8"就绪",
+                                g_birdMinPhotoDist, g_birdScanRange);
             ImGui::TextDisabled(Tr("Rescan Cooldown: %.1fs", u8"重新扫描冷却: %.1f秒"), g_birdCatchCooldown);
             ImGui::SliderFloat("##birdCool", &g_birdCatchCooldown, 0.2f, 10.0f);
             ImGui::TextDisabled(Tr("Range: %.0fm", u8"范围: %.0f米"), g_birdScanRange);
@@ -1756,13 +1772,13 @@ void DrawMenu() {
             ImGui::Separator();
             if (ImGui::Checkbox(Tr("Auto Pumpkin Carving", u8"自动南瓜雕刻 (Auto Pumpkin Carving)"), &g_isAutoPumpkinActive)) {
                 if (g_isAutoPumpkinActive) {
-                    if (!SesiAktif() || WireForOp(OP_AUTO_PUMPKIN).empty()) {
+                    if (!SesiAktif()) {
                         g_isAutoPumpkinActive = false;
-                        g_pumpkinStatus = u8"服务器载荷不可用（离线）";
+                        g_pumpkinStatus = u8"请先登录卡密（会话未就绪）";
                     } else {
                         g_autoPumpkinPlace = true;
                         g_autoPumpkinCollect = true;
-                        g_pumpkinStatus = u8"正在向服务器验证…";
+                        g_pumpkinStatus = u8"正在初始化…";
                         std::thread([]() {
                             RunAutoPumpkinCarvingLoop();
                         }).detach();
@@ -1779,6 +1795,11 @@ void DrawMenu() {
             ImGui::SameLine();
             ImGui::Checkbox(Tr("Auto Collect (Ambil Hasil)", u8"自动拾取"), &g_autoPumpkinCollect);
             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), u8"状态: %s | 已完成: %d", g_pumpkinStatus.c_str(), g_pumpkinDoneCount);
+            ImGui::TextDisabled(u8"授权: 卡密=%s 会话=%s 载荷=%s 元数据=%d | 完成总数: %d",
+                                Weiyan::IsVerified() ? u8"是" : u8"否",
+                                SesiAktif() ? u8"是" : u8"否",
+                                WireForOp(OP_AUTO_PUMPKIN).empty() ? u8"缺失" : u8"就绪",
+                                (int) g_pumpkinPn.size(), g_pumpkinDoneCount);
             ImGui::Spacing();
             ImGui::Separator();
 

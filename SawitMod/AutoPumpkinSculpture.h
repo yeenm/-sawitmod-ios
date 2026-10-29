@@ -1605,21 +1605,39 @@ inline void ProcessPumpkinCarvingOnUpdate() {
     }
 }
 
+// 内嵌 op37 payload 元数据（从本地 dump 的 SVM2 信封里解出来的 20 个 n_* 名字，
+// 与安卓/PC 版逐字一致）。在线/离线载荷拿不到时用它兜底，否则 iOS 上这个功能
+// 永远卡在 "Server payload unavailable (offline)"。
+inline const char* LocalPumpkinPnJson() {
+    return "{\"n_imgData\":\"XDTDataAndProtocol\",\"n_imgLevel\":\"XDTLevelAndEntity\",\"n_imgTable\":\"EcsClient\",\"n_nsPumpkinProto\":\"XDTDataAndProtocol.ProtocolService.PumpkinCarving\",\"n_clsPumpkinProto\":\"PumpkinCarvingProtocolManager\",\"n_startCarving\":\"StartMakingPumpkinCarving\",\"n_finishCarving\":\"FinishMakingPumpkinCarving\",\"n_nsCharProto\":\"XDTDataAndProtocol.ProtocolService.GamePlay.Character\",\"n_clsCharProto\":\"CharacterProtocolManager\",\"n_poseDelete\":\"PoseDeleteBuild\",\"n_nsHomelandComp\":\"XDTLevelAndEntity.Gameplay.Component.Homeland\",\"n_clsPumpkinComp\":\"PumpkinComponent\",\"n_clsBuildComp\":\"BuildComponent\",\"n_clsFinishComp\":\"PumpkinFinishComponent\",\"n_clsBaseComp\":\"PumpkinBaseComponent\",\"n_mGetOwnerId\":\"get_OwnerId\",\"n_mGetFirstParent\":\"GetFirstParentNetId\",\"n_clsTableData\":\"TableData\",\"n_mGetPumpkinRough\":\"GetPumpkinrough\",\"n_mGetPumpkinBase\":\"GetPumpkinbase\"}";
+}
+
 inline void RunAutoPumpkinCarvingLoop() {
     SMPlatform::SetBreadcrumbLight("pumpkin:loop");
-    InvokeRequest req = FetchPayloadSync(WireForOp(OP_AUTO_PUMPKIN));
-    if (req.op != OP_AUTO_PUMPKIN || req.methodDesc != "CUSTOM_AUTO_PUMPKIN" ||
-        req.payloadRaw.empty() || !SesiAktif()) {
-        LOGI("[Pumpkin] Server authorization FAILED or offline -> aborting Auto Pumpkin\n");
-        g_pumpkinStatus = "Server payload unavailable (offline)";
+    if (!SesiAktif()) {
+        LOGI("[Pumpkin] session not active -> ask user to login first\n");
+        g_pumpkinStatus = u8"请先登录卡密（会话未就绪）";
         g_isAutoPumpkinActive = false;
         g_pumpkinPn.clear();
         g_pumpkinCache.resolved = false;
         return;
     }
-    g_pumpkinPn = req.payloadRaw;
-    g_pumpkinStatus = "idle";
+    InvokeRequest req = FetchPayloadSync(WireForOp(OP_AUTO_PUMPKIN));
+    const bool serverOk = (req.op == OP_AUTO_PUMPKIN &&
+                           req.methodDesc == "CUSTOM_AUTO_PUMPKIN" &&
+                           !req.payloadRaw.empty());
+    if (serverOk) {
+        g_pumpkinPn = req.payloadRaw;
+        g_pumpkinStatus = "idle";
+        g_isAutoPumpkinActive = true;
+        return;
+    }
+    // 载荷没拿到（本地 dump 无该信封 / 在线 payload 接口不可用）：用内嵌元数据兜底。
+    g_pumpkinPn = LocalPumpkinPnJson();
+    g_pumpkinStatus = u8"本地协议（载荷缺失，已兜底）";
     g_isAutoPumpkinActive = true;
+    SMPlatform::SetBreadcrumbLight("pumpkin:localpn");
+    LOGI("[Pumpkin] cloud payload missing -> using embedded protocol metadata");
 }
 
 inline void RunAutoPumpkinCarvingOnce() {
