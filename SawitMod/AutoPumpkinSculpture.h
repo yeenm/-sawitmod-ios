@@ -12,6 +12,8 @@
 #include "obfuscate.h"
 #include "Logger.h"
 #include "Starcoolxdl/xdl.h"
+#include "MonoGameApi.h"      // MonoApi::CreateGenericList
+#include "IL2CPP/MonoHot.h"    // SMMonoHot::ArrayNew（iOS mono 数组入口）
 // The RVA table comes in through Global.h (Offsets-cn.h). Including Offsets.h here as well pulled
 // in the Global build's table on top of it, so it is deliberately not included twice.
 
@@ -282,6 +284,11 @@ inline float PumpkinGetTimeSec() {
 }
 
 inline void* PumpkinMonoArrayNew(void* domain, void* byteKlass, size_t count) {
+    // iOS：mono 运行时静态链接进主程序，没有 libmonosgen-2.0.so，xdl_open 必然失败。
+    // 先走 MonoHot 的数组入口（iOS 侧按句柄分发到 mono_array_new），失败再回落旧路径。
+    if (byteKlass) {
+        if (void* hosted = SMMonoHot::ArrayNew(byteKlass, (uintptr_t) count)) return hosted;
+    }
     static void* (*p)(void*, void*, uintptr_t) = nullptr;
     if (!p) {
         void* h = xdl_open(OBFUSCATE("libmonosgen-2.0.so"), 0);
@@ -709,50 +716,33 @@ inline bool TryCreatePumpkinScoreList(void*& outListObj) {
     outListObj = nullptr;
     void* corlib = GetCorlibImage();
     if (!corlib) return false;
+    void* intKlass = _monoClassFromName(corlib, OBFUSCATE("System"), OBFUSCATE("Int32"));
+    if (!intKlass) return false;
 
-    void* typeKlass = _monoClassFromName(corlib, OBFUSCATE("System"), OBFUSCATE("Type"));
-    void* actKlass = _monoClassFromName(corlib, OBFUSCATE("System"), OBFUSCATE("Activator"));
-    if (!typeKlass || !actKlass) return false;
-
-    void* m_getType = FindMethodInHierarchy(typeKlass, OBFUSCATE("GetType"), 1);
-    void* m_createInst = FindMethodInHierarchy(actKlass, OBFUSCATE("CreateInstance"), 1);
-    if (!m_getType || !m_createInst) return false;
-
-    const char* candidates[] = {
-        "System.Collections.Generic.List`1[System.Int32]",
-        "System.Collections.Generic.List`1[[System.Int32, mscorlib]]",
-        "System.Collections.Generic.List`1[[System.Int32, System.Private.CoreLib]]"
-    };
-
-    void* domain = _monoGetRootDomain();
-    void* listObj = nullptr;
-    for (const char* cand : candidates) {
-        void* monoStr = _monoStringNew ? _monoStringNew(domain, cand) : nullptr;
-        if (!monoStr) continue;
-        void* tArgs[1] = { monoStr };
-        void* exc = nullptr;
-        void* typeObj = _monoRuntimeInvoke(m_getType, nullptr, tArgs, &exc);
-        if (typeObj && !exc) {
-            void* cArgs[1] = { typeObj };
-            listObj = _monoRuntimeInvoke(m_createInst, nullptr, cArgs, &exc);
-            if (listObj && !exc) break;
-        }
+    // iOS mono：原来的 Type.GetType("List`1[System.Int32]") + Activator 解析不到泛型
+    // 程序集限定名，Finish 会永远失败（菜单只看到 "Finish failed"）。
+    // MonoApi::CreateGenericList：先 BCL，失败再 mono 原生泛型膨胀 + runtime_object_init。
+    void* listObj = MonoApi::CreateGenericList(
+            intKlass, "System.Collections.Generic.List`1[System.Int32]");
+    if (!listObj) {
+        LOGE("[Pumpkin] create List<int> failed");
+        return false;
     }
-    if (!listObj) return false;
-
     void* listKlass = SafeMonoObjectGetClass(listObj);
-    if (!listKlass) return false;
-    void* m_add = FindMethodInHierarchy(listKlass, OBFUSCATE("Add"), 1);
-    if (m_add) {
-        int score = (g_pumpkinScore > 0) ? g_pumpkinScore : 100;
-        int count = (g_pumpkinScoreCount > 0) ? g_pumpkinScoreCount : 4;
-        void* args[] = { &score };
-        for (int i = 0; i < count; i++) {
-            _monoRuntimeInvoke(m_add, listObj, args, nullptr);
-        }
+    void* m_add = listKlass ? FindMethodInHierarchy(listKlass, OBFUSCATE("Add"), 1) : nullptr;
+    if (!m_add) return false;
+
+    const int score = (g_pumpkinScore > 0) ? g_pumpkinScore : 100;
+    const int count = (g_pumpkinScoreCount > 0) ? g_pumpkinScoreCount : 4;
+    for (int i = 0; i < count; ++i) {
+        int v = score;
+        void* args[] = {&v};
+        void* exc = nullptr;
+        _monoRuntimeInvoke(m_add, listObj, args, &exc);
+        if (exc) return false;
     }
     outListObj = listObj;
-    return (outListObj != nullptr);
+    return true;
 }
 
 inline bool TryPumpkinStart(uint32_t baseNetId, uint32_t pumpkinNetId) {

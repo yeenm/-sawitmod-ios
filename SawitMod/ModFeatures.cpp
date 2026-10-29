@@ -1,5 +1,6 @@
 #include "ModFeatures.h"
 #include "ModUtils.h"
+#include "MonoGameApi.h"       // MonoApi 类/方法/泛型工具
 #include "IL2CPP/MonoHot.h"
 #include "IL2CPP/MonoCompat.h"
 #include "App/Platform.h"
@@ -3756,41 +3757,142 @@ static bool ResolveBirdTarget(BirdTarget &selected) {
     return selected.birdNetId != 0;
 }
 
+// 按 PC 版 HeartopiaComplete.BirdFarm.cs 的 TryInvokeAuraMonoBirdPhotoProtocol 对齐：
+//   TakingBirdPhoto(int staticId, int usePhoto, BirdPhotoDetailInfo detail, uint birdNetId)
+//   - 第二参是 int（旧代码传 uint8_t，mono 侧读 4 字节会拿到脏数据）
+//   - 有站位（standNetId != 0）时 birdNetId 必须传 0
+//   - detail 用游戏类 XDT.Scene.Shared.Modules.BirdWatching.BirdPhotoDetailInfo 动态建，
+//     字段按名字解析后写入（ActionStar/IsPerfectStar/BirdActionType/BirdStandNetId），
+//     不再依赖写死的 NativeBirdPhotoDetailInfo 布局。
 static bool SendBirdPhotoRequest(const BirdTarget &target) {
     if (target.staticId <= 0 || target.birdNetId == 0) return false;
-    void *image = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol"));
-    void *klass = image ? _monoClassFromName(image,
-            OBFUSCATE("XDTDataAndProtocol.ProtocolService.GamePlay.Bird"),
-            OBFUSCATE("BirdProtocolManager")) : nullptr;
-    void *method = klass ? FindMethodInHierarchy(klass,
-            OBFUSCATE("TakingBirdPhoto"), 4) : nullptr;
-    if (!method) return false;
 
-    NativeBirdPhotoDetailInfo detail{};
-    detail.ActionStar = 5;
-    detail.IsPerfectStar = 1;
-    detail.IsCoverStar = 0;
-    detail.BirdActionType = target.pose >= 0 && target.pose <= 5 ? target.pose : 0;
-    detail.IsUsingZoom = 0;
-    detail.BirdStandNetId = target.standNetId;
+    static void* s_protoKlass = nullptr;
+    static void* s_method = nullptr;
+    static int s_arity = 0;
+    static void* s_detailKlass = nullptr;
+    static void* s_fActionStar = nullptr;
+    static void* s_fPerfectStar = nullptr;
+    static void* s_fActionType = nullptr;
+    static void* s_fStandNetId = nullptr;
+
+    static const char* kDataImages[] = {"XDTDataAndProtocol", "XDTDataAndProtocol.dll"};
+    static const char* kAnyImages[] = {"XDTDataAndProtocol", "EcsClient", "XDTLevelAndEntity"};
+
+    if (!s_protoKlass) {
+        s_protoKlass = MonoApi::FindClass(kDataImages, 2,
+                OBFUSCATE("XDTDataAndProtocol.ProtocolService.GamePlay.Bird"),
+                OBFUSCATE("BirdProtocolManager"));
+        if (!s_protoKlass) {
+            s_protoKlass = MonoApi::FindClass(kAnyImages, 3,
+                    OBFUSCATE("XDTDataAndProtocol.ProtocolService.GamePlay.Bird"),
+                    OBFUSCATE("BirdProtocolManager"), nullptr, true);
+        }
+    }
+    if (!s_method && s_protoKlass) {
+        static const char* kNames[] = {"TakingBirdPhoto", "SendTakingBirdPhoto",
+                                       "CmdTakingBirdPhoto", "BirdPhoto"};
+        static const int kArities[] = {4, 3, 5};
+        for (const char* name : kNames) {
+            for (int arity : kArities) {
+                void* m = FindMethodInHierarchy(s_protoKlass, name, arity);
+                if (m) {
+                    s_method = m;
+                    s_arity = MonoApi::MethodParamCount(m);
+                    if (s_arity <= 0) s_arity = arity;
+                    break;
+                }
+            }
+            if (s_method) break;
+        }
+    }
+    if (!s_method) {
+        g_birdFarmStatus = u8"鸟类协议方法缺失";
+        SMPlatform::SetBreadcrumbLight("bird:noproto");
+        return false;
+    }
+
+    if (!s_detailKlass) {
+        s_detailKlass = MonoApi::FindClass(kAnyImages, 3,
+                OBFUSCATE("XDT.Scene.Shared.Modules.BirdWatching"),
+                OBFUSCATE("BirdPhotoDetailInfo"), nullptr, true);
+        if (s_detailKlass) {
+            s_fActionStar = FindFieldInHierarchy(s_detailKlass, OBFUSCATE("ActionStar"));
+            if (!s_fActionStar) s_fActionStar = FindFieldInHierarchy(s_detailKlass, OBFUSCATE("actionStar"));
+            static const char* kPerfectNames[] = {"IsPerfectStar", "isPerfectStar",
+                                                  "PerfectStar", "perfectStar"};
+            for (const char* n : kPerfectNames) {
+                if (!s_fPerfectStar) s_fPerfectStar = FindFieldInHierarchy(s_detailKlass, n);
+            }
+            static const char* kTypeNames[] = {"BirdActionType", "birdActionType",
+                                               "ActionType", "actionType"};
+            for (const char* n : kTypeNames) {
+                if (!s_fActionType) s_fActionType = FindFieldInHierarchy(s_detailKlass, n);
+            }
+            static const char* kStandNames[] = {"BirdStandNetId", "birdStandNetId",
+                                                "StandNetId", "standNetId"};
+            for (const char* n : kStandNames) {
+                if (!s_fStandNetId) s_fStandNetId = FindFieldInHierarchy(s_detailKlass, n);
+            }
+        }
+    }
+
+    // detail：mono 值类型参数在 runtime_invoke 里要的是未装箱数据指针
+    void* detailObj = nullptr;
+    void* detailData = nullptr;
+    std::vector<uint8_t> fallback;
+    void* domain = _monoGetRootDomain ? _monoGetRootDomain() : nullptr;
+    if (s_detailKlass && domain && _monoObjectNew && _monoObjectUnbox) {
+        detailObj = _monoObjectNew(domain, s_detailKlass);
+        if (detailObj) detailData = _monoObjectUnbox(detailObj);
+    }
+    if (!detailData) {
+        int size = 0;
+        if (s_detailKlass && _monoClassValueSize) {
+            uint32_t align = 0;
+            size = _monoClassValueSize(s_detailKlass, &align);
+        }
+        if (size <= 0 || size > 512) size = 64;
+        fallback.assign((size_t) size, 0);
+        detailData = fallback.data();
+    }
+    if (detailObj) {
+        // 与 PC 版一致：完美照片 = ActionStar 4 + IsPerfectStar true + 姿势
+        int actionStar = 4;
+        bool perfect = true;
+        int actionType = (target.pose >= 0 && target.pose <= 5) ? target.pose : 0;
+        uint32_t standNetId = target.standNetId;
+        if (s_fActionStar) _monoFieldSetValue(detailObj, s_fActionStar, &actionStar);
+        if (s_fPerfectStar) _monoFieldSetValue(detailObj, s_fPerfectStar, &perfect);
+        if (s_fActionType) _monoFieldSetValue(detailObj, s_fActionType, &actionType);
+        if (s_fStandNetId && standNetId != 0) _monoFieldSetValue(detailObj, s_fStandNetId, &standNetId);
+    }
+
     int staticId = target.staticId;
-    uint8_t success = 1;
-    uint32_t netId = target.birdNetId;
-    void *args[] = {&staticId, &success, &detail, &netId};
-    void *exc = nullptr;
+    int usePhoto = 1;
+    uint32_t resolvedNetId = (target.standNetId == 0) ? target.birdNetId : 0;
+    void* args4[] = {&staticId, &usePhoto, detailData, &resolvedNetId};
+    void* args3[] = {&staticId, &usePhoto, detailData};
+    void* args5[] = {&staticId, &usePhoto, detailData, &resolvedNetId, &usePhoto};
+    void** args = (s_arity == 3) ? args3 : ((s_arity >= 5) ? args5 : args4);
+
+    void* exc = nullptr;
     g_birdRequestPending.store(g_birdCounterAvailable, std::memory_order_release);
     g_birdRequestSentAt = BirdNowMs();
-    _monoRuntimeInvoke(method, nullptr, args, &exc);
+    _monoRuntimeInvoke(s_method, nullptr, args, &exc);
     if (exc) {
         g_birdRequestPending.store(false, std::memory_order_release);
+        g_birdFarmStatus = u8"拍照协议异常";
+        SMPlatform::SetBreadcrumbLight("bird:sendexc");
         return false;
     }
     ++g_birdLocalPhotoAttempts;
     g_birdPhotoAttempts[target.birdNetId] = g_birdLocalPhotoAttempts;
-    LOGI("[BirdWatch] sent static=%d net=%u pose=%d stand=%u count=%d/%d attempts=%d counter=%d",
-         staticId, netId, detail.BirdActionType, detail.BirdStandNetId,
+    SMPlatform::SetBreadcrumbLight("bird:sent");
+    LOGI("[BirdWatch] sent static=%d net=%u pose=%d stand=%u count=%d/%d attempts=%d arity=%d",
+         staticId, resolvedNetId, target.pose, target.standNetId,
          g_birdObservedPhotoCount, g_birdTargetPhotoMaxCount,
-         g_birdLocalPhotoAttempts, g_birdCounterAvailable ? 1 : 0);
+         g_birdLocalPhotoAttempts, s_arity);
     return true;
 }
 
