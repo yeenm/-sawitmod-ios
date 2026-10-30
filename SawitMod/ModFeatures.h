@@ -47,6 +47,7 @@ void AutoCookBatchRoutine(int recipeId);
 void FailedCookRoutine();
 void HelperCookRoutine();
 void ProcessBirdWatchingNative();
+void ScareCurrentBirdNative();   // 手动吓走当前拍鸟目标（菜单按钮）
 
 // --- Anti AFK ---
 void AntiAfkRoutine();

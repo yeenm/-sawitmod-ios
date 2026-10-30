@@ -29,6 +29,8 @@ SKIP = {
     "g_RequestedUiScale", "g_RealScreenWidth", "g_RealScreenHeight",
     "g_AppInForeground", "g_GameWorldReady", "g_unityFramePumpReady",
     "g_premiumWoodOnePass",
+    "g_birdScaredCount",
+    "g_birdAutoScareMaxed",
     "g_birdCatchCooldown",
     "g_birdScanRange",
     "g_birdMinPhotoDist",

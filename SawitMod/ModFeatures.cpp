@@ -3574,6 +3574,99 @@ static int ReadBirdPhotoMaxCount(int staticId) {
     return -1;
 }
 
+
+// ============================================================================
+//  上限鸟自动吓走（PC 版 HeartopiaComplete.BirdFarm.cs 的 MaxPhoto auto-scare）
+// ----------------------------------------------------------------------------
+//  PC 版检测到 BirdErrorCode.MaxPhoto(15) 后：
+//    1) 取最近一次拍照的鸟 netId；
+//    2) BirdProtocolManager.BirdEscape(netId, delayMilliSec)（1/2 参都试）；
+//    3) 失败再 RemoveBird(netId)；
+//    4) 成功就把这只鸟加入"最近已处理"，20 秒内不再拍它。
+//  iOS 侧载没有事件 hook，改用拍前/拍后状态判断上限（见 ProcessBirdWatchingNative），
+//  协议调用与 PC 版保持一致。
+// ============================================================================
+static void *s_birdScareProtoKlass = nullptr;
+static void *s_birdEscapeMethod = nullptr;
+static int s_birdEscapeArity = 0;
+static void *s_birdRemoveMethod = nullptr;
+static int s_birdRemoveArity = 0;
+
+static bool TryScareBirdAway(uint32_t birdNetId) {
+    if (birdNetId == 0) return false;
+    // 同一只鸟 2 秒内只发一次，避免循环里重复调用（与 PC 版节流一致）
+    static std::unordered_map<uint32_t, uint64_t> s_lastScareAt;
+    const uint64_t now = BirdNowMs();
+    auto it = s_lastScareAt.find(birdNetId);
+    if (it != s_lastScareAt.end() && now - it->second < 2000) return false;
+    s_lastScareAt[birdNetId] = now;
+
+    if (!s_birdScareProtoKlass) {
+        static const char *kImages[] = {"XDTDataAndProtocol", "XDTDataAndProtocol.dll"};
+        s_birdScareProtoKlass = MonoApi::FindClass(
+                kImages, 2, OBFUSCATE("XDTDataAndProtocol.ProtocolService.GamePlay.Bird"),
+                OBFUSCATE("BirdProtocolManager"));
+        if (!s_birdScareProtoKlass) {
+            static const char *kAny[] = {"XDTDataAndProtocol", "EcsClient", "XDTLevelAndEntity"};
+            s_birdScareProtoKlass = MonoApi::FindClass(
+                    kAny, 3, OBFUSCATE("XDTDataAndProtocol.ProtocolService.GamePlay.Bird"),
+                    OBFUSCATE("BirdProtocolManager"), nullptr, true);
+        }
+    }
+    if (s_birdScareProtoKlass) {
+        if (!s_birdEscapeMethod) {
+            for (int arity : {2, 1}) {
+                void *m = FindMethodInHierarchy(s_birdScareProtoKlass,
+                                                OBFUSCATE("BirdEscape"), arity);
+                if (m) {
+                    s_birdEscapeMethod = m;
+                    s_birdEscapeArity = MonoApi::MethodParamCount(m);
+                    if (s_birdEscapeArity <= 0) s_birdEscapeArity = arity;
+                    break;
+                }
+            }
+        }
+        if (!s_birdRemoveMethod) {
+            for (int arity : {1, 2}) {
+                void *m = FindMethodInHierarchy(s_birdScareProtoKlass,
+                                                OBFUSCATE("RemoveBird"), arity);
+                if (m) {
+                    s_birdRemoveMethod = m;
+                    s_birdRemoveArity = MonoApi::MethodParamCount(m);
+                    if (s_birdRemoveArity <= 0) s_birdRemoveArity = arity;
+                    break;
+                }
+            }
+        }
+    }
+
+    bool ok = false;
+    uint32_t netId = birdNetId;
+    int delayMs = 0;
+    if (s_birdEscapeMethod) {
+        void *args[2] = {&netId, &delayMs};
+        void *exc = nullptr;
+        _monoRuntimeInvoke(s_birdEscapeMethod, nullptr,
+                           (s_birdEscapeArity >= 2) ? args : args, &exc);
+        ok = (exc == nullptr);
+        LOGI("[BirdWatch] scare escape net=%u arity=%d ok=%d", birdNetId,
+             s_birdEscapeArity, ok ? 1 : 0);
+    }
+    if (!ok && s_birdRemoveMethod) {
+        void *args[1] = {&netId};
+        void *exc = nullptr;
+        _monoRuntimeInvoke(s_birdRemoveMethod, nullptr, args, &exc);
+        ok = (exc == nullptr);
+        LOGI("[BirdWatch] scare remove net=%u arity=%d ok=%d", birdNetId,
+             s_birdRemoveArity, ok ? 1 : 0);
+    }
+    if (ok) {
+        g_processedBirds.insert(birdNetId);
+        ++g_birdScaredCount;
+        SMPlatform::SetBreadcrumbLight("bird:scared");
+    }
+    return ok;
+}
 static void ResetBirdTarget(const char *status, uint64_t delayMs) {
     g_birdCurrentTarget = {};
     g_birdRequestPending.store(false, std::memory_order_release);
@@ -3922,6 +4015,10 @@ void ProcessBirdWatchingNative() {
 
             if (g_birdTargetPhotoMaxCount > 0 &&
                 currentCount >= g_birdTargetPhotoMaxCount) {
+                // 到上限：这只鸟再拍也是 MaxPhoto 错误，按 PC 版做法直接吓走。
+                if (g_birdAutoScareMaxed) {
+                    TryScareBirdAway(g_birdCurrentTarget.birdNetId);
+                }
                 g_processedBirds.insert(g_birdCurrentTarget.birdNetId);
                 ResetBirdTarget("TARGET LIMIT REACHED",
                                 (uint64_t) (g_birdCatchCooldown * 1000.0f));
@@ -3938,7 +4035,20 @@ void ProcessBirdWatchingNative() {
         if (now - g_birdRequestSentAt >= 8000) {
             g_birdRequestPending.store(false, std::memory_order_release);
             ++g_birdRetryCount;
-            if (g_birdRetryCount >= 3) {
+            // 计数没涨通常就是服务端回了 MaxPhoto（这只鸟已拍满）。
+            // 投影次数 = 已记录次数 + 本轮已重试次数；一碰上限就立刻吓走，避免继续拍。
+            const int projected = g_birdObservedPhotoCount + g_birdRetryCount;
+            if (g_birdTargetPhotoMaxCount > 0 && projected >= g_birdTargetPhotoMaxCount) {
+                if (g_birdAutoScareMaxed) {
+                    TryScareBirdAway(g_birdCurrentTarget.birdNetId);
+                }
+                g_processedBirds.insert(g_birdCurrentTarget.birdNetId);
+                ResetBirdTarget("TARGET LIMIT REACHED", 1500);
+            } else if (g_birdRetryCount >= 3) {
+                // 连续三次计数不涨、且无法确认上限：仍然当上限鸟处理（PC 版也是保守吓走）。
+                if (g_birdAutoScareMaxed) {
+                    TryScareBirdAway(g_birdCurrentTarget.birdNetId);
+                }
                 g_processedBirds.insert(g_birdCurrentTarget.birdNetId);
                 ResetBirdTarget("PHOTO COUNT TIMEOUT", 1500);
             } else {
@@ -3995,6 +4105,7 @@ void ProcessBirdWatchingNative() {
         int existingAttempts = (it != g_birdPhotoAttempts.end()) ? it->second : 0;
 
         if (counterReady && photoCount >= maxCount) {
+            if (g_birdAutoScareMaxed) TryScareBirdAway(target.birdNetId);
             g_processedBirds.insert(target.birdNetId);
             g_birdPhotoAttempts[target.birdNetId] = photoCount;
             g_birdFarmStatus = u8"已达目标上限";
@@ -4004,6 +4115,7 @@ void ProcessBirdWatchingNative() {
         }
 
         if (!counterReady && existingAttempts >= maxCount) {
+            if (g_birdAutoScareMaxed) TryScareBirdAway(target.birdNetId);
             g_processedBirds.insert(target.birdNetId);
             g_birdFarmStatus = u8"已达目标上限";
             g_birdNextActionAt = now +
@@ -4036,6 +4148,9 @@ void ProcessBirdWatchingNative() {
 
     if (!g_birdCounterAvailable) {
         if (g_birdLocalPhotoAttempts >= g_birdTargetPhotoMaxCount) {
+            if (g_birdAutoScareMaxed) {
+                TryScareBirdAway(g_birdCurrentTarget.birdNetId);
+            }
             g_processedBirds.insert(g_birdCurrentTarget.birdNetId);
             ResetBirdTarget("TARGET LIMIT REACHED",
                             (uint64_t) (g_birdCatchCooldown * 1000.0f));
@@ -4046,6 +4161,15 @@ void ProcessBirdWatchingNative() {
             g_birdNextActionAt = now +
                     (uint64_t) (g_birdInvokeCooldown * 1000.0f);
         }
+    }
+}
+
+
+// 手上已没有可用上限信息时的兜底：直接吓走当前目标（菜单"吓走当前目标"按钮用）
+void ScareCurrentBirdNative() {
+    const uint32_t netId = g_birdCurrentTarget.birdNetId;
+    if (netId != 0 && TryScareBirdAway(netId)) {
+        ResetBirdTarget("SCARED AWAY", (uint64_t) (g_birdCatchCooldown * 1000.0f));
     }
 }
 

@@ -19,6 +19,10 @@ float g_birdInvokeCooldown = 1.0f;
 int g_pumpkinScore = 100;
 int g_pumpkinScoreCount = 4;
 
+// 拍鸟：上限鸟自动吓走（默认开，PC 版 BirdFarmConfigData 默认也是 true）
+bool g_birdAutoScareMaxed = true;
+int g_birdScaredCount = 0;
+
 
 
 // Instant Farm 的 18 种资源：顺序必须与 NUM_RESOURCES / g_farmSelections 一致。

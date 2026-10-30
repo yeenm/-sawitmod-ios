@@ -1361,6 +1361,16 @@ void DrawMenu() {
             if (ImGui::Button(Tr("Reset History", u8"重置历史"))) {
                 ResetBirdHistory();
             }
+            if (ImGui::Checkbox(Tr("Auto Scare Maxed Birds", u8"自动吓走上限鸟类"),
+                                &g_birdAutoScareMaxed)) {
+                // 对齐 PC 版 autoScareMaxPhotoEnabled：拍到上限的鸟用 BirdEscape/RemoveBird
+                // 吓走，避免上限之后继续对同一只鸟拍（服务端只会一直回 MaxPhoto 错误）。
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled(Tr("Scared: %d", u8"已吓走: %d"), g_birdScaredCount);
+            if (ImGui::Button(Tr("Scare Current Target", u8"吓走当前目标"), ImVec2(-1, 32))) {
+                RunOnUnityThreadAsync([]() { ScareCurrentBirdNative(); });
+            }
             ImGui::TextDisabled(u8"状态: %s | 成功: %d | 完成: %d",
                                 g_birdFarmStatus.c_str(), g_birdSuccessCount,
                                 (int) g_processedBirds.size());

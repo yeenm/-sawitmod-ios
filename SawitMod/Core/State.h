@@ -548,6 +548,9 @@ extern uint64_t g_birdRequestSentAt;
 extern uint64_t g_birdNextActionAt;
 extern int g_birdSuccessCount;
 extern int g_birdRetryCount;
+// 拍鸟：拍到上限的鸟自动用 BirdEscape/RemoveBird 吓走（对齐 PC 版 autoScareMaxPhotoEnabled）
+extern bool g_birdAutoScareMaxed;
+extern int g_birdScaredCount;   // 本会话吓走成功次数
 extern std::string g_birdFarmStatus;
 extern int g_insectCatchLimit;
 extern bool g_testAutoCatch;
