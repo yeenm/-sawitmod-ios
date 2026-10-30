@@ -1,13 +1,17 @@
-﻿# ============================================================================
-#  SawitMod (iOS) 鈥?Theos 鏋勫缓鑴氭湰
+# ============================================================================
+#  SawitMod (iOS) — Theos 构建脚本
 # ----------------------------------------------------------------------------
-#  浜х墿锛氫竴涓敞鍏ュ紡 dylib锛?theos/obj/SawitMod.dylib锛夛紝濉炶繘 iOS 鐗堟父鎴忕殑
-#  .app 閲屽嵆鍙€備笉渚濊禆 CydiaSubstrate/ElleKit 鈥斺€?hook 鐢?Dobby锛屽叆鍙ｇ敤
-#  __attribute__((constructor))銆?#
-#  渚濊禆锛?#    * Theos锛坔ttps://theos.dev锛変笌 iOS SDK锛圶code锛?#    * Dobby 鐨?iOS arm64 闈欐€佸簱锛歋awitMod/ThirdParty/Dobby/libdobby.a
-#      锛堢紪璇戞柟娉曡 docs/鏋勫缓涓庢敞鍏?md锛?#
-#  鏋勫缓锛? make clean && make
-#  璋冭瘯锛? make DEBUG=1
+#  产物：一个注入式 dylib（.theos/obj/SawitMod.dylib），塞进 iOS 版游戏的
+#  .app 里即可。不依赖 CydiaSubstrate/ElleKit —— hook 用 Dobby，入口用
+#  __attribute__((constructor))。
+#
+#  依赖：
+#    * Theos（https://theos.dev）与 iOS SDK（Xcode）
+#    * Dobby 的 iOS arm64 静态库：SawitMod/ThirdParty/Dobby/libdobby.a
+#      （编译方法见 docs/构建与注入.md）
+#
+#  构建：  make clean && make
+#  调试：  make DEBUG=1
 # ============================================================================
 
 export TARGET = iphone:clang:latest:13.0
@@ -19,10 +23,10 @@ LIBRARY_NAME = SawitMod
 
 SAWIT_DIR := $(THEOS_PROJECT_DIR)/SawitMod
 
-# 鎵€鏈?C/C++/ObjC 婧愭枃浠讹紙tests/ 涓嬬殑鑷绋嬪簭涓嶅弬涓庢瀯寤猴級
+# 所有 C/C++/ObjC 源文件（tests/ 下的自检程序不参与构建）
 SawitMod_FILES = $(shell find $(SAWIT_DIR) -type f \( -name '*.cpp' -o -name '*.mm' -o -name '*.m' -o -name '*.c' \) ! -path '*/tests/*')
 
-# ---- 鏋勫缓寮€鍏筹紙涓?Android.mk 瀵归綈锛?---
+# ---- 构建开关（与 Android.mk 对齐）----
 SAWIT_OFFLINE_MODE ?= 1
 SAWIT_LOCAL_FEATURES ?= $(SAWIT_OFFLINE_MODE)
 SAWIT_LOCAL_PAYLOAD_ONLY ?= $(SAWIT_OFFLINE_MODE)
@@ -59,10 +63,11 @@ SawitMod_LDFLAGS = \
 
 include $(THEOS_MAKE_PATH)/library.mk
 
-# Dobby 鏄繀椤荤殑澶栭儴渚濊禆锛氱己浜嗙洿鎺ョ粰涓€鍙ヤ汉璇濓紝鑰屼笉鏄閾炬帴鍣ㄥ悙 400 琛?undefined銆?before-all::
+# Dobby 是必须的外部依赖：缺了直接给一句人话，而不是让链接器吐 400 行 undefined。
+before-all::
 	@test -f "$(SAWIT_DIR)/ThirdParty/Dobby/libdobby.a" || \
 		(echo ""; \
-		 echo "  [SawitMod] 缂哄皯 Dobby 闈欐€佸簱锛?; \
+		 echo "  [SawitMod] 缺少 Dobby 静态库："; \
 		 echo "             $(SAWIT_DIR)/ThirdParty/Dobby/libdobby.a"; \
-		 echo "             缂栬瘧鏂规硶瑙?docs/鏋勫缓涓庢敞鍏?md 鐨勩€孌obby銆嶄竴鑺傘€?; \
+		 echo "             编译方法见 docs/构建与注入.md 的「Dobby」一节。"; \
 		 echo ""; exit 1)
