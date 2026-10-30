@@ -84,3 +84,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# CI_BUILD_TRIGGER: macos runner switch rebuild trigger
