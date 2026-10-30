@@ -16,6 +16,7 @@ on:
     paths:
       - 'SawitMod/**'
       - 'scripts/**'
+      - 'Makefile'
       - '.github/workflows/build-ios.yml'
 
 jobs:
