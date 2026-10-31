@@ -20,6 +20,31 @@ int g_pumpkinScore = 100;
 int g_pumpkinScoreCount = 4;
 
 // 拍鸟：上限鸟自动吓走（默认开，PC 版 BirdFarmConfigData 默认也是 true）
+
+// ---- 自动钓鱼 / 鱼饵 / 打窝球默认值（对齐安卓 Main.cpp）----
+// iOS 生成器默认把 int/float 初始化成 0：g_autoFishBiteTimeoutTicks=0 会让
+// “咬钩超时”变成 0ms，等待咬钩阶段第一帧就判超时 → 立即收杆重抛（随机收杆的根因）。
+int g_autoFishRodId = 3;
+float g_autoFishRadius = 40.0f;
+bool g_autoFishTeleport = true;
+float g_autoFishGap = 10.0f;
+int g_autoFishCatchGraceTicks = 12;
+int g_autoFishBiteTimeoutTicks = 40;
+int g_autoFishEquipDelayTicks = 5;
+bool g_autoFishHoverBetweenCasts = false;
+float g_autoFishHoverOriginalGravity = -9.8f;
+bool g_autoFishSkipCastAnim = true;
+bool g_autoFishSkipCatchAnim = true;
+std::string g_autoFishStatus = u8"空闲";
+std::string g_autoFishTargetStatus = u8"无";
+bool isInstantFishing = false;
+float g_fishThrowDist = 2.0f;
+int g_lureBallCooldownSec = 60;
+std::string g_lureBallStatus = u8"就绪";
+int g_fishBaitIntervalMs = 20;
+std::string g_fishBaitStatus = u8"就绪";
+std::string g_fishBaitStatusZh = u8"就绪";
+
 bool g_birdAutoScareMaxed = true;
 int g_birdScaredCount = 0;
 

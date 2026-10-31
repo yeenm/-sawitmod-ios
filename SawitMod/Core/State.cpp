@@ -81,23 +81,10 @@ bool g_autoQuestCutsceneSkip;
 std::atomic<int> g_questFollowStatus;
 bool g_autoFishingActive;
 std::atomic<uint32_t> g_autoFishingGeneration;
-int g_autoFishRodId;
-float g_autoFishRadius;
-bool g_autoFishTeleport;
-float g_autoFishGap;
-int g_autoFishCatchGraceTicks;
-int g_autoFishBiteTimeoutTicks;
-int g_autoFishEquipDelayTicks;
-bool g_autoFishHoverBetweenCasts;
 bool g_autoFishHoverGravitySaved;
-float g_autoFishHoverOriginalGravity;
 bool g_autoFishHoverAnchorValid;
 float g_autoFishHoverAnchorY;
-bool g_autoFishSkipCastAnim;
-bool g_autoFishSkipCatchAnim;
 int g_autoFishSessionCatches;
-std::string g_autoFishStatus;
-std::string g_autoFishTargetStatus;
 std::vector<FoodItem> g_foodList;
 std::mutex g_foodListMutex;
 bool g_autoEatActive;
@@ -206,23 +193,16 @@ int g_birdRetryCount;
 std::string g_birdFarmStatus;
 int g_insectCatchLimit;
 bool g_testAutoCatch;
-bool isInstantFishing;
-float g_fishThrowDist;
 bool g_autoLureBallActive;
-int g_lureBallCooldownSec;
 std::atomic<uint64_t> g_lureBallCooldownUntilMs;
 std::atomic<bool> g_lureBallBusy;
 std::atomic<uint32_t> g_lureBallLoopGeneration;
 std::mutex g_lureBallMutex;
-std::string g_lureBallStatus;
 int g_lureBallCount;
 bool g_autoFishBaitActive;
-int g_fishBaitIntervalMs;
 std::atomic<bool> g_fishBaitBusy;
 std::atomic<uint32_t> g_fishBaitLoopGeneration;
 std::mutex g_fishBaitMutex;
-std::string g_fishBaitStatus;
-std::string g_fishBaitStatusZh;
 bool g_fishBaitEmpty;
 int g_fishBaitCount;
 int g_fishBaitCurrentStackCount;
@@ -318,6 +298,31 @@ int g_pumpkinScore = 100;
 int g_pumpkinScoreCount = 4;
 
 // 拍鸟：上限鸟自动吓走（默认开，PC 版 BirdFarmConfigData 默认也是 true）
+
+// ---- 自动钓鱼 / 鱼饵 / 打窝球默认值（对齐安卓 Main.cpp）----
+// iOS 生成器默认把 int/float 初始化成 0：g_autoFishBiteTimeoutTicks=0 会让
+// “咬钩超时”变成 0ms，等待咬钩阶段第一帧就判超时 → 立即收杆重抛（随机收杆的根因）。
+int g_autoFishRodId = 3;
+float g_autoFishRadius = 40.0f;
+bool g_autoFishTeleport = true;
+float g_autoFishGap = 10.0f;
+int g_autoFishCatchGraceTicks = 12;
+int g_autoFishBiteTimeoutTicks = 40;
+int g_autoFishEquipDelayTicks = 5;
+bool g_autoFishHoverBetweenCasts = false;
+float g_autoFishHoverOriginalGravity = -9.8f;
+bool g_autoFishSkipCastAnim = true;
+bool g_autoFishSkipCatchAnim = true;
+std::string g_autoFishStatus = u8"空闲";
+std::string g_autoFishTargetStatus = u8"无";
+bool isInstantFishing = false;
+float g_fishThrowDist = 2.0f;
+int g_lureBallCooldownSec = 60;
+std::string g_lureBallStatus = u8"就绪";
+int g_fishBaitIntervalMs = 20;
+std::string g_fishBaitStatus = u8"就绪";
+std::string g_fishBaitStatusZh = u8"就绪";
+
 bool g_birdAutoScareMaxed = true;
 int g_birdScaredCount = 0;
 

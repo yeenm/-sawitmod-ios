@@ -11584,6 +11584,9 @@ void AutoFishingLoop(uint32_t generation) {
     int lastDiagPhase = -1, lastDiagFsm = -10000, lastDiagInFishing = -10000;
     int lastDiagFishState = -10000;
     uint32_t lastDiagFloat = UINT32_MAX;
+    // 收杆/失败判定去抖：状态读取抖动一帧不能当成"鱼跑了/钓到了"立刻收杆
+    int catchConfirm = 0, failConfirm = 0, goneConfirm = 0;
+    bool exitSent = false;
 
     while (g_autoFishingActive &&
            g_autoFishingGeneration.load(std::memory_order_acquire) == generation) {
@@ -11595,9 +11598,10 @@ void AutoFishingLoop(uint32_t generation) {
         RunOnUnityThreadSync([&]() {
             _monoThreadAttach(_monoGetRootDomain());
 
-            const uint64_t equipDelayMs = (uint64_t) g_autoFishEquipDelayTicks * 200;
-            const uint64_t biteTimeoutMs = (uint64_t) g_autoFishBiteTimeoutTicks * 200;   // 8s default
-            const uint64_t cooldownMs = (uint64_t) g_autoFishCatchGraceTicks * 200;
+            // 下限保护：即使配置被清零，也不能让咬钩超时变成 0ms（否则第一帧就收杆）
+            const uint64_t equipDelayMs = std::max<uint64_t>(800, (uint64_t) g_autoFishEquipDelayTicks * 200);
+            const uint64_t biteTimeoutMs = std::max<uint64_t>(4000, (uint64_t) g_autoFishBiteTimeoutTicks * 200);
+            const uint64_t cooldownMs = std::min<uint64_t>(3000, std::max<uint64_t>(300, (uint64_t) g_autoFishCatchGraceTicks * 200));
             const uint64_t respStuckMs = biteTimeoutMs + 12000;
 
             uint64_t now = NowMs();
@@ -11627,6 +11631,8 @@ void AutoFishingLoop(uint32_t generation) {
                     castCrossfaded = false;
                     spinSeenCount = 0;
                 }
+                if (phase == 3) { catchConfirm = 0; failConfirm = 0; goneConfirm = 0; }
+                if (phase == 4) { exitSent = false; }
             }
             uint64_t elapsed = now - phaseStart;
 
@@ -11774,6 +11780,10 @@ void AutoFishingLoop(uint32_t generation) {
                 if (myFloat == 0) {
                     if (fs.valid && fs.inFishingState != 0) {
                         myFloat = fs.rodNetId ? fs.rodNetId : 1;
+                    } else if (!fs.valid && elapsed < 2000) {
+                        // 刚抛竿/切场景时读不到玩家状态是正常的：先等，别把竿收起来
+                        g_autoFishStatus = u8"等待状态";
+                        break;
                     } else {
                         cancelOnReset = false; phase = 4; break;
                     }
@@ -11829,7 +11839,11 @@ void AutoFishingLoop(uint32_t generation) {
 
                 if (responded) {
                     // Caught! (FishShadowAiState.Succeed == 6 or FishingSubState.FishingSucc == 5)
-                    if (st == 6 || (fs.valid && fs.fishState == 5)) {
+                    // 连续两帧确认，避免状态读抖动时误判"已钓到"而收杆
+                    const bool catchNow = (st == 6) || (fs.valid && fs.fishState == 5);
+                    catchConfirm = catchNow ? (catchConfirm + 1) : 0;
+                    if (catchConfirm >= 2) {
+                        catchConfirm = 0;
                         PullFishingRodNative(false);
                         rodPulled = false;
                         tensionHoldingRelease = false;
@@ -11841,11 +11855,10 @@ void AutoFishingLoop(uint32_t generation) {
                         g_autoFishStatus = catchBuf;
                         LOGI((const char *) OBFUSCATE("[AutoFish] TERTANGKAP (st=%u fss=%d, total=%d)"), st, fs.fishState, g_autoFishSessionCatches);
 
-                        // Clean up fishing state on catch
-                        TakeUpRodNative(0);
-                        CancelFishingNative();
+                        // 收杆/取消交给 phase 4 统一发一次（这里重复发会把刚收的竿又切换一次，
+                        // 表现为"莫名其妙自己收杆/放竿"）。
                         if (g_autoFishSkipCatchAnim) {
-                            LOGI((const char *) OBFUSCATE("[AutoFish] Skip catch animation: TakeUpRod & Cancel sent"));
+                            LOGI((const char *) OBFUSCATE("[AutoFish] catch confirmed -> exit/recast"));
                         }
 
                         cancelOnReset = false;
@@ -11889,8 +11902,10 @@ void AutoFishingLoop(uint32_t generation) {
                     // FishingSubState: 3 = FishingFail, 4 = BattleFailSlack
                     // FishShadowAiState: 7 = RunAway (only when not in active Battle/Succ)
                     bool battleFailed = fs.valid && (fs.fishState == 3 || fs.fishState == 4);
-                    bool fishRanAway = (st == 7) && (!fs.valid || (fs.fishState != 2 && fs.fishState != 5));
-                    if (battleFailed || fishRanAway) {
+                    bool fishRanAway = fs.valid && (st == 7) && (fs.fishState != 2 && fs.fishState != 5);
+                    failConfirm = (battleFailed || fishRanAway) ? (failConfirm + 1) : 0;
+                    if (failConfirm >= 2) {
+                        failConfirm = 0;
                         PullFishingRodNative(false);
                         rodPulled = false;
                         tensionHoldingRelease = false;
@@ -11901,7 +11916,8 @@ void AutoFishingLoop(uint32_t generation) {
                         break;
                     }
 
-                    if (wasFishing && fsm == 1 && (!fs.valid || fs.inFishingState == 0)) {
+                    if (wasFishing && fsm == 1 && fs.valid && fs.inFishingState == 0 &&
+                        elapsed > 500) {
                         PullFishingRodNative(false);
                         rodPulled = false;
                         tensionHoldingRelease = false;
@@ -11922,7 +11938,11 @@ void AutoFishingLoop(uint32_t generation) {
                 }
                 else {
                     // Also check if fish ran away or fishing failed before strike
-                    if ((fs.valid && (fs.fishState == 3 || fs.fishState == 4)) || (st == 7 && (fs.valid && fs.baitNetId == cachedFish))) {
+                    const bool preFail = (fs.valid && (fs.fishState == 3 || fs.fishState == 4)) ||
+                                         (fs.valid && st == 7 && fs.baitNetId == cachedFish);
+                    goneConfirm = preFail ? (goneConfirm + 1) : 0;
+                    if (goneConfirm >= 2) {
+                        goneConfirm = 0;
                         LOGI((const char *) OBFUSCATE("[AutoFish] gagal sebelum strike (st=%u fss=%d) -> recast"), st, fs.fishState);
                         cancelOnReset = true;
                         phase = 4;
@@ -11955,9 +11975,13 @@ void AutoFishingLoop(uint32_t generation) {
 
                 if (exitAfterCatch) {
                     g_autoFishStatus = u8"重新抛竿";
-                    // Send exit & reset
-                    TakeUpRodNative(0);
-                    CancelFishingNative();
+                    // 只发一次：原来每帧都发 TakeUpRod/Cancel，会把正在收的竿反复切换，
+                    // 表现为"自动钓鱼莫名其妙收杆"。
+                    if (!exitSent) {
+                        exitSent = true;
+                        TakeUpRodNative(0);
+                        CancelFishingNative();
+                    }
 
                     // Fast recast delay: 30ms if skip animation is enabled, otherwise 100ms
                     const uint64_t recastDelay = (g_autoFishSkipCastAnim || g_autoFishSkipCatchAnim) ? 30 : 100;
