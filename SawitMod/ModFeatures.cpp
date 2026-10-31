@@ -8925,7 +8925,13 @@ static void UpdateFishShadowPositionNative(uint32_t fishNetId, Vector3 pos) {
     void *args[] = { &n, &p }; void *exc = nullptr;
     _monoRuntimeInvoke(m, nullptr, args, &exc);
 }
+// 枚举当前 LevelData 里所有实体 netId。
+// 注意：不要手写 Dictionary 的 Entry 布局。Dictionary<NetId,EntityId> 的 Entry 是
+// hashCode4 + next4 + NetId4 + EntityId8 = 20 字节（NetId/EntityId 都是小结构体，
+// 没有 8 字节对齐填充）；而 Dictionary<int,void*> 才是 24 字节。旧代码统一按 24 读，
+// 对 _netEntitiesMap 会全部错位 → 鱼影扫描永远为空。
 static void GetAllNetIds(std::vector<uint32_t> &out) {
+    out.clear();
     void *imgData = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol"));
     if (!imgData) return;
     void *dcKlass = _monoClassFromName(imgData, OBFUSCATE("XDTDataAndProtocol.ComponentsData"), OBFUSCATE("DataCenter"));
@@ -8935,26 +8941,73 @@ static void GetAllNetIds(std::vector<uint32_t> &out) {
     void *cur = _monoRuntimeInvoke(m_getCur, nullptr, nullptr, &exc);
     if (!cur || exc) return;
     void *sysKlass = _monoObjectGetClass(cur);
-    void *f_map = _monoClassGetFieldFromName(sysKlass, OBFUSCATE("_netEntitiesMap"));
+    void *f_map = sysKlass ? _monoClassGetFieldFromName(sysKlass, OBFUSCATE("_netEntitiesMap")) : nullptr;
     if (!f_map) return;
-    void *dict = nullptr; _monoFieldGetValue(cur, f_map, &dict);
+    void *dict = nullptr;
+    _monoFieldGetValue(cur, f_map, &dict);
     if (!dict) return;
-    void *dk = _monoObjectGetClass(dict);
-    void *f_e = _monoClassGetFieldFromName(dk, OBFUSCATE("entries"));
-    if (!f_e) f_e = _monoClassGetFieldFromName(dk, OBFUSCATE("_entries"));
-    if (!f_e) return;
-    void *arr = nullptr; _monoFieldGetValue(dict, f_e, &arr);
-    if (!arr) return;
-    uintptr_t a = (uintptr_t) arr;
-    int len = SafeRead<int>(a + OFF_ARR_COUNT, 0);
-    if (len <= 0 || len > 100000) return;
-    uintptr_t d = a + OFF_ARR_DATA;
-    for (int i = 0; i < len; i++) {
-        uintptr_t e = d + (uintptr_t) i * SZ_DICT_ENTRY;
-        if (SafeRead<int>(e, -1) < 0) continue;
-        uint32_t k = SafeRead<uint32_t>(e + OFF_ENTRY_KEY, 0);
-        if (k) out.push_back(k);
+
+    // ---- 方案 A（首选，布局无关）：get_Keys → KeyCollection.CopyTo(NetId[], 0) ----
+    {
+        void *dictKlass = _monoObjectGetClass(dict);
+        void *m_keys = dictKlass ? FindMethodInHierarchy(dictKlass, OBFUSCATE("get_Keys"), 0) : nullptr;
+        void *keys = m_keys ? _monoRuntimeInvoke(m_keys, dict, nullptr, nullptr) : nullptr;
+        if (keys) {
+            void *keysKlass = _monoObjectGetClass(keys);
+            void *m_count = keysKlass ? FindMethodInHierarchy(keysKlass, OBFUSCATE("get_Count"), 0) : nullptr;
+            int count = 0;
+            if (m_count) {
+                void *r = _monoRuntimeInvoke(m_count, keys, nullptr, nullptr);
+                if (r) count = *(int *) _monoObjectUnbox(r);
+            }
+            void *m_copy = keysKlass ? FindMethodInHierarchy(keysKlass, OBFUSCATE("CopyTo"), 2) : nullptr;
+            void *ecsImg = _monoImageLoaded(OBFUSCATE("EcsClient"));
+            void *netIdKlass = ecsImg ? _monoClassFromName(ecsImg,
+                    OBFUSCATE("EcsClient.XDT.Scene.Shared.Data.SharedData"), OBFUSCATE("NetId")) : nullptr;
+            if (m_copy && netIdKlass && count > 0 && count < 200000) {
+                void *arr = SMMonoHot::ArrayNew(netIdKlass, (uintptr_t) count);
+                if (arr) {
+                    int zeroIndex = 0;
+                    void *cargs[] = { arr, &zeroIndex };
+                    void *cexc = nullptr;
+                    _monoRuntimeInvoke(m_copy, keys, cargs, &cexc);
+                    if (!cexc) {
+                        const uintptr_t a = (uintptr_t) arr;
+                        const int len = SafeRead<int>(a + OFF_ARR_COUNT, 0);
+                        const uintptr_t data = a + OFF_ARR_DATA;
+                        for (int i = 0; i < len && i < count; ++i) {
+                            uint32_t nid = SafeRead<uint32_t>(data + (uintptr_t) i * 4, 0);
+                            if (nid != 0) out.push_back(nid);
+                        }
+                        if (!out.empty()) return;
+                    }
+                }
+            }
+        }
     }
+
+    // ---- 方案 B（兜底）：直接读 entries，按 20 字节 Entry / key@8 ----
+    void *dk = _monoObjectGetClass(dict);
+    void *f_e = dk ? _monoClassGetFieldFromName(dk, OBFUSCATE("entries")) : nullptr;
+    if (!f_e && dk) f_e = _monoClassGetFieldFromName(dk, OBFUSCATE("_entries"));
+    void *arrObj = nullptr;
+    if (f_e) _monoFieldGetValue(dict, f_e, &arrObj);
+    if (!arrObj) return;
+    const uintptr_t a = (uintptr_t) arrObj;
+    const int len = SafeRead<int>(a + OFF_ARR_COUNT, 0);
+    if (len <= 0 || len > 200000) return;
+    const uintptr_t data = a + OFF_ARR_DATA;
+    auto harvest = [&](int stride, uintptr_t keyOff) {
+        out.clear();
+        for (int i = 0; i < len; ++i) {
+            const uintptr_t e = data + (uintptr_t) i * (uintptr_t) stride;
+            if (SafeRead<int>(e, -1) < 0) continue;
+            uint32_t k = SafeRead<uint32_t>(e + keyOff, 0);
+            if (k != 0) out.push_back(k);
+        }
+    };
+    harvest(20, 8);          // Dictionary<NetId,EntityId>
+    if (out.empty()) harvest(24, 8);  // 兼容旧的/其它布局，最后兜底
 }
 static int GetCurrentToolIdNative() {
     _monoThreadAttach(_monoGetRootDomain());
@@ -11487,8 +11540,77 @@ static Vector3 ComputeStandPos(Vector3 fishPos, Vector3 selfPos, float gap) {
     out.y = selfPos.y;
     return out;
 }
+static int g_lastScanIdCount = 0;
+static int g_lastScanFishCompCount = 0;
+
+// 鱼影 ViewComponent 扫描（备用路线）：
+// 和南瓜/拍鸟一样，通过 GetComponentsOfClass(FishComponent) 拿鱼影视图组件，
+// 直接读组件内联的 FishComponentData 字段，绕开 _netEntitiesMap 内部布局问题。
+static uint32_t ScanNearestFishViaViewComponents(Vector3 ref, float maxDist, float &outDist,
+                                                 Vector3 &outPos, uint32_t ignoreNetId, int *outCompCount) {
+    if (outCompCount) *outCompCount = 0;
+    static void *s_fishKlass = nullptr;
+    static void *s_dataKlass = nullptr;
+    static int s_offShadow = -1, s_offFloat = -1, s_offPlayer = -1, s_offTarget = -1;
+    static bool s_ready = false;
+    if (!s_ready) {
+        s_ready = true;
+        void *imgLevel = _monoImageLoaded(OBFUSCATE("XDTLevelAndEntity"));
+        if (!imgLevel) imgLevel = _monoImageLoaded(OBFUSCATE("XDTLevelAndEntity.dll"));
+        if (imgLevel) {
+            s_fishKlass = _monoClassFromName(imgLevel,
+                    OBFUSCATE("XDTLevelAndEntity.Gameplay.Component.Fish"), OBFUSCATE("FishComponent"));
+        }
+        void *imgData = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol"));
+        if (imgData) {
+            s_dataKlass = _monoClassFromName(imgData,
+                    OBFUSCATE("XDTDataAndProtocol.ComponentsData"), OBFUSCATE("FishComponentData"));
+        }
+        auto structOff = [](void *k, const char *n) -> int {
+            if (!k) return -1;
+            void *f = _monoClassGetFieldFromName(k, n);
+            return f ? (_monoFieldGetOffset(f) - MONO_FIELD_HEADER) : -1;
+        };
+        if (s_dataKlass) {
+            s_offShadow = structOff(s_dataKlass, (const char *) OBFUSCATE("shadowState"));
+            s_offFloat = structOff(s_dataKlass, (const char *) OBFUSCATE("floatNetId"));
+            s_offPlayer = structOff(s_dataKlass, (const char *) OBFUSCATE("playerNetId"));
+            s_offTarget = structOff(s_dataKlass, (const char *) OBFUSCATE("targetPos"));
+        }
+    }
+    if (!s_fishKlass || !s_dataKlass || s_offShadow < 0 || s_offShadow > 96) return 0;
+    auto comps = GetComponentsOfClass(s_fishKlass);
+    if (outCompCount) *outCompCount = (int) comps.size();
+    uint32_t best = 0; float bestD = 1e9f; Vector3 bestPos{};
+    for (void *comp : comps) {
+        if (!comp || !IsValidMonoPointer(comp)) continue;
+        const uint32_t netId = ReadComponentNetId(comp);
+        if (netId == 0 || netId == ignoreNetId) continue;
+        void *fData = _monoClassGetFieldFromName(s_fishKlass, OBFUSCATE("_componentData"));
+        if (!fData) continue;
+        const int baseOff = _monoFieldGetOffset(fData);
+        if (baseOff < 16 || baseOff > 512) continue;
+        const uint8_t *base = (const uint8_t *) comp + baseOff;
+        const uint32_t st = *(const uint32_t *) (base + s_offShadow);
+        if (st >= 4) continue;  // Battle/Escape/Succeed/RunAway
+        if (s_offFloat >= 0 && *(const uint32_t *) (base + s_offFloat) != 0) continue;
+        if (s_offPlayer >= 0 && *(const uint32_t *) (base + s_offPlayer) != 0) continue;
+        Vector3 fp{};
+        if (!GetEntityPosByNetId(netId, fp)) {
+            if (s_offTarget < 0) continue;
+            memcpy(&fp, base + s_offTarget, sizeof(Vector3));
+            if (!std::isfinite(fp.x) || !std::isfinite(fp.y) || !std::isfinite(fp.z)) continue;
+        }
+        const float d = GetVector3Distance(ref, fp);
+        if (d < bestD) { bestD = d; best = netId; bestPos = fp; }
+    }
+    outDist = bestD; outPos = bestPos;
+    return (best != 0 && bestD <= maxDist) ? best : 0;
+}
+
 static uint32_t ScanNearestFish(Vector3 ref, float maxDist, float &outDist, Vector3 &outPos, uint32_t ignoreNetId = 0) {
     std::vector<uint32_t> ids; GetAllNetIds(ids);
+    g_lastScanIdCount = (int) ids.size();
     uint32_t best = 0; float bestD = 1e9f; Vector3 bestPos{};
     for (uint32_t nid : ids) {
         if (ignoreNetId != 0 && nid == ignoreNetId) continue;
@@ -11538,7 +11660,13 @@ static uint32_t ScanNearestFish(Vector3 ref, float maxDist, float &outDist, Vect
         if (d < bestD) { bestD = d; best = nid; bestPos = fp; }
     }
     outDist = bestD; outPos = bestPos;
-    return (best != 0 && bestD <= maxDist) ? best : 0;
+    if (best != 0 && bestD <= maxDist) return best;
+    // ECS 路线没找到鱼：走 ViewComponent 备用扫描（不依赖 _netEntitiesMap 布局）
+    int compCount = 0;
+    const uint32_t viaView = ScanNearestFishViaViewComponents(ref, maxDist, outDist, outPos,
+                                                              ignoreNetId, &compCount);
+    g_lastScanFishCompCount = compCount;
+    return viaView;
 }
 void AutoFishingLoop(uint32_t generation) {
     LOGI((const char *) OBFUSCATE("[AutoFish] STARTED (v18 - Instant Catch & Battle Fix)"));
@@ -11723,7 +11851,12 @@ void AutoFishingLoop(uint32_t generation) {
                     }
                 }
                 else {
-                    g_autoFishTargetStatus = u8"范围内无目标";
+                    {
+                        char nfBuf[96];
+                        snprintf(nfBuf, sizeof(nfBuf), "范围内无目标 (实体 %d / 鱼影组件 %d)",
+                                 g_lastScanIdCount, g_lastScanFishCompCount);
+                        g_autoFishTargetStatus = nfBuf;
+                    }
                     if (now - lastNoFishLog > 3000) { LOGI((const char *) OBFUSCATE("[AutoFish] tak ada ikan dlm radius %.0f"), g_autoFishRadius); lastNoFishLog = now; }
                     phase = 0;
                 }
