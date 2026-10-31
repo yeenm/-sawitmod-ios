@@ -495,18 +495,19 @@ inline FrameInfo BeginChrome(const char* title, const char* brand, bool* minimiz
     dl->AddLine(ImVec2(nav_min.x, nav_max.y), ImVec2(nav_max.x, nav_max.y),
                 U32(kBorder), S(1.f));
 
-    // 页面：0 主页 / 1 功能（免费功能 + 卡密解锁的完整列表）/ 2 公告 / 3 设置
-    // 四页都常显：功能页里免费部分不需要卡密，公告页也不需要。
-    const char* nav_labels[4] = {
+    // 页面：0 主页 / 1 功能 / 2 聊天室 / 3 公告 / 4 设置
+    // 五页都常显：功能页里免费部分不需要卡密，聊天室/公告页也不需要（聊天室未登录时给提示）。
+    const char* nav_labels[5] = {
             *is_english ? "Home" : u8"主页",
             *is_english ? "Features" : u8"功能",
+            *is_english ? "Chat" : u8"聊天室",
             *is_english ? "Notice" : u8"公告",
             *is_english ? "Settings" : u8"设置"};
-    const bool nav_locked[4] = {false, false, false, false};
+    const bool nav_locked[5] = {false, false, false, false, false};
     {
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, S2(12, 4));
         float nav_x = nav_min.x + S(8);
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 5; ++i) {
             if (nav_locked[i] && !features_unlocked) continue;
             const float w = ImGui::CalcTextSize(nav_labels[i]).x + S(28.f);
             NavTab(nav_labels[i], i, nav_x, nav_min.y + S(4), w);
@@ -526,11 +527,13 @@ inline FrameInfo BeginChrome(const char* title, const char* brand, bool* minimiz
     ImVec2 head_max(p.x + sz.x - S(12), nav_max.y + head_h);
     const char* page_title = (tab == 0) ? (*is_english ? "Home" : u8"主页") :
                              (tab == 1) ? (*is_english ? "Features" : u8"功能") :
-                             (tab == 2) ? (*is_english ? "Notice" : u8"公告") :
+                             (tab == 2) ? (*is_english ? "Chat room" : u8"聊天室") :
+                             (tab == 3) ? (*is_english ? "Notice" : u8"公告") :
                              (*is_english ? "Settings" : u8"设置");
     const char* page_sub = (tab == 0) ? (*is_english ? "Card key" : u8"卡密与授权") :
                            (tab == 1) ? (*is_english ? "Feature list" : u8"功能列表") :
-                           (tab == 2) ? (*is_english ? "Server notice" : u8"服务器公告") :
+                           (tab == 2) ? (*is_english ? "Server chat" : u8"服务器聊天") :
+                           (tab == 3) ? (*is_english ? "Server notice" : u8"服务器公告") :
                            (*is_english ? "Interface scale" : u8"界面缩放");
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, tab_alpha);
     TextClip(dl, font_inter, S(19.f), head_min, head_max, U32(kAccent), page_title, ImVec2(0.f, 0.5f));

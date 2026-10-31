@@ -129,3 +129,13 @@ void ShowInput(const std::string &, const std::string &, const std::string &,
                std::function<void(const std::string &)>) {}
 void Toast(const std::string &) {}
 }  // namespace SMAlert
+// ---- 聊天室（真实实现在 App/ChatRoom.mm，属于 ObjC++，不参与 Windows 自检）----
+#include "App/ChatRoom.h"
+namespace SMChatRoom {
+void Tick() {}
+Snapshot GetSnapshot() { return Snapshot{}; }
+void RefreshNow(bool /*forceFullReload*/) {}
+void Send(const std::string & /*text*/) {}
+void ShowInputDialog() {}
+void Reset() {}
+}  // namespace SMChatRoom

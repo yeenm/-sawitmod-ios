@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -27,6 +28,7 @@
 #include "Core/FramePump.h"
 #include "App/OverlayWindow.h"
 #include "App/Platform.h"
+#include "App/ChatRoom.h"      // 聊天室（/api/chat/*）
 #include "ModFeatures.h"
 #include "ModUtils.h"
 #include "Core/State.h"
@@ -68,6 +70,87 @@ static bool CyloneOpenUrl(const char *url) {
     if (url && *url)
         OpenURL(url);
     return true;
+}
+
+
+// ============================================================================
+//  聊天室页（对接面板 /api/chat/*）：Tab 位于「功能」和「公告」之间
+//  - 进入页面即 Tick()，内部 5 秒拉一次增量（after=最后消息id）
+//  - 最新消息显示在最上面（服务端是升序，这里倒序渲染）
+//  - kind == "broadcast" 显示【官方广播】+ 强调色
+// ============================================================================
+static std::string ChatTimeText(long long sec) {
+    if (sec <= 0) return std::string();
+    const std::time_t tt = (std::time_t) sec;
+    std::tm tmv{};
+#if defined(_WIN32)
+    localtime_s(&tmv, &tt);
+#else
+    localtime_r(&tt, &tmv);
+#endif
+    char buf[32] = {0};
+    std::strftime(buf, sizeof(buf), "%m-%d %H:%M", &tmv);
+    return std::string(buf);
+}
+
+static void DrawChatRoomPage() {
+    SMChatRoom::Tick();
+    const SMChatRoom::Snapshot snap = SMChatRoom::GetSnapshot();
+    const bool en = (g_language == LANG_EN);
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ActiveUI::kAccent);
+    ImGui::TextUnformatted(u8"聊天室");
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s%s   · %s %d",
+                        en ? "User: " : u8"用户: ",
+                        snap.me.empty() ? "-" : snap.me.c_str(),
+                        en ? "Online" : u8"在线", snap.online);
+    ImGui::Spacing();
+
+    if (!snap.available) {
+        ImGui::TextWrapped("%s", u8"聊天室需要先登录卡密（服务器按卡密+设备码鉴权）。");
+        if (!snap.error.empty()) ImGui::TextColored(ActiveUI::kErr, "%s", snap.error.c_str());
+        ImGui::Spacing();
+        if (ImGui::Button(u8"去登录卡密##chat_login", ImVec2(-1.0f, ActiveUI::S(38)))) {
+            ActiveUI::tab_stored = 0;
+        }
+        return;
+    }
+
+    const float half = (ImGui::GetContentRegionAvail().x - ActiveUI::S(6)) * 0.5f;
+    if (ImGui::Button(u8"发消息##chat_send", ImVec2(half, ActiveUI::S(38)))) {
+        SMChatRoom::ShowInputDialog();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(u8"刷新##chat_refresh", ImVec2(half, ActiveUI::S(38)))) {
+        SMChatRoom::RefreshNow(true);
+    }
+    if (snap.sending) ImGui::TextDisabled("%s", u8"发送中…");
+    if (!snap.error.empty()) ImGui::TextColored(ActiveUI::kErr, "%s", snap.error.c_str());
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    ImGui::BeginChild("##chat_list", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    if (snap.messages.empty()) {
+        ImGui::TextDisabled("%s", u8"还没有消息，点「发消息」发一条试试。");
+    }
+    for (auto it = snap.messages.rbegin(); it != snap.messages.rend(); ++it) {
+        const bool broadcast = (it->kind == "broadcast");
+        const ImVec4 color = broadcast ? ImVec4(1.00f, 0.72f, 0.20f, 1.00f)
+                                       : ImVec4(0.92f, 0.94f, 0.98f, 1.00f);
+        ImGui::PushStyleColor(ImGuiCol_Text, color);
+        if (broadcast) {
+            ImGui::TextWrapped("%s%s", u8"【官方广播】", it->text.c_str());
+        } else {
+            ImGui::TextWrapped("%s：%s", it->user.c_str(), it->text.c_str());
+        }
+        ImGui::PopStyleColor();
+        const std::string timeText = ChatTimeText(it->ts);
+        if (!timeText.empty()) ImGui::TextDisabled("%s", timeText.c_str());
+        ImGui::Spacing();
+    }
+    ImGui::EndChild();
 }
 
 void DrawMenu() {
@@ -473,6 +556,9 @@ void DrawMenu() {
         ImGui::TextUnformatted(en ? ANDROID_BRAND_FOOTER_EN : ANDROID_BRAND_FOOTER_CN);
         ImGui::PopStyleColor();
     } else if (ActiveUI::tab == 2) {
+        // ================= 聊天室（功能 与 公告 之间） =================
+        DrawChatRoomPage();
+    } else if (ActiveUI::tab == 3) {
         // ================= 服务器公告（登录前后都能看） =================
         static std::atomic<bool> noticeBusy{false};
         static std::mutex noticeMutex;
@@ -549,7 +635,7 @@ void DrawMenu() {
         if (ImGui::Button(Tr(ANDROID_JOIN_GROUP_LABEL_EN, ANDROID_JOIN_GROUP_LABEL_CN),
                           ImVec2(-1.0f, ActiveUI::S(38))))
             OpenURL(ANDROID_GROUP_URL);
-    } else if (ActiveUI::tab == 3) {
+    } else if (ActiveUI::tab == 4) {
         // ================= 设置（界面缩放 + 卡密接口自查） =================
         static float pendingScale = 1.0f;
         static bool settingsInitialized = false;
