@@ -340,6 +340,9 @@ extern int  g_pumpkinScoreCount;
 extern bool g_isAutoSandActive;
 extern int g_sandBaseStaticId;
 extern int g_sandProductId;
+extern bool g_sandPreferRare;      // 优先稀有/未收集模型（PC sandPreferRareUncollected）
+extern int g_sandLastPickProduct;  // 上次选中的 productId（UI 显示）
+extern int g_sandLastPickModel;    // 上次选中的模型 staticId（UI 显示）
 extern int g_sandSuccessCount;
 extern int g_sandPerfectCount;
 

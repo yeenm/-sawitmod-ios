@@ -532,6 +532,27 @@ inline bool TryReadSandPictorialState(int staticId, int& outState, int& outStarR
         void* f_star = FindFieldInHierarchy(pdKlass, OBFUSCATE("_starRate"));
         if (f_state) _monoFieldGetValue(picDataObj, f_state, (void**)&outState);
         if (f_star) _monoFieldGetValue(picDataObj, f_star, (void**)&outStarRate);
+        // PC 版 TryGetMonoInt32Member 同时支持字段/属性：字段读不到时再试 getter。
+        // iOS 游戏版本里 PictorialBase 的收集状态有可能是属性，只读字段会永远拿到
+        // collectValue=2（全部当成未收集）→ 只按稀有度选 → 永远轮不到小熊(item 8)。
+        if (!f_state) {
+            void* getter = FindMethodInHierarchy(pdKlass, OBFUSCATE("get__state"), 0);
+            if (!getter) getter = FindMethodInHierarchy(pdKlass, OBFUSCATE("get_state"), 0);
+            if (getter) {
+                void* exc2 = nullptr;
+                void* boxed = _monoRuntimeInvoke(getter, picDataObj, nullptr, &exc2);
+                if (!exc2 && boxed) outState = *(int*)_monoObjectUnbox(boxed);
+            }
+        }
+        if (!f_star) {
+            void* getter = FindMethodInHierarchy(pdKlass, OBFUSCATE("get__starRate"), 0);
+            if (!getter) getter = FindMethodInHierarchy(pdKlass, OBFUSCATE("get_starRate"), 0);
+            if (getter) {
+                void* exc2 = nullptr;
+                void* boxed = _monoRuntimeInvoke(getter, picDataObj, nullptr, &exc2);
+                if (!exc2 && boxed) outStarRate = *(int*)_monoObjectUnbox(boxed);
+            }
+        }
         success = true;
     });
     return success;
@@ -568,17 +589,38 @@ inline bool TryGetSandModelCollectValue(int modelStaticId, int starCap, int& out
 }
 
 // Bugtopia Smart Option Scorer: SandPickModelOptionIndex
+// 把 options 拼成 "8,2,15" 便于日志排查（PC 版会记录 options 列表）
+inline std::string JoinSandOptions(const std::vector<int>& options) {
+    std::string out;
+    for (size_t i = 0; i < options.size(); i++) {
+        if (i) out += ",";
+        out += std::to_string(options[i]);
+    }
+    return out;
+}
+
 inline int SandPickModelOptionIndex(const std::vector<int>& options) {
     if (options.empty()) return 0;
 
-    // If user manually chose a valid productId, prioritize it
+    // 记录本次选型，供 UI 显示（PC 版 sandLastPick*；可用来确认小熊= item 8 / model 600111）
+    auto recordPick = [&](int idx) {
+        if (idx < 0 || idx >= (int) options.size()) return;
+        const int opt = options[idx];
+        g_sandLastPickProduct = opt;
+        g_sandLastPickModel = (opt >= 1 && opt <= 14) ? s_BugtopiaSandItemToModelStaticId[opt] : 0;
+    };
+
+    // 用户指定了模型（0=自动；8=小熊）：options 里出现就直接选它
     if (g_sandProductId > 0) {
         for (size_t i = 0; i < options.size(); i++) {
             if (options[i] == g_sandProductId) {
                 LOGI("[Sand] Picked user-chosen productId=%d at index %zu", g_sandProductId, i);
-                return (int)i;
+                recordPick((int) i);
+                return (int) i;
             }
         }
+        LOGI("[Sand] user-chosen productId=%d NOT in options=[%s] -> fall back to auto pick",
+             g_sandProductId, JoinSandOptions(options).c_str());
     }
 
     int firstValidIndex = -1;
@@ -588,47 +630,60 @@ inline int SandPickModelOptionIndex(const std::vector<int>& options) {
 
     for (size_t i = 0; i < options.size(); i++) {
         int opt = options[i];
-        if (opt < options[lowestAnyIndex]) lowestAnyIndex = (int)i;
+        if (opt < options[lowestAnyIndex]) lowestAnyIndex = (int) i;
         if (opt >= 1 && opt <= 14) {
             validCount++;
             if (opt < lowestValidId) {
                 lowestValidId = opt;
-                firstValidIndex = (int)i;
+                firstValidIndex = (int) i;
             }
         }
     }
 
     if (validCount == 0) {
-        LOGI("[Sand] model-pick: NO valid model (1..14) in options -> forced index %d", lowestAnyIndex);
+        LOGI("[Sand] model-pick: NO valid model (1..14) in options=[%s] -> forced index %d",
+             JoinSandOptions(options).c_str(), lowestAnyIndex);
+        recordPick(lowestAnyIndex);
         return lowestAnyIndex;
     }
 
-    // Bugtopia Smart Pick logic
-    int starCap = SandCurrentStarCap();
+    // PC 版 sandPreferRareUncollected 关掉时：直接选最小合法 id（同 PC / 安卓行为）
+    if (!g_sandPreferRare) {
+        const int idx = (firstValidIndex != -1) ? firstValidIndex : lowestAnyIndex;
+        LOGI("[Sand] model-pick: preferRare=OFF -> lowest valid index=%d id=%d", idx, options[idx]);
+        recordPick(idx);
+        return idx;
+    }
+
+    // PC 版逻辑：优先未收集（collectValue=2）→ 稀有度 → id 小的优先
+    const int starCap = SandCurrentStarCap();
     int bestIndex = (firstValidIndex != -1) ? firstValidIndex : 0;
     long long bestScore = -999999999999LL;
 
     for (size_t j = 0; j < options.size(); j++) {
-        int opt = options[j];
-        if (opt >= 1 && opt <= 14) {
-            int modelStaticId = s_BugtopiaSandItemToModelStaticId[opt];
-            int rarity = s_BugtopiaSandItemRarity[opt];
-            int collectValue = 0;
-            TryGetSandModelCollectValue(modelStaticId, starCap, collectValue);
+        const int opt = options[j];
+        if (opt < 1 || opt > 14) continue;
+        const int modelStaticId = s_BugtopiaSandItemToModelStaticId[opt];
+        const int rarity = s_BugtopiaSandItemRarity[opt];
+        int collectValue = 0;
+        TryGetSandModelCollectValue(modelStaticId, starCap, collectValue);
 
-            // Priority score: collectValue (weight 40) | rarity (weight 32) | inverted opt
-            long long score = ((long long)collectValue << 40) | ((long long)rarity << 32) | (uint32_t)(0x7FFFFFFF - opt);
-            if (score > bestScore) {
-                bestScore = score;
-                bestIndex = (int)j;
-            }
+        long long score = ((long long) collectValue << 40) | ((long long) rarity << 32) |
+                          (uint32_t) (0x7FFFFFFF - opt);
+        if (score > bestScore) {
+            bestScore = score;
+            bestIndex = (int) j;
         }
     }
 
-    LOGI("[Sand] model-pick: validCount=%d cap=%d -> selected index=%d (id=%d, rarity=%d)",
-        validCount, starCap, bestIndex, options[bestIndex], s_BugtopiaSandItemRarity[options[bestIndex] >= 1 && options[bestIndex] <= 14 ? options[bestIndex] : 0]);
+    LOGI("[Sand] model-pick: validCount=%d cap=%d options=[%s] -> selected index=%d (id=%d, model=%d, rarity=%d)",
+         validCount, starCap, JoinSandOptions(options).c_str(), bestIndex, options[bestIndex],
+         s_BugtopiaSandItemToModelStaticId[options[bestIndex] >= 1 && options[bestIndex] <= 14 ? options[bestIndex] : 0],
+         s_BugtopiaSandItemRarity[options[bestIndex] >= 1 && options[bestIndex] <= 14 ? options[bestIndex] : 0]);
+    recordPick(bestIndex);
     return bestIndex;
 }
+
 
 // -------------------------------------------------------------------------
 // Find Nearest Sand Base (SandSculpturesComponent scan within 60m)

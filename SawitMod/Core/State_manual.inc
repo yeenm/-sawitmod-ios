@@ -37,6 +37,10 @@ bool g_autoFishSkipCastAnim = true;
 bool g_autoFishSkipCatchAnim = true;
 std::string g_autoFishStatus = u8"空闲";
 std::string g_autoFishTargetStatus = u8"无";
+// ---- 自动沙雕选型（对齐安卓 Main.cpp 初值）----
+bool g_sandPreferRare = true;
+int g_sandLastPickProduct = 0;
+int g_sandLastPickModel = 0;
 bool isInstantFishing = false;
 float g_fishThrowDist = 2.0f;
 int g_lureBallCooldownSec = 60;

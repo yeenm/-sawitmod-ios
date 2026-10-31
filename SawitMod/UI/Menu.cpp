@@ -96,16 +96,23 @@ static std::string ChatTimeText(long long sec) {
 static void DrawChatRoomPage() {
     SMChatRoom::Tick();
     const SMChatRoom::Snapshot snap = SMChatRoom::GetSnapshot();
-    const bool en = (g_language == LANG_EN);
+    static std::string chatDraft;
 
+    // ---- 标题行：聊天室（强调色） 用户名 · 在线 N 人 [刷新] ----
     ImGui::PushStyleColor(ImGuiCol_Text, ActiveUI::kAccent);
     ImGui::TextUnformatted(u8"聊天室");
     ImGui::PopStyleColor();
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s%s   · %s %d",
-                        en ? "User: " : u8"用户: ",
-                        snap.me.empty() ? "-" : snap.me.c_str(),
-                        en ? "Online" : u8"在线", snap.online);
+    ImGui::SameLine(0.0f, ActiveUI::S(10));
+    ImGui::TextDisabled("%s", snap.me.empty() ? u8"连接中…" : snap.me.c_str());
+    ImGui::SameLine(0.0f, ActiveUI::S(8));
+    ImGui::TextColored(ActiveUI::kInfo, u8"· 在线 %d 人", snap.online);
+    {
+        const float refreshW = ActiveUI::S(64);
+        ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - refreshW);
+        if (ImGui::Button(u8"刷新##chat_refresh", ImVec2(refreshW, ActiveUI::S(30)))) {
+            SMChatRoom::RefreshNow(true);
+        }
+    }
     ImGui::Spacing();
 
     if (!snap.available) {
@@ -118,39 +125,75 @@ static void DrawChatRoomPage() {
         return;
     }
 
-    const float half = (ImGui::GetContentRegionAvail().x - ActiveUI::S(6)) * 0.5f;
-    if (ImGui::Button(u8"发消息##chat_send", ImVec2(half, ActiveUI::S(38)))) {
-        SMChatRoom::ShowInputDialog();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button(u8"刷新##chat_refresh", ImVec2(half, ActiveUI::S(38)))) {
-        SMChatRoom::RefreshNow(true);
-    }
-    if (snap.sending) ImGui::TextDisabled("%s", u8"发送中…");
     if (!snap.error.empty()) ImGui::TextColored(ActiveUI::kErr, "%s", snap.error.c_str());
-    ImGui::Spacing();
-    ImGui::Separator();
 
-    ImGui::BeginChild("##chat_list", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    // ---- 消息列表（最新在上，每条带分隔线；颜色与安卓版一致）----
+    const float footerH = ActiveUI::S(126);
+    ImGui::BeginChild("##chat_list", ImVec2(0, -footerH), true,
+                      ImGuiWindowFlags_AlwaysVerticalScrollbar);
     if (snap.messages.empty()) {
-        ImGui::TextDisabled("%s", u8"还没有消息，点「发消息」发一条试试。");
+        ImGui::TextDisabled("%s", u8"还没有消息，发一条试试。");
     }
     for (auto it = snap.messages.rbegin(); it != snap.messages.rend(); ++it) {
         const bool broadcast = (it->kind == "broadcast");
-        const ImVec4 color = broadcast ? ImVec4(1.00f, 0.72f, 0.20f, 1.00f)
-                                       : ImVec4(0.92f, 0.94f, 0.98f, 1.00f);
-        ImGui::PushStyleColor(ImGuiCol_Text, color);
-        if (broadcast) {
-            ImGui::TextWrapped("%s%s", u8"【官方广播】", it->text.c_str());
-        } else {
-            ImGui::TextWrapped("%s：%s", it->user.c_str(), it->text.c_str());
-        }
-        ImGui::PopStyleColor();
         const std::string timeText = ChatTimeText(it->ts);
-        if (!timeText.empty()) ImGui::TextDisabled("%s", timeText.c_str());
-        ImGui::Spacing();
+        if (broadcast) {
+            ImGui::TextColored(ActiveUI::kAccent, "%s", u8"【官方广播】");
+        } else {
+            ImGui::TextColored(ActiveUI::kInfo, "%s", it->user.c_str());
+        }
+        if (!timeText.empty()) {
+            ImGui::SameLine(0.0f, ActiveUI::S(10));
+            ImGui::TextDisabled("%s", timeText.c_str());
+        }
+        if (broadcast) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ActiveUI::kAccent);
+            ImGui::TextWrapped("%s", it->text.c_str());
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, ActiveUI::kText);
+            ImGui::TextWrapped("%s", it->text.c_str());
+            ImGui::PopStyleColor();
+        }
+        ImGui::Separator();
     }
     ImGui::EndChild();
+
+    // ---- 底部输入区：键盘输入 / 粘贴 / 发送（iOS 没有 ImGui 键盘，用系统对话框填 draft）----
+    ImGui::Dummy(ActiveUI::S2(0, 4));
+    if (chatDraft.empty()) {
+        ImGui::TextDisabled("%s", u8"点「键盘输入」输入消息（最多 200 字）");
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ActiveUI::kText);
+        ImGui::TextWrapped("%s", chatDraft.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    const float bw = (ImGui::GetContentRegionAvail().x - ActiveUI::S(12)) / 3.0f;
+    if (ImGui::Button(u8"键盘输入##chat_input", ImVec2(bw, ActiveUI::S(36)))) {
+        std::string current = chatDraft;
+        SMAlert::ShowInput(u8"输入聊天消息", u8"最多 200 字，发送后 5 秒内同步",
+                           current, [](const std::string &value) {
+            chatDraft = value;
+        });
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(u8"粘贴##chat_paste", ImVec2(bw, ActiveUI::S(36)))) {
+        const std::string clip = GetAndroidClipboard();
+        if (!clip.empty()) chatDraft = clip;
+    }
+    ImGui::SameLine();
+    const bool canSend = (!chatDraft.empty()) && (!snap.sending);
+    if (!canSend) ImGui::BeginDisabled();
+    if (ImGui::Button(snap.sending ? u8"发送中…" : u8"发送##chat_send",
+                      ImVec2(bw, ActiveUI::S(36)))) {
+        if (!chatDraft.empty()) {
+            SMChatRoom::Send(chatDraft);
+            chatDraft.clear();
+        }
+    }
+    if (!canSend) ImGui::EndDisabled();
+    ImGui::TextDisabled("%s", u8"消息保留 7 天；同卡密每 2 秒限 1 条；请勿发送违规内容。");
 }
 
 void DrawMenu() {
@@ -1861,6 +1904,17 @@ void DrawMenu() {
                 }
             }
             ImGui::Spacing();
+
+            // PC 版同款：优先稀有/未收集模型 + 指定模型（0=自动，1..14 对应游戏沙雕模型）
+            ImGui::Checkbox(Tr("Prefer rare / uncollected models", u8"优先稀有/未收集模型"),
+                            &g_sandPreferRare);
+            ImGui::TextDisabled(u8"指定模型: 0=自动；1汽车 2青蛙 3寄居蟹 4鸭子 5兔子 6灯塔 7帆船");
+            ImGui::TextDisabled(u8"          8小熊 9鲸鱼 10肌肉猫 11海鸥 12北极熊 13摩艾石像 14仙人掌");
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::SliderInt("##sandModel", &g_sandProductId, 0, 14,
+                             g_sandProductId == 0 ? u8"自动选型" : u8"固定模型 %d");
+            ImGui::TextDisabled(u8"上次模型: productId=%d model=%d（小熊=8 / 600111）",
+                                g_sandLastPickProduct, g_sandLastPickModel);
 
             // ================= AUTO PUMPKIN CARVING =================
             ActiveUI::Section("P", Tr("AUTO PUMPKIN CARVING", u8"自动南瓜雕刻"));
