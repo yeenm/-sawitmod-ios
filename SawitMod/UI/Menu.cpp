@@ -2645,6 +2645,46 @@ void DrawMenu() {
                     "Body emotes replicate to other players; face bubbles are local only.",
                     u8"身体动作会同步给别人；表情气泡仅本机可见。"));
 
+            ImGui::Spacing();
+            ImGui::Separator();
+            ActiveUI::Section("L", Tr("EMOTE / ACTION BROWSER", u8"表情/动作浏览器"));
+            ImGui::TextDisabled("%s", Tr(
+                    "iOS sideload cannot hook the panel getter, so browse every emote/action here: owned rows go through the game protocol (visible to others), unowned rows play locally.",
+                    u8"iOS 侧载无法替换游戏面板列表，改用这里：已拥有走游戏协议（别人可见），未拥有本地补演（仅自己可见）。"));
+            {
+                const std::vector<EmoteBrowserEntry> entries = GetEmoteBrowserEntries();
+                if (entries.empty()) {
+                    ImGui::TextDisabled("%s", u8"正在枚举游戏表情/动作表…（进入世界后自动加载）");
+                } else {
+                    static int browserType = 2;
+                    ImGui::RadioButton(u8"动作##emote_browser_type", &browserType, 2);
+                    ImGui::SameLine();
+                    ImGui::RadioButton(u8"表情##emote_browser_type", &browserType, 1);
+                    static bool browserLoop = false;
+                    ImGui::SameLine();
+                    ImGui::Checkbox(u8"循环##emote_browser_loop", &browserLoop);
+                    ImGui::BeginChild("##emote_browser_list", ImVec2(0, 220), true);
+                    int shown = 0;
+                    for (const EmoteBrowserEntry &entry : entries) {
+                        if (entry.type != browserType) continue;
+                        char label[320];
+                        snprintf(label, sizeof(label), "%s%s  #%d##emote_row_%d_%d",
+                                 entry.name.empty()
+                                         ? (entry.type == 1 ? u8"表情" : u8"动作")
+                                         : entry.name.c_str(),
+                                 entry.isLoop ? u8" [循环]" : "", entry.id,
+                                 entry.type, entry.id);
+                        if (ImGui::Selectable(label)) {
+                            PlayEmoteBrowserEntryNative(entry.id, entry.type,
+                                                        browserLoop || entry.isLoop);
+                        }
+                        shown++;
+                    }
+                    ImGui::EndChild();
+                    ImGui::TextDisabled(u8"共 %d 条（点一行即演）", shown);
+                }
+            }
+
             // ================================================================
             //  解锁所有双人互动（PC 版 FriendInteractUnlockFeature 移植）
             // ================================================================
@@ -2897,6 +2937,17 @@ void DrawMenu() {
                 u8"自动为发送的聊天消息添加绕过标签，使所有玩家都能看到彩色文字。"));
 
             ImGui::Spacing();
+            ImGui::TextColored(ActiveUI::kInfo, "%s", Tr("Hook status: ", u8"Hook 状态："));
+            ImGui::SameLine();
+            ImGui::TextWrapped("%s", GetChatHookStatus().c_str());
+            if (ImGui::Button(Tr("Retry hook install", u8"重试安装 Hook"), ImVec2(-1, 44))) {
+                EnsureChatHookInstalled();
+            }
+            ImGui::TextDisabled("%s", Tr(
+                "Hook fails on sideloaded iOS: use the direct color send below (works without hook).",
+                u8"Hook 在侧载 iOS 上通常装不上：用下面「彩字发送」直发即可（不需要 hook）。"));
+
+            ImGui::Spacing();
             ImGui::Separator();
             ActiveUI::Section("1", Tr("COLOR SELECTION", u8"颜色选择"));
 
@@ -2916,6 +2967,20 @@ void DrawMenu() {
 
             if (g_chatColorMode == 9) {
                 ImGui::InputText(Tr("Hex Code", u8"Hex颜色代码"), g_chatCustomHex, sizeof(g_chatCustomHex));
+            }
+            ImGui::Spacing();
+            ImGui::Separator();
+            ActiveUI::Section("2", Tr("DIRECT COLOR SEND (HOOK-FREE)", u8"彩字发送（无需 Hook）"));
+            ImGui::TextDisabled("%s", Tr(
+                "Type a message, it is sent with the selected color through the game's own chat protocol - other players see the color.",
+                u8"在这里输入内容，会用当前选中的颜色通过游戏自己的聊天协议发出去 —— 其他玩家能看到彩色。"));
+            if (ImGui::Button(Tr("SEND COLORED MESSAGE", u8"发送彩字消息"), ImVec2(-1, 52))) {
+                SMAlert::ShowInput(u8"发送彩字消息", u8"输入后点 OK 直接发送", "",
+                                   [](const std::string &text) {
+                    if (text.empty()) return;
+                    const std::string copy = text;
+                    RunOnUnityThreadAsync([copy]() { SendColorChatNative(copy, 0); });
+                });
             }
             ImGui::Spacing();
         }

@@ -714,12 +714,31 @@ static void Hooked_SendMessage(void* messageMonoStr, int32_t channelType) {
     s_inHook = false;
 }
 
+namespace {
+std::mutex g_chatHookStatusMutex;
+std::string g_chatHookStatusText = u8"未尝试安装（进世界后点启用或自动重试）";
+}  // namespace
+
+void SetChatHookStatus(const std::string &text) {
+    {
+        std::lock_guard<std::mutex> lock(g_chatHookStatusMutex);
+        g_chatHookStatusText = text;
+    }
+    LOGI(OBFUSCATE("[AutoColorChat] %s"), text.c_str());
+}
+
+std::string GetChatHookStatus() {
+    std::lock_guard<std::mutex> lock(g_chatHookStatusMutex);
+    return g_chatHookStatusText;
+}
+
 bool EnsureChatHookInstalled() {
     if (g_chatHookInstalled.load(std::memory_order_acquire)) return true;
     if (g_chatHookingInProgress.exchange(true)) return false;
 
     void* domain = _monoGetRootDomain ? _monoGetRootDomain() : nullptr;
     if (!domain) {
+        SetChatHookStatus(u8"安装失败：Mono 域还没起来（回登录/热更后重试）");
         g_chatHookingInProgress.store(false);
         return false;
     }
@@ -728,24 +747,28 @@ bool EnsureChatHookInstalled() {
     void* img = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol"));
     if (!img) img = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol.dll"));
     if (!img) {
+        SetChatHookStatus(u8"安装失败：XDTDataAndProtocol 还没加载");
         g_chatHookingInProgress.store(false);
         return false;
     }
 
     void* klass = _monoClassFromName(img, OBFUSCATE("XDTDataAndProtocol.ProtocolService.Social"), OBFUSCATE("ChatProtocolManager"));
     if (!klass) {
+        SetChatHookStatus(u8"安装失败：ChatProtocolManager 类没找到");
         g_chatHookingInProgress.store(false);
         return false;
     }
 
     void* method = _monoClassGetMethodFromName(klass, OBFUSCATE("SendMessage"), 2);
     if (!method) {
+        SetChatHookStatus(u8"安装失败：SendMessage(string,int) 没找到");
         g_chatHookingInProgress.store(false);
         return false;
     }
 
     void* nativeAddr = _monoCompileMethod ? _monoCompileMethod(method) : nullptr;
     if (!nativeAddr) {
+        SetChatHookStatus(u8"安装失败：mono_compile_method 返回空（方法可能没被调用过）");
         g_chatHookingInProgress.store(false);
         return false;
     }
@@ -755,10 +778,12 @@ bool EnsureChatHookInstalled() {
         VirtualProtect(nativeAddr, 0x1000);
         g_chatHookInstalled.store(true, std::memory_order_release);
         g_chatHookingInProgress.store(false);
+        SetChatHookStatus(u8"已安装 hook：游戏内正常聊天会自动加彩字");
         LOGI(OBFUSCATE("[AutoColorChat] Hooked ChatProtocolManager::SendMessage successfully (native=%p)"), nativeAddr);
         return true;
     }
 
+    SetChatHookStatus(u8"安装失败：DobbyHook 被系统拒绝（侧载 iOS 常见，用下方「彩字发送」直发即可）");
     g_chatHookingInProgress.store(false);
     return false;
 }
@@ -1420,3 +1445,76 @@ using GameAppUpdateFn = void (*)(void* instance);
 static GameAppUpdateFn old_GameApp_Update = nullptr;
 
 // Android kembali memakai GameApp_Update sebagai frame pump.
+
+
+// ============================================================================
+//  彩字聊天直发通道（hook-free）—— 修复 iOS 侧载「自动彩字」无效
+// ----------------------------------------------------------------------------
+//  hook 装不上时，直接反射调用
+//    ChatProtocolManager.SendMessage(string message, ChatChannelType channelType)
+//  把带颜色标签的文本发出去；服务器原样广播，所有客户端都按彩色渲染。
+//  （hook 能装上的机型仍可用复选框实现"每条都自动加"）
+// ============================================================================
+bool SendColorChatNative(const std::string &text, int channelType) {
+    if (text.empty()) return false;
+
+    const std::string formatted = FormatColorChatMessage(text);
+    void *domain = _monoGetRootDomain ? _monoGetRootDomain() : nullptr;
+    if (!domain) {
+        SetChatHookStatus(u8"彩字发送失败：Mono 域还没起来");
+        return false;
+    }
+    if (_monoThreadAttach) _monoThreadAttach(domain);
+
+    void *img = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol"));
+    if (!img) img = _monoImageLoaded(OBFUSCATE("XDTDataAndProtocol.dll"));
+    if (!img) {
+        SetChatHookStatus(u8"彩字发送失败：XDTDataAndProtocol 未加载");
+        return false;
+    }
+    void *klass = _monoClassFromName(img, OBFUSCATE("XDTDataAndProtocol.ProtocolService.Social"),
+                                     OBFUSCATE("ChatProtocolManager"));
+    if (!klass) {
+        SetChatHookStatus(u8"彩字发送失败：ChatProtocolManager 类没找到");
+        return false;
+    }
+    void *method = nullptr;
+    if (_monoClassGetMethodFromName)
+        method = _monoClassGetMethodFromName(klass, OBFUSCATE("SendMessage"), 2);
+    if (!method) method = FindMethodInHierarchy(klass, OBFUSCATE("SendMessage"), 2);
+    if (!method) {
+        SetChatHookStatus(u8"彩字发送失败：SendMessage(string,int) 没找到");
+        return false;
+    }
+
+    void *monoStr = nullptr;
+    if (SMMonoHot::Available()) monoStr = SMMonoHot::StringNew(formatted.c_str());
+    if (!monoStr && _monoStringNew) monoStr = _monoStringNew(domain, formatted.c_str());
+    if (!monoStr) {
+        SetChatHookStatus(u8"彩字发送失败：构造消息字符串失败");
+        return false;
+    }
+
+    int channel = channelType;
+    void *args[2] = {monoStr, &channel};
+    void *exception = nullptr;
+    _monoRuntimeInvoke(method, nullptr, args, &exception);
+    if (exception) {
+        SetChatHookStatus(u8"彩字发送失败：SendMessage 抛异常（可能频道/文本被服务端拦）");
+        return false;
+    }
+    SetChatHookStatus(u8"彩字已发送：" + formatted);
+    return true;
+}
+
+// 帧泵每 5 秒自动重试安装一次 hook（菜单开着自动彩字时）。
+void MaybeRetryChatHookOnUpdate() {
+    if (!g_autoColorChatActive) return;
+    static uint64_t s_nextTryMs = 0;
+    const uint64_t now = (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (now < s_nextTryMs) return;
+    s_nextTryMs = now + 5000;
+    if (g_chatHookInstalled.load(std::memory_order_acquire)) return;
+    EnsureChatHookInstalled();
+}

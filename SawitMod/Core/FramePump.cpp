@@ -589,6 +589,8 @@ void SMRunUnityFramePump() {
         ProcessEmoteUnlockOnUpdate();
         ProcessFriendInteractUnlockOnUpdate();
         MaybeRunAutoSymbolProbe();
+        // 自动彩字：hook 装不上时每 5 秒重试一次（侧载 iOS 常见；不影响下面的直发通道）。
+        MaybeRetryChatHookOnUpdate();
     }
 }
 

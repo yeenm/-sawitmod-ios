@@ -866,3 +866,171 @@ std::string GetEmoteUnlockStatus() {
     std::lock_guard<std::mutex> lock(g_emoteUnlockMutex);
     return GetEmoteStatusLocked();
 }
+
+
+// ============================================================================
+//  表情/动作浏览器（hook-free 兜底）—— 修复 iOS 侧载「解锁更多表情/动作」无效
+// ----------------------------------------------------------------------------
+//  iOS 侧载环境下 Dobby 对 Mono JIT 方法的 detour 装不上，面板列表替换那条路
+//  走不通。这里完全不依赖 hook：
+//    * 用 TableData.GetSingleaction / GetExpression 枚举这版游戏真实存在的 id；
+//    * 菜单把列表画出来，点一行就演；
+//    * 已拥有的走游戏协议（CharacterProtocolManager.SendSingleAction/SendEmotion，
+//      别人也能看到），未拥有的走本地补演（PC 版 HALF2 同款，仅本机可见）。
+// ============================================================================
+namespace {
+
+std::mutex g_emoteBrowserMutex;
+std::vector<EmoteBrowserEntry> g_emoteBrowserEntries;
+bool g_emoteBrowserBuilding = false;
+uint64_t g_emoteBrowserLastKickMs = 0;
+
+uint64_t BrowserNowMs() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// TableData 行对象上的 name 属性：public string name => TableData.Localize(_name)
+std::string ReadEmoteTableRowName(void *row) {
+    if (!row || !_monoObjectGetClass || !_monoRuntimeInvoke) return std::string();
+    void *rowClass = _monoObjectGetClass(row);
+    if (!rowClass) return std::string();
+    void *getter = FindMethodInHierarchy(rowClass, (const char *) OBFUSCATE("get_name"), 0);
+    if (!getter) return std::string();
+    void *exception = nullptr;
+    void *monoStr = _monoRuntimeInvoke(getter, row, nullptr, &exception);
+    if (exception || !monoStr) return std::string();
+    return ReadMonoStringNative(monoStr);
+}
+
+void BuildEmoteBrowserCatalogOnUnityThread() {
+    if (_monoGetRootDomain && _monoThreadAttach) _monoThreadAttach(_monoGetRootDomain());
+    std::vector<EmoteBrowserEntry> out;
+    for (int id = 1; id <= kEmoteMaxSingleActionId; ++id) {
+        void *row = FetchTableRow(OBFUSCATE("GetSingleaction"), id);
+        if (!row) continue;
+        EmoteBrowserEntry entry;
+        entry.id = id;
+        entry.type = kEmoteTypeSingleAction;
+        entry.isLoop = EmoteTableIsLoop(id);
+        entry.name = ReadEmoteTableRowName(row);
+        out.push_back(entry);
+    }
+    for (int id = 1; id <= kEmoteMaxExpressionId; ++id) {
+        void *row = FetchTableRow(OBFUSCATE("GetExpression"), id);
+        if (!row) continue;
+        EmoteBrowserEntry entry;
+        entry.id = id;
+        entry.type = kEmoteTypeExpression;
+        entry.isLoop = false;
+        entry.name = ReadEmoteTableRowName(row);
+        out.push_back(entry);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_emoteBrowserMutex);
+        g_emoteBrowserEntries = std::move(out);
+        g_emoteBrowserBuilding = false;
+    }
+    LOGI(OBFUSCATE("[EmoteUnlock] browser catalog: %zu rows"), g_emoteBrowserEntries.size());
+}
+
+bool IsExpressionActionObtainedNative(int type, int id) {
+    void *klass = FindClassInGameImages(
+            OBFUSCATE("XDTDataAndProtocol.ProtocolService.ExpressionAction"),
+            OBFUSCATE("ExpressionActionProtocolManager"));
+    if (!klass) return false;   // 解析失败按“未拥有”处理：宁可本地补演，也不静默不演
+    void *method = FindMethod(klass, OBFUSCATE("IsExpressionActionObtained"), {2});
+    if (!method || !_monoRuntimeInvoke) return false;
+    int argType = type;
+    int argId = id;
+    void *args[2] = {&argType, &argId};
+    void *exception = nullptr;
+    void *boxed = _monoRuntimeInvoke(method, nullptr, args, &exception);
+    if (exception || !boxed) return false;
+    return *(uint8_t *) UnboxValue(boxed) != 0;
+}
+
+bool SendSingleActionViaProtocol(int id, bool isLoop) {
+    void *klass = FindClassInGameImages(
+            OBFUSCATE("XDTDataAndProtocol.ProtocolService.GamePlay.Character"),
+            OBFUSCATE("CharacterProtocolManager"));
+    if (!klass) return false;
+    void *method = FindMethod(klass, OBFUSCATE("SendSingleAction"), {2});
+    if (!method || !_monoRuntimeInvoke) return false;
+    int argType = kEmoteTypeSingleAction;
+    uint8_t argLoop = isLoop ? 1 : 0;
+    void *args[2] = {&argType, &argLoop};
+    void *exception = nullptr;
+    _monoRuntimeInvoke(method, nullptr, args, &exception);
+    return !exception;
+}
+
+bool SendEmotionViaProtocol(int id) {
+    void *klass = FindClassInGameImages(
+            OBFUSCATE("XDTDataAndProtocol.ProtocolService.GamePlay.Character"),
+            OBFUSCATE("CharacterProtocolManager"));
+    if (!klass) return false;
+    void *method = FindMethod(klass, OBFUSCATE("SendEmotion"), {1});
+    if (!method || !_monoRuntimeInvoke) return false;
+    int argId = id;
+    void *args[1] = {&argId};
+    void *exception = nullptr;
+    _monoRuntimeInvoke(method, nullptr, args, &exception);
+    return !exception;
+}
+
+void KickEmoteBrowserBuild() {
+    const uint64_t now = BrowserNowMs();
+    {
+        std::lock_guard<std::mutex> lock(g_emoteBrowserMutex);
+        if (g_emoteBrowserBuilding || now - g_emoteBrowserLastKickMs < 2000) return;
+        g_emoteBrowserLastKickMs = now;
+        g_emoteBrowserBuilding = true;
+    }
+    RunOnUnityThreadAsync([]() { BuildEmoteBrowserCatalogOnUnityThread(); });
+}
+
+}  // namespace
+
+std::vector<EmoteBrowserEntry> GetEmoteBrowserEntries() {
+    {
+        std::lock_guard<std::mutex> lock(g_emoteBrowserMutex);
+        if (!g_emoteBrowserEntries.empty()) return g_emoteBrowserEntries;
+    }
+    KickEmoteBrowserBuild();
+    return std::vector<EmoteBrowserEntry>();
+}
+
+void PlayEmoteBrowserEntryNative(int id, int type, bool forceLoop) {
+    if (id <= 0) return;
+    RunOnUnityThreadAsync([id, type, forceLoop]() {
+        if (_monoGetRootDomain && _monoThreadAttach) _monoThreadAttach(_monoGetRootDomain());
+        const bool owned = IsExpressionActionObtainedNative(type, id);
+        bool ok = false;
+        const char *how = "local";
+        if (type == kEmoteTypeExpression) {
+            if (owned) {
+                ok = SendEmotionViaProtocol(id);
+                if (ok) how = "protocol";
+            }
+            if (!ok) {
+                ok = DispatchFaceEmoteLocal(id);
+                how = "local";
+            }
+        } else {
+            const bool loop = forceLoop || EmoteTableIsLoop(id);
+            if (owned) {
+                ok = SendSingleActionViaProtocol(id, loop);
+                if (ok) how = "protocol";
+            }
+            if (!ok) {
+                ok = PlaySocialActionLocalNative(id, loop);
+                how = "local";
+            }
+        }
+        SetEmoteStatus(ok ? (u8"已演出 " + std::to_string(id) + u8"（" + how + u8"）")
+                          : (u8"演出失败 " + std::to_string(id)));
+        LOGI(OBFUSCATE("[EmoteUnlock] browser play id=%d type=%d owned=%d -> ok=%d (%s)"),
+             id, type, owned ? 1 : 0, ok ? 1 : 0, how);
+    });
+}

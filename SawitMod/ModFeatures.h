@@ -99,6 +99,21 @@ void ReinstallEmoteUnlockHooksNative();
 void PlayEmoteUnlockLocalNowNative(int actionId, bool forceLoop);
 std::string GetEmoteUnlockStatus();
 
+// --- 表情/动作浏览器（iOS 侧载 hook 装不上时的兜底：列出表里全部 id 并演出）---
+struct EmoteBrowserEntry {
+    int id = 0;
+    int type = 2;        // 1 = Expression(表情气泡) / 2 = SingleAction(动作)
+    bool isLoop = false;
+    std::string name;
+};
+std::vector<EmoteBrowserEntry> GetEmoteBrowserEntries();
+void PlayEmoteBrowserEntryNative(int id, int type, bool forceLoop);
+
+// --- 彩字聊天（hook 不可用时的直发通道 + hook 状态诊断）---
+bool SendColorChatNative(const std::string &text, int channelType);
+std::string GetChatHookStatus();
+void MaybeRetryChatHookOnUpdate();
+
 // --- Unlock All Two-Person Interactions（移植自 buddy/FriendInteractUnlockFeature.cs）---
 // 遍历 TableData.GetFriendInteract(id, false)，把事件锁的行改写成 gainCondition=0 /
 // unlockType=0；friendshipLv 与 isDisable 保持原样。
