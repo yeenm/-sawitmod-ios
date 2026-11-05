@@ -84,3 +84,5 @@ Windows 上无法编译 ObjC++（UIKit/GLES），这部分需要在 macOS + Theo
 - [`docs/API映射.md`](docs/API映射.md) — Android → iOS 的 API 对照表
 - [`docs/构建与注入.md`](docs/构建与注入.md) — Theos/Dobby/签名/安装/排错
 - [`tests/README.md`](tests/README.md) — 两个自检程序怎么跑
+
+<!-- ci probe -->
