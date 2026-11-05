@@ -27,10 +27,9 @@ SAWIT_DIR := $(THEOS_PROJECT_DIR)/SawitMod
 SawitMod_FILES = $(shell find $(SAWIT_DIR) -type f \( -name '*.cpp' -o -name '*.mm' -o -name '*.m' -o -name '*.c' \) ! -path '*/tests/*')
 
 # ---- 构建开关（与 Android.mk 对齐）----
-SAWIT_OFFLINE_MODE ?= 1
-SAWIT_LOCAL_FEATURES ?= $(SAWIT_OFFLINE_MODE)
-SAWIT_LOCAL_PAYLOAD_ONLY ?= $(SAWIT_OFFLINE_MODE)
-
+SAWIT_OFFLINE_MODE ?= 0
+SAWIT_LOCAL_FEATURES ?= 1
+SAWIT_LOCAL_PAYLOAD_ONLY ?= 0
 SAWIT_DEFINES = \
 	-DSAWIT_OFFLINE_MODE=$(SAWIT_OFFLINE_MODE) \
 	-DSAWIT_LOCAL_FEATURES=$(SAWIT_LOCAL_FEATURES) \

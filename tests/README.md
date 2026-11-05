@@ -1,6 +1,6 @@
 # tests — 本机自检
 
-这两个程序**不参与 iOS 构建**，只在开发机上验证移植质量。
+下面这些程序**不参与 iOS 构建**，只在开发机上验证移植质量。
 
 ## 1. crypto_test.cpp
 
@@ -44,3 +44,23 @@ crypto_test.exe
 | `stub/strings.h` | strcasecmp |
 
 这些桩只求"能过编译"，不实现功能；真实行为在 iOS 上由系统库提供。
+
+## 4. fake_mono/（MonoHot 混合分发自测）
+
+iOS 包里同时有 il2cpp（AOT）和 Mono 热更程序集（EcsClient / XDTDataAndProtocol /
+XDTLevelAndEntity ...），`SawitMod/IL2CPP/MonoHot.cpp` 负责按**句柄归属**把
+`_monoXxx` 调用分给真 `mono_*` 或原来的 il2cpp 垫片；`MonoCompat.cpp` 里每个
+shim 的分发规则就靠它。
+
+Windows 上没有真 mono/il2cpp，`fake_mono/fake_dual_runtime.cpp` 用假 `dlsym`
+造出两套运行时，把**真实的** `MonoHot.cpp` + `MonoCompat.cpp` + `Il2CppApi.cpp`
+编进去跑契约检查（45 项）：mono/AOT 句柄分流、对象判型（AOT 对象不允许被误判成
+mono 对象）、`mono_image_loaded` 的 .dll 变体与 mscorlib 重映射、字符串按运行时
+选择、泛型/GC 句柄、SelfTest 命中统计。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests\fake_mono\build_and_run.ps1
+```
+
+当前：45/45 通过。它和 `check_link.ps1` 必须分开跑（两者都定义 `dlsym`，不能进
+同一个链接单元）。

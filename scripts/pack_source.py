@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """把 ios/ 打成发布用的源码包。
 
@@ -16,7 +16,7 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # ios/
 DIST = os.path.join(os.path.dirname(ROOT), "dist")
-VERSION = "v1.1"
+VERSION = "v1.2"
 ZIP_NAME = f"SawitMod-ios-{VERSION}-src.zip"
 
 EXCLUDE_DIRS = {

@@ -48,7 +48,7 @@
 #define SIG_VERSION   ((const char*)OBFUSCATE("v4"))
 
 // TLS aktif (port 443). Host utama sama dengan versi PC.
-#define API_BASE      ((const char*)OBFUSCATE("http://yslf.work"))
+#define API_BASE      ((const char*)OBFUSCATE("https://yslf.work"))
 //#define API_BASE      ((const char*)OBFUSCATE("https://test.arsipharian.com"))
 #define ALOG(...) ((void)0)
 
