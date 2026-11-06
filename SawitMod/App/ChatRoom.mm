@@ -1,7 +1,7 @@
 // ============================================================================
 //  ChatRoom.mm — iOS 客户端聊天室实现（Objective-C++）
 // ----------------------------------------------------------------------------
-//  对接：面板 http://yslf.work 的 /api/chat/list 与 /api/chat/send（HTTP 80）。
+//  对接：独立 API 域名 https://api.yslf.work 的 /api/chat/list 与 /api/chat/send。
 //  游戏 Info.plist 已配置 NSAllowsArbitraryLoads=true，所以 NSURLSession 走明文
 //  HTTP 不受 ATS 影响（与参考实现一致）。
 //
@@ -64,9 +64,9 @@ NSString *UrlEncode(NSString *s) {
 
 NSString *ChatBaseUrl() {
     std::string host = Weiyan::ApiHost();
-    if (host.empty()) host = "yslf.work";
+    if (host.empty()) host = "api.yslf.work";
     if (host.rfind("http://", 0) == 0 || host.rfind("https://", 0) == 0) return NsString(host);
-    return NsString("http://" + host);
+    return NsString("https://" + host);
 }
 
 NSURLSession *ChatSession() {

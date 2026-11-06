@@ -47,8 +47,8 @@
 // Versi format baris tanda tangan. HARUS sama dengan SIG_VERSION di server.
 #define SIG_VERSION   ((const char*)OBFUSCATE("v4"))
 
-// TLS aktif (port 443). Host utama sama dengan versi PC.
-#define API_BASE      ((const char*)OBFUSCATE("https://yslf.work"))
+// TLS aktif (port 443). 独立 API 域名，避免和后台面板共用域名。
+#define API_BASE      ((const char*)OBFUSCATE("https://api.yslf.work"))
 //#define API_BASE      ((const char*)OBFUSCATE("https://test.arsipharian.com"))
 #define ALOG(...) ((void)0)
 

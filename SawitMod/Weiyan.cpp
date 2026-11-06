@@ -48,7 +48,7 @@ void SetNoSigPipe(int fd) {
 // =====================================================================
 //  常量（与原实现同一组，勿改）
 // =====================================================================
-const char* kHostDefault = "yslf.work";
+const char* kHostDefault = "api.yslf.work";
 const char* kPathDefault = "v2/c84ec01e30ad49897de7c59f5edd4af8";
 // 面板文档里的正式「单码登录」接口：GET/POST /api/?id=kmlogon&app=<应用ID>&data=<密文参数>
 const char* kDocLoginPath = "api/";
@@ -687,6 +687,10 @@ void EnsureCfg() {
         else if (k == "doc_path") g_docPath = v;
         else if (k == "doc_id") g_docId = v;
         else if (k == "login_mode") g_useDocLogin = (v != "legacy");
+    }
+    // 老版本留下的 weiyan_api.txt 里可能还是 yslf.work；自动迁移到独立 API 域名。
+    if (g_host == "yslf.work" || g_host == "http://yslf.work" || g_host == "https://yslf.work") {
+        g_host = kHostDefault;
     }
     LOGI("api cfg: host=%s app=%s doc=%s/%s legacy_path=%s login_id=%s",
            g_host.c_str(), g_appId.c_str(), g_docPath.c_str(), g_docId.c_str(),
