@@ -22,8 +22,10 @@ int main() {
     Check(r.body=="ok" && calls==std::vector<int>({0,1}),"network failure switches to backup");
     calls.clear(); state.Run(exchange,2000);
     Check(calls==std::vector<int>({1}),"working backup is preferred for 30 seconds");
-    calls.clear(); state.Run(exchange,32001);
-    Check(calls==std::vector<int>({0,1}),"primary is probed again after cooldown");
+    calls.clear(); state.Run(exchange,30000);
+    Check(calls==std::vector<int>({1}),"backup stays available near the end of cooldown");
+    calls.clear(); state.Run(exchange,31001);
+    Check(calls==std::vector<int>({0,1}),"backup traffic does not extend primary retry cooldown");
     for (long code : {500,502,503,504,599}) {
         FailoverState s; calls.clear();
         r=s.Run([&](int n){calls.push_back(n);return Reply(n==0?code:200,n==0?"error":"ok");},1000);
@@ -59,5 +61,6 @@ int main() {
     Check(parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nokX\n0\r\n\r\n",true)==ParseResult::Invalid,"broken chunk ending is rejected");
     Check(parse("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 2\r\n\r\nok",true)==ParseResult::Invalid,"unexpected content encoding is rejected");
     Check(parse("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok",true)==ParseResult::Invalid,"duplicate framing header is rejected");
+    Check(parse("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nok",true)==ParseResult::Complete && parsed.body=="ok","duplicate ordinary headers remain compatible");
     std::cout << "IOS_ENDPOINT_TESTS_PASS=" << passed << '\n';
 }

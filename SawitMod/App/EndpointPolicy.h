@@ -40,8 +40,9 @@ public:
             if (!reply.transportOk || (reply.code >= 500 && reply.code <= 599)) continue;
             // Redirects never carry credentials to another origin.
             if (reply.code >= 300 && reply.code < 400) return Response{};
-            preferred_.store(node);
-            until_.store(now + 30000);
+            const int previous = preferred_.exchange(node);
+            if (node == 0) until_.store(0);
+            else if (previous != node || now >= until_.load()) until_.store(now + 30000);
             return reply; // Includes signed 401/403 and protocol-level denials.
         }
         return Response{};
@@ -94,7 +95,8 @@ inline ParseResult ParseReply(const std::string& wire, bool eof, Response& out) 
             size_t next = wire.find("\r\n", line), colon = wire.find(':', line);
             if (colon == std::string::npos || colon <= line || colon >= next) return ParseResult::Invalid;
             std::string key = Lower(wire.substr(line, colon - line));
-            if (headers.count(key)) return ParseResult::Invalid;
+            if (headers.count(key) && (key == "content-length" || key == "transfer-encoding"
+                || key == "content-encoding")) return ParseResult::Invalid;
             headers[key] = Trim(wire.substr(colon + 1, next - colon - 1));
             line = next + 2;
         }
