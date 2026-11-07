@@ -34,6 +34,16 @@ jobs:
           cmake --version | head -1
           python3 --version
 
+      - name: Dual endpoint policy and TLS verification
+        run: |
+          mkdir -p out
+          clang++ -std=c++17 -I SawitMod tests/endpoint_policy_test.cpp -o /tmp/endpoint-policy
+          /tmp/endpoint-policy | tee out/endpoint-policy.log
+          clang++ -std=c++17 -fobjc-arc -I SawitMod -DSM_HTTP_BASELINE=1 tests/baseline/HttpClient.mm tests/http_live_test.mm -framework Foundation -framework CFNetwork -framework Security -o /tmp/http-baseline
+          /tmp/http-baseline | tee out/http-baseline.log
+          clang++ -std=c++17 -fobjc-arc -I SawitMod -DSM_HTTP_TESTING=1 SawitMod/App/HttpClient.mm tests/http_live_test.mm -framework Foundation -framework CFNetwork -framework Security -o /tmp/http-dual
+          /tmp/http-dual | tee out/http-dual.log
+
       - name: 安装 Theos
         run: |
           git clone --recursive --depth=1 https://github.com/theos/theos.git "$HOME/theos"
@@ -97,3 +107,10 @@ jobs:
           path: |
             scripts/inject_ipa.sh
             docs/构建与注入.md
+
+      - name: Upload transport verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dual-endpoint-verification
+          path: out/*.log
