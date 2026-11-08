@@ -13,8 +13,8 @@ static SMHttp::Response Reply(long code, const char* body) {
 }
 int main() {
     using namespace SMHttp::Detail;
-    Check(std::string(NodeAddress(0))=="216.167.14.42" && std::string(NodeAddress(1))=="156.239.4.155", "primary and backup address order");
-    Check(IsPanelHost("API.YSLF.WORK") && IsPanelHost("yslf.work") && !IsPanelHost("other.example"), "allowlisted panel hosts only");
+    Check(std::string(NodeAddress(0)).empty() && std::string(NodeAddress(1)).empty(), "no embedded origin IP");
+    Check(!IsPanelHost("LLDF.BID") && !IsPanelHost("other.example"), "host pinning is disabled");
     FailoverState state;
     std::vector<int> calls;
     auto exchange = [&](int node) { calls.push_back(node); return node==0 ? SMHttp::Response{} : Reply(200,"ok"); };

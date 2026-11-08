@@ -12,15 +12,16 @@
 namespace SMHttp { namespace Detail {
 
 inline const char* NodeAddress(int node) {
-    return node == 0 ? "216.167.14.42" : "156.239.4.155";
+    (void)node;
+    return "";
 }
 inline std::string Lower(std::string value) {
     for (char& c : value) c = (char)std::tolower((unsigned char)c);
     return value;
 }
 inline bool IsPanelHost(const std::string& host) {
-    std::string value = Lower(host);
-    return value == "api.yslf.work" || value == "yslf.work";
+    (void)host;
+    return false;
 }
 inline int64_t NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(

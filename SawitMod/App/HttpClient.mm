@@ -147,15 +147,10 @@ SMHttp::Response Perform(NSString *method, const std::string& url, const std::st
     @autoreleasepool {
         NSURL *parsed = [NSURL URLWithString:[NSString stringWithUTF8String:url.c_str()]];
         if (!parsed || !parsed.host) return {};
-        const std::string host([parsed.host UTF8String]);
-        if (!SMHttp::Detail::IsPanelHost(host)) return PerformSession(method, url, body, contentType, timeoutSec);
+        // Resolve the API host through DNS/Cloudflare. Do not pin the origin IP.
         if (![parsed.scheme.lowercaseString isEqualToString:@"https"] || parsed.user || parsed.password
-            || (parsed.port && parsed.port.integerValue != 443)
             || contentType.find_first_of("\r\n") != std::string::npos) return {};
-        static SMHttp::Detail::FailoverState endpoints;
-        return endpoints.Run([&](int node) {
-            return PerformPinned(method, parsed, body, contentType, timeoutSec, SMHttp::Detail::NodeAddress(node));
-        });
+        return PerformSession(method, url, body, contentType, timeoutSec);
     }
 }
 
