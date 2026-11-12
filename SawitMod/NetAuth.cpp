@@ -17,6 +17,7 @@
 #include "App/Platform.h"
 #include "App/HttpClient.h"
 #include "Core/Crypto.h"
+#include "App/EndpointObf.h"
 
 #include <random>
 #include <sstream>
@@ -47,9 +48,11 @@
 // Versi format baris tanda tangan. HARUS sama dengan SIG_VERSION di server.
 #define SIG_VERSION   ((const char*)OBFUSCATE("v4"))
 
-// TLS aktif (port 443). 独立 API 域名，避免和后台面板共用域名。
-#define API_BASE      ((const char*)OBFUSCATE("https://api.yslf.work"))
-//#define API_BASE      ((const char*)OBFUSCATE("https://test.arsipharian.com"))
+// API host is decoded from EndpointObf.h at runtime; no plaintext host in the dylib.
+static const std::string& ApiBase() {
+    static const std::string base = endpoint::Base();
+    return base;
+}
 #define ALOG(...) ((void)0)
 
 // =========================================================
@@ -1061,7 +1064,7 @@ extern "C" VIRBOX_TARGET_ATTR AuthResult Virbox_DoVerify(const std::string& lice
          << "\",\"clientPubKey\":\"" << clientPubKey
          << "\"}";
 
-    std::string url = API_BASE;
+    std::string url = ApiBase();
     // Tab AVATAR pakai endpoint login terpisah supaya key VIP & AVATAR tak saling login.
     url += g_avatarMode ? (const char*)OBFUSCATE("/api/license/avatar/verify")
                         : (const char*)OBFUSCATE("/api/license/verify");
@@ -1114,7 +1117,7 @@ static AuthResult KirimPermintaanSesi(const std::string& license, const char* ja
          << ",\"nonce\":\"" << nonce
          << "\",\"clientPubKey\":\"" << clientPubKey
          << "\"}";
-    std::string resp = HttpPostNative(std::string(API_BASE) + jalur, body.str());
+    std::string resp = HttpPostNative(ApiBase() + jalur, body.str());
     AuthResult r = Virbox_NetAuthParse(resp, nonce, hwid);
     if (r.ok && !r.data.empty() && privKey) {
         r.decrypted = DecryptDynamicPayload(r.data, privKey, r.serverPubKey, nonce, hwid);
@@ -1338,7 +1341,7 @@ extern "C" VIRBOX_TARGET_ATTR PayloadResult Virbox_RequestPayload(const std::str
          << "\",\"clientPubKey\":\"" << clientPubKey
          << "\"}";
 
-    std::string url  = API_BASE;
+    std::string url  = ApiBase();
     url += g_avatarMode ? (const char*)OBFUSCATE("/api/license/avatar/payload")
                         : (const char*)OBFUSCATE("/api/license/payload");
     std::string resp = HttpPostNative(url, body.str());

@@ -52,7 +52,7 @@ SawitMod_CCFLAGS = -std=c++17 -fexceptions $(SAWIT_COMMON_FLAGS)
 SawitMod_OBJCFLAGS = $(SAWIT_COMMON_FLAGS)
 SawitMod_OBJCCFLAGS = -std=c++17 -fexceptions $(SAWIT_COMMON_FLAGS)
 
-SawitMod_FRAMEWORKS = UIKit Foundation Security QuartzCore OpenGLES CoreGraphics
+SawitMod_FRAMEWORKS = UIKit Foundation Security CFNetwork QuartzCore OpenGLES CoreGraphics
 SawitMod_LIBRARIES = z
 SawitMod_LDFLAGS = \
 	-Wl,-undefined,dynamic_lookup \

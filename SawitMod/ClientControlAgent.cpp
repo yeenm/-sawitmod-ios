@@ -13,6 +13,7 @@
 #include "AndroidBrandConfig.h"
 #include "App/HttpClient.h"   // iOS：替换 Java HttpURLConnection 的 HttpPostNative
 #include "App/Platform.h"     // iOS：设备/安装信息（替换原来的 JNI 块）
+#include "App/EndpointObf.h"
 #include "Includes/Dobby/dobby.h"
 #include "Includes/Logger.h"
 // iOS：Android 版的 StartupTrace.h 只包了 <android/log.h>。没有这个头时按 Android
@@ -431,7 +432,7 @@ bool Enroll() {
     // iOS：Android 版的 HttpPostNative 走 java.net.HttpURLConnection（jni 桥），
     // 这里换成 SMHttp::PostJson（NSURLSession）；URL 与 JSON 字段一字未改。
     AuthResult result = Virbox_NetAuthParse(
-        SMHttp::PostJson("https://api.yslf.work/api/client-control/enroll", body.str()),
+        SMHttp::PostJson(endpoint::Base() + "/api/client-control/enroll", body.str()),
         nonce, hwid);
     return result.ok;
 }
@@ -496,7 +497,7 @@ bool Heartbeat() {
          << "\",\"proof\":\"" << proof << "\"}";
     // iOS：同上，Java 网络桥换成 SMHttp::PostJson，endpoint 不变。
     AuthResult result = Virbox_NetAuthParse(
-        SMHttp::PostJson("https://api.yslf.work/api/client-control/heartbeat", body.str()),
+        SMHttp::PostJson(endpoint::Base() + "/api/client-control/heartbeat", body.str()),
         nonce, hwid);
     if (!result.ok || result.data.empty()) return false;
     if (ack > 0) {

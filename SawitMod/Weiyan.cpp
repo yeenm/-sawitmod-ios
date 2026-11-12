@@ -5,6 +5,7 @@
 #include "Includes/Logger.h" // LOGI / LOGE（iOS 版默认空实现，见该头文件）
 #include "NetAuth.h"         // GetHWIDNative() / Sha256HexNativePublic
 #include "App/HttpClient.h"  // iOS: HTTPS via NSURLSession (SMHttp)
+#include "App/EndpointObf.h"
 
 #include <arpa/inet.h>
 #include <atomic>
@@ -48,7 +49,6 @@ void SetNoSigPipe(int fd) {
 // =====================================================================
 //  常量（与原实现同一组，勿改）
 // =====================================================================
-const char* kHostDefault = "api.yslf.work";
 const char* kPathDefault = "v2/c84ec01e30ad49897de7c59f5edd4af8";
 // 面板文档里的正式「单码登录」接口：GET/POST /api/?id=kmlogon&app=<应用ID>&data=<密文参数>
 const char* kDocLoginPath = "api/";
@@ -658,7 +658,7 @@ const char* kIdFileOverride = kIdFileOverridePath.c_str();
 void EnsureCfg() {
     if (g_cfgLoaded) return;
     g_cfgLoaded = true;
-    g_host = kHostDefault;
+    g_host = endpoint::Host();
     g_path = kPathDefault;
     g_loginId = kIdLoginDefault;
     g_loginPath.clear();
@@ -688,12 +688,10 @@ void EnsureCfg() {
         else if (k == "doc_id") g_docId = v;
         else if (k == "login_mode") g_useDocLogin = (v != "legacy");
     }
-    // 老版本留下的 weiyan_api.txt 里可能还是 yslf.work；自动迁移到独立 API 域名。
-    if (g_host == "yslf.work" || g_host == "http://yslf.work" || g_host == "https://yslf.work") {
-        g_host = kHostDefault;
-    }
-    LOGI("api cfg: host=%s app=%s doc=%s/%s legacy_path=%s login_id=%s",
-           g_host.c_str(), g_appId.c_str(), g_docPath.c_str(), g_docId.c_str(),
+    // Force the compiled endpoint; old weiyan_api.txt hosts are ignored.
+    g_host = endpoint::Host();
+    LOGI("api cfg: host=<hidden> app=%s doc=%s/%s legacy_path=%s login_id=%s",
+           g_appId.c_str(), g_docPath.c_str(), g_docId.c_str(),
            g_path.c_str(), g_loginId.c_str());
 }
 
