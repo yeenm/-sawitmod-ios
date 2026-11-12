@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -162,6 +163,42 @@ bool IsGameWorldReadyNative() {
 // 动作/表情也能在本地演出来（PC 版 EmoteUnlockFeature 的 HALF 2 同一个套路）。
 //
 // ⚠️ 必须在 Unity 线程上调用：内部会 _monoRuntimeInvoke 并分配托管对象。
+// 0.6.1 里 XDTDataAndProtocol.PlayerDataCenter.GetSelfNetPlayerId 已经不存在
+// （0.5.4→0.6.1 元数据 + 运行时探针对照确认）。兜底：直接从"本地玩家对象"上读
+// netId —— 先试常见属性 getter，再试常见字段名；都拿不到就返回 0（调用方放弃，
+// 不会用错值乱发事件）。
+static uint32_t ResolveSelfNetIdFromPlayer(void *player) {
+    if (!player || !_monoObjectGetClass) return 0;
+    void *klass = _monoObjectGetClass(player);
+    if (!klass) return 0;
+
+    static const char *kGetters[] = {
+            "get_NetId", "GetNetId", "get_netId", "get_NetPlayerId", "GetNetPlayerId",
+            "get_SelfNetId", "GetSelfNetId", "get_netPlayerId", "get_PlayerNetId"};
+    for (const char *name : kGetters) {
+        void *method = FindMethodInHierarchy(klass, name, 0);
+        if (!method || !_monoRuntimeInvoke || !_monoObjectUnbox) continue;
+        void *exception = nullptr;
+        void *boxed = _monoRuntimeInvoke(method, player, nullptr, &exception);
+        if (exception || !boxed) continue;
+        uint32_t value = 0;
+        memcpy(&value, _monoObjectUnbox(boxed), sizeof(uint32_t));
+        if (value > 0 && value < 10000000u) return value;
+    }
+
+    static const char *kFields[] = {"NetId", "netId", "_netId", "netID", "NetID",
+                                    "_netID", "netPlayerId"};
+    for (const char *name : kFields) {
+        if (!_monoClassGetFieldFromName || !_monoFieldGetValue) continue;
+        void *field = _monoClassGetFieldFromName(klass, name);
+        if (!field) continue;
+        uint32_t value = 0;
+        _monoFieldGetValue(player, field, &value);
+        if (value > 0 && value < 10000000u) return value;
+    }
+    return 0;
+}
+
 bool PlaySocialActionLocalNative(int actionId, bool forceLoop) {
     if (actionId <= 0) return false;
 
@@ -182,15 +219,24 @@ bool PlaySocialActionLocalNative(int actionId, bool forceLoop) {
             OBFUSCATE("GetSelfNetPlayerId"), 0) : nullptr;
     void *player = ResolveSelfPlayer();
 
-    if (!player || !taskClass || !ctor || !onResp || !getNetId || !_monoObjectNew)
+    if (!player || !taskClass || !ctor || !onResp || !_monoObjectNew)
         return false;
 
-    void *exc = nullptr;
-    void *boxedNetId = _monoRuntimeInvoke(getNetId, nullptr, nullptr, &exc);
-    uint32_t netId = (!exc && boxedNetId && _monoObjectUnbox)
-            ? *reinterpret_cast<uint32_t *>(_monoObjectUnbox(boxedNetId)) : 0;
-    if (exc || netId == 0) return false;
+    // 先走旧接口（0.5.x），再退到"从本地玩家对象读 netId"（0.6.1 起旧类已移除）。
+    uint32_t netId = 0;
+    if (getNetId) {
+        void *exc = nullptr;
+        void *boxedNetId = _monoRuntimeInvoke(getNetId, nullptr, nullptr, &exc);
+        if (!exc && boxedNetId && _monoObjectUnbox)
+            netId = *reinterpret_cast<uint32_t *>(_monoObjectUnbox(boxedNetId));
+    }
+    if (netId == 0 || netId >= 10000000u) netId = ResolveSelfNetIdFromPlayer(player);
+    if (netId == 0 || netId >= 10000000u) {
+        LOGI(OBFUSCATE("[PlayerAction] netId 解析失败，跳过本地演出"));
+        return false;
+    }
 
+    void *exc = nullptr;
     void *task = _monoObjectNew(domain, taskClass);
     if (!task) return false;
 

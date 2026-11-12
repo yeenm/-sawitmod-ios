@@ -123,6 +123,16 @@ bool WaitForIl2Cpp(int timeoutSeconds) {
     return false;
 }
 
+// 游戏版本是否与 Core/Offsets-iOS.h 的 RVA 标定版本一致。
+// 侧载构建里 Dobby 被禁用，RVA 退路本来就不生效；这里主要保护越狱构建
+// （-DSM_ALLOW_DOBBY_HOOK=1）—— 游戏一更新，旧 RVA 指到的就是别的函数。
+bool GameVersionMatchesOffsets() {
+    NSString *version = [[NSBundle mainBundle]
+            objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+    if (version == nil) return false;
+    return [version isEqualToString:@SAWIT_OFFSETS_GAME_VERSION];
+}
+
 // 安装 GameApp.Update 的帧泵 hook。偏移 0 表示还没按 iOS 包标定：
 // 此时不挂钩，菜单照样能开，只是"每帧逻辑"类功能（自动采集/雷达等）不会跑。
 bool InstallFramePumpHook() {
@@ -134,6 +144,13 @@ bool InstallFramePumpHook() {
     }
     if (OFF_GAMEAPP_UPDATE == 0) {
         NSLog(@"[SawitMod] OFF_GAMEAPP_UPDATE 未标定，跳过 GameApp.Update hook");
+        return false;
+    }
+    if (!GameVersionMatchesOffsets()) {
+        NSString *version = [[NSBundle mainBundle]
+                objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+        NSLog(@"[SawitMod] 游戏版本 %@ 与偏移标定版本 %s 不一致，跳过 OFF_GAMEAPP_UPDATE RVA 退路",
+              version ?: @"?", SAWIT_OFFSETS_GAME_VERSION);
         return false;
     }
     const uintptr_t base = SMImage::FindImageBase("UnityFramework");

@@ -903,28 +903,196 @@ std::string ReadEmoteTableRowName(void *row) {
     return ReadMonoStringNative(monoStr);
 }
 
+// ── 0.6.1 新数据源：表情/动作从"表"改成协议管理器/ECS ─────────────────────
+// 0.6.1 里 TableData.GetSingleaction / GetExpression 已经不存在（0.5.4→0.6.1
+// 元数据 + 运行时探针对照确认）。新入口：
+//   XDTDataAndProtocol.ProtocolService.ExpressionAction.ExpressionActionProtocolManager
+//       .GetExpressionActions()  -> 服务器同步的动作集合，元素 ExpressionActionComponent
+// 元素字段：Id、ExpressionActionType(1=表情 2=动作)、ObtainTime、Expired ...
+// 拿不到就返回 false，调用方回退旧表扫描（0.5.x 设备仍走老路）。
+void *ResolveExpressionActionProtocolManager() {
+    return FindClassInGameImages(
+            OBFUSCATE("XDTDataAndProtocol.ProtocolService.ExpressionAction"),
+            OBFUSCATE("ExpressionActionProtocolManager"));
+}
+
+void *ResolveExpressionActionComponentClass() {
+    return FindClassInGameImages(OBFUSCATE("XDT.Scene.Shared.Modules.ExpressionAction"),
+                                 OBFUSCATE("ExpressionActionComponent"));
+}
+
+// 静态字段取值（协议管理器可能是单例 + 实例方法）。
+void *ReadStaticObjectField(void *klass, const char *fieldName) {
+    if (!klass || !fieldName || !_monoClassGetFieldFromName || !_monoFieldStaticGetValue
+        || !_monoClassGetVTable || !_monoGetRootDomain) {
+        return nullptr;
+    }
+    void *field = _monoClassGetFieldFromName(klass, fieldName);
+    if (!field) return nullptr;
+    void *domain = _monoGetRootDomain();
+    void *vtable = domain ? _monoClassGetVTable(domain, klass) : nullptr;
+    if (!vtable) return nullptr;
+    void *value = nullptr;
+    _monoFieldStaticGetValue(vtable, field, &value);
+    return value;
+}
+
+void *ResolveManagerInstance(void *klass) {
+    static const char *kNames[] = {"Instance", "_instance", "Self", "instance",
+                                   "s_instance", "Instance_", "_self", "_Instance"};
+    for (const char *name : kNames) {
+        void *obj = ReadStaticObjectField(klass, name);
+        if (obj) return obj;
+    }
+    return nullptr;
+}
+
+void PushEmoteEntry(std::vector<EmoteBrowserEntry> &out, int id, int rawType) {
+    if (id <= 0 || id > 100000) return;
+    int type;
+    if (rawType == kEmoteTypeExpression || rawType == 1) {
+        type = kEmoteTypeExpression;
+    } else if (rawType == kEmoteTypeSingleAction || rawType == 2) {
+        type = kEmoteTypeSingleAction;
+    } else {
+        // 类型字段缺失/异值时按动作处理，至少让用户能试演。
+        type = kEmoteTypeSingleAction;
+    }
+    EmoteBrowserEntry entry;
+    entry.id = id;
+    entry.type = type;
+    entry.isLoop = false;
+    entry.name.clear();
+    out.push_back(entry);
+}
+
+// 返回 true 表示"新接口可用且取到了行"；false 时调用方回退旧表逻辑。
+bool BuildCatalogFromProtocolManager(std::vector<EmoteBrowserEntry> &out) {
+    void *mgr = ResolveExpressionActionProtocolManager();
+    if (!mgr || !_monoRuntimeInvoke) return false;
+    void *getter = FindMethodInHierarchy(mgr, OBFUSCATE("GetExpressionActions"), 0);
+    if (!getter) return false;
+
+    void *self = nullptr;
+    if (!MethodIsStatic(getter)) {
+        self = ResolveManagerInstance(mgr);
+        if (!self) {
+            LOGI(OBFUSCATE("[EmoteUnlock] ExpressionActionProtocolManager 是实例方法且取不到实例"));
+            return false;
+        }
+    }
+    void *exception = nullptr;
+    void *collection = _monoRuntimeInvoke(getter, self, nullptr, &exception);
+    if (exception || !collection) {
+        LOGI(OBFUSCATE("[EmoteUnlock] GetExpressionActions 调用失败（异常/空）"));
+        return false;
+    }
+
+    void *componentClass = ResolveExpressionActionComponentClass();
+    void *collectionClass = _monoObjectGetClass ? _monoObjectGetClass(collection) : nullptr;
+    if (!collectionClass) return false;
+
+    void *idField = (componentClass && _monoClassGetFieldFromName)
+            ? _monoClassGetFieldFromName(componentClass, OBFUSCATE("Id")) : nullptr;
+    void *typeField = (componentClass && _monoClassGetFieldFromName)
+            ? _monoClassGetFieldFromName(componentClass, OBFUSCATE("ExpressionActionType"))
+            : nullptr;
+
+    int count = 0;
+    // (1) 反射遍历：List<T> / IReadOnlyList<T> 的 get_Count + get_Item(int)
+    void *getCount = FindMethodInHierarchy(collectionClass, OBFUSCATE("get_Count"), 0);
+    void *getItem = FindMethodInHierarchy(collectionClass, OBFUSCATE("get_Item"), 1);
+    if (getCount) InvokeReturningIntNoArg(getCount, collection, &count);
+    if (count < 0 || count > 100000) count = 0;
+
+    if (count > 0 && getItem && idField && typeField && _monoFieldGetValue) {
+        for (int i = 0; i < count; ++i) {
+            int index = i;
+            void *args[1] = {&index};
+            void *itemException = nullptr;
+            void *boxed = _monoRuntimeInvoke(getItem, collection, args, &itemException);
+            if (itemException || !boxed) continue;
+            int id = 0;
+            int rawType = 0;
+            _monoFieldGetValue(boxed, idField, &id);
+            _monoFieldGetValue(boxed, typeField, &rawType);
+            if (id <= 0 && _monoObjectUnbox && _monoFieldGetOffset) {
+                // 个别 mono 版本对"装箱值类型"的 mono_field_get_value 不生效，
+                // 退回 unbox 指针 + 字段偏移直接读。
+                uint8_t *raw = reinterpret_cast<uint8_t *>(_monoObjectUnbox(boxed));
+                const int idOffset = _monoFieldGetOffset(idField) - MONO_FIELD_HEADER;
+                const int typeOffset = _monoFieldGetOffset(typeField) - MONO_FIELD_HEADER;
+                if (raw && idOffset >= 0 && typeOffset >= 0) {
+                    memcpy(&id, raw + idOffset, sizeof(int));
+                    memcpy(&rawType, raw + typeOffset, sizeof(int));
+                }
+            }
+            PushEmoteEntry(out, id, rawType);
+        }
+    }
+
+    // (2) 内存兜底：List<T> 的私有 _items 数组，或返回值本身就是数组
+    if (out.empty() && idField && typeField && _monoClassValueSize
+        && _monoFieldGetOffset && _monoFieldGetValue) {
+        uint32_t alignment = 0;
+        const int elementSize = _monoClassValueSize(componentClass, &alignment);
+        const int idOffset = _monoFieldGetOffset(idField) - MONO_FIELD_HEADER;
+        const int typeOffset = _monoFieldGetOffset(typeField) - MONO_FIELD_HEADER;
+        void *array = nullptr;
+        if (_monoClassGetFieldFromName) {
+            void *itemsField = _monoClassGetFieldFromName(collectionClass,
+                                                          OBFUSCATE("_items"));
+            if (itemsField) _monoFieldGetValue(collection, itemsField, &array);
+        }
+        if (!array) array = collection;
+        if (array && elementSize > 0 && idOffset >= 0 && typeOffset >= 0) {
+            const int arrayCount = *reinterpret_cast<int *>(
+                    reinterpret_cast<uint8_t *>(array) + OFF_ARR_COUNT);
+            const uint8_t *data = reinterpret_cast<uint8_t *>(array) + OFF_ARR_DATA;
+            if (arrayCount > 0 && arrayCount <= 100000) {
+                for (int i = 0; i < arrayCount; ++i) {
+                    const uint8_t *element = data + static_cast<size_t>(i) * elementSize;
+                    int id = 0;
+                    int rawType = 0;
+                    memcpy(&id, element + idOffset, sizeof(int));
+                    memcpy(&rawType, element + typeOffset, sizeof(int));
+                    PushEmoteEntry(out, id, rawType);
+                }
+            }
+        }
+    }
+
+    LOGI(OBFUSCATE("[EmoteUnlock] ExpressionAction catalog: %zu rows (count=%d)"),
+         out.size(), count);
+    return !out.empty();
+}
+
 void BuildEmoteBrowserCatalogOnUnityThread() {
     if (_monoGetRootDomain && _monoThreadAttach) _monoThreadAttach(_monoGetRootDomain());
     std::vector<EmoteBrowserEntry> out;
-    for (int id = 1; id <= kEmoteMaxSingleActionId; ++id) {
-        void *row = FetchTableRow(OBFUSCATE("GetSingleaction"), id);
-        if (!row) continue;
-        EmoteBrowserEntry entry;
-        entry.id = id;
-        entry.type = kEmoteTypeSingleAction;
-        entry.isLoop = EmoteTableIsLoop(id);
-        entry.name = ReadEmoteTableRowName(row);
-        out.push_back(entry);
-    }
-    for (int id = 1; id <= kEmoteMaxExpressionId; ++id) {
-        void *row = FetchTableRow(OBFUSCATE("GetExpression"), id);
-        if (!row) continue;
-        EmoteBrowserEntry entry;
-        entry.id = id;
-        entry.type = kEmoteTypeExpression;
-        entry.isLoop = false;
-        entry.name = ReadEmoteTableRowName(row);
-        out.push_back(entry);
+
+    // 0.6.1+：优先走协议管理器；旧版本没有这个类，自动回退表扫描。
+    if (!BuildCatalogFromProtocolManager(out)) {
+        for (int id = 1; id <= kEmoteMaxSingleActionId; ++id) {
+            void *row = FetchTableRow(OBFUSCATE("GetSingleaction"), id);
+            if (!row) continue;
+            EmoteBrowserEntry entry;
+            entry.id = id;
+            entry.type = kEmoteTypeSingleAction;
+            entry.isLoop = EmoteTableIsLoop(id);
+            entry.name = ReadEmoteTableRowName(row);
+            out.push_back(entry);
+        }
+        for (int id = 1; id <= kEmoteMaxExpressionId; ++id) {
+            void *row = FetchTableRow(OBFUSCATE("GetExpression"), id);
+            if (!row) continue;
+            EmoteBrowserEntry entry;
+            entry.id = id;
+            entry.type = kEmoteTypeExpression;
+            entry.isLoop = false;
+            entry.name = ReadEmoteTableRowName(row);
+            out.push_back(entry);
+        }
     }
     {
         std::lock_guard<std::mutex> lock(g_emoteBrowserMutex);

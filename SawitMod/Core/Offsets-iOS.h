@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // ============================================================================
 //  Offsets-iOS.h — iOS 版偏移表（RVA 相对 UnityFramework / 主可执行文件）
 // ----------------------------------------------------------------------------
@@ -48,6 +48,14 @@ static const uintptr_t OFF_BP_COUNT    = 0x14;
 // =====================================================================
 
 // --- Hook fungsi utama ---
+// 下面所有 RVA 都按 SAWIT_OFFSETS_GAME_VERSION 这一版游戏的 IPA 逐字节标定。
+// 游戏一更新（例如 0.5.4 → 0.6.1），UnityFramework 布局会变，旧 RVA 就失效：
+//   * 侧载 iOS：Dobby inline hook 被禁用（Includes/Dobby/dobby.h），RVA 退路本来就
+//     不会执行，不会写坏内存；
+//   * 越狱构建（-DSM_ALLOW_DOBBY_HOOK=1）：会真的 inline hook，必须靠这个版本号
+//     做闸门 —— 版本不符就跳过 RVA 退路，只保留类名解析 + CADisplayLink 帧泵。
+#define SAWIT_OFFSETS_GAME_VERSION "0.5.4"
+
 static const uintptr_t OFF_GAMEAPP_UPDATE = 0x3B1F74C; // GameApp.Update —— 已用 0.5.4 IPA 逐字节校验（RVA 相对 UnityFramework __TEXT）
 
 static const uintptr_t OFF_THEMIS_P1  = 0x0;
