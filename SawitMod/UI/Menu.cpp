@@ -31,6 +31,7 @@
 #include "App/ChatRoom.h"      // 聊天室（/api/chat/*）
 #include "ModFeatures.h"
 #include "ModUtils.h"
+#include "BubbleFeatures.h"
 #include "Core/State.h"
 #include "Global.h"
 #include "Includes/Logger.h"
@@ -2383,6 +2384,33 @@ void DrawMenu() {
             ImGui::SameLine();
             ImGui::TextColored(ActiveUI::kMuted, Tr("Bubbles collected: %zu", u8"本次已收集气泡: %zu"),
                                g_claimedBubbles.size());
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ActiveUI::Section("P", Tr("Bubble Spawn (BPM)", u8"气泡生成（每分钟）"));
+            ImGui::Spacing();
+            if (ImGui::Checkbox(Tr("Fast Bubble Generation", u8"快速气泡生成"), &g_fastBubbleGenEnabled)) {
+                BubbleFeatures::Refresh();
+            }
+            ImGui::SameLine();
+            ImGui::TextColored(ActiveUI::kMuted, Tr("Generated: %llu", u8"已生成: %llu"),
+                               (unsigned long long) BubbleFeatures::g_generated.load());
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::SliderFloat(Tr("Bubbles / minute", u8"气泡/分钟"),
+                               &g_bubbleBubblesPerMinute, 0.0f, 100.0f, "%.0f");
+            if (ImGui::Button(Tr("Spawn One Bubble Now", u8"立即生成一颗气泡"),
+                              ImVec2(-1.0f, ActiveUI::S(42)))) {
+                BubbleFeatures::ManualSpawn();
+                ActiveUI::ShowToast(u8"已请求生成气泡", 1.2f);
+            }
+            if (ImGui::Checkbox(Tr("Game Bubbles Also Spawn At Player",
+                                   u8"游戏自身气泡也生成在玩家位置"),
+                                &g_bubbleSpawnAtPlayerEnabled)) {
+                BubbleFeatures::Refresh();
+            }
+            ImGui::TextDisabled("%s", Tr(
+                    "That switch needs an inline hook (jailbreak build). On sideload our own spawns already use the player position.",
+                    u8"该开关需要 inline hook（越狱构建）；侧载下本模组生成的气泡本来就在玩家位置。"));
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();

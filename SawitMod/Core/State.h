@@ -434,6 +434,11 @@ extern int glWidth, glHeight;
 extern bool g_autoCollectBubbleActive;
 extern std::unordered_set<uint32_t> g_claimedBubbles;
 
+// --- Bubble Spawn（v1.6.5，移植自 PC/安卓气泡补丁） ---
+extern bool g_fastBubbleGenEnabled;
+extern float g_bubbleBubblesPerMinute;
+extern bool g_bubbleSpawnAtPlayerEnabled;
+
 // --- Vehicle Swap ---
 extern bool g_vehicleSwapSuccess;
 extern std::chrono::steady_clock::time_point g_vehicleSwapTime;
