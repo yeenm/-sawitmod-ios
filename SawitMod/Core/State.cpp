@@ -171,6 +171,7 @@ uint32_t g_playerNetId;
 bool g_autoCookingActive;
 bool g_autoCookPayloadReady;
 int g_autoCookFrameDelay;
+bool g_autoCookUseUniversalIngredient = true;
 std::vector<MyPet> g_myPets;
 int g_selectedPetIndex;
 int g_petFoodMode;

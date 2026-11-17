@@ -524,6 +524,9 @@ extern uint32_t g_playerNetId;
 extern bool g_autoCookingActive;
 extern bool g_autoCookPayloadReady;
 extern int g_autoCookFrameDelay;
+// 自动做饭时食材不足就用万能食材(staticId=46999)补满槽位
+//（PC「Use Universal Ingredient」/ 安卓 v1.7.5 同款）
+extern bool g_autoCookUseUniversalIngredient;
 
 // --- Pet ---
 extern std::vector<MyPet> g_myPets;

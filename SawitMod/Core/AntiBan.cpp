@@ -45,6 +45,7 @@
 #include "Includes/OSCache.h"
 #include "Includes/obfuscate.h"
 #include "App/Platform.h"
+#include "ModFeatures.h"
 #include "ModUtils.h"
 
 namespace {
@@ -273,6 +274,8 @@ void BuildPendingList() {
         P_SBOOL("TapTap.Themis", "TapThemis", "Open", false),
         P_SBOOL("TapTap.Themis", "TapThemis", "_autoQuitApplicationAfterReport", false),
         P_SBOOL("TapTap.Themis", "TapThemis", "_debugMode", false),
+        // v1.7.5 对齐：安卓端还关了 _uncaughtAutoReportOnce（未捕获异常自动上报一次）
+        P_SBOOL("TapTap.Themis", "TapThemis", "_uncaughtAutoReportOnce", false),
         // 摘掉 native -> 托管 的状态/消息回调对象
         // 引擎侧 Themis 管理类：摘掉附加消息对象（心跳/额外上报数据）
         // TapDB 的 Themis 工具类：关自动退出/调试/日志回调
@@ -323,6 +326,8 @@ bool TryOne(Pending &p) {
     return false;
 }
 
+void ApplyReturnHooksLocked();
+
 void ApplyPendingLocked() {
     int budget = 4;   // 每轮最多 4 条，别让类名扫描把主线程卡住
     for (Pending &p : g_pending) {
@@ -341,6 +346,8 @@ void ApplyPendingLocked() {
     for (const Pending &p : g_pending) {
         if (!p.done && p.tries < kMaxTries) ++g_pendingLeft;
     }
+    // 越狱构建：v1.7.5 的方法体拦截（侧载构建里这个函数是空实现）
+    ApplyReturnHooksLocked();
 }
 
 void TryFrameHookLocked() {
@@ -452,16 +459,30 @@ void *RxFindMonoClass(const char *imageName, const char *ns, const char *cls) {
 }
 
 // ---- 动作 1：关掉 Themis 检测开关（游戏自己在更新弹窗里也这么干）----
+// v1.7.5 对齐：安卓端还会调 U3d_ConfigAutoQuitApplication(false)，
+// 避免 Themis 上报后自动退出游戏。
 bool RxApplyThemisSwitchOff() {
     void *klass = RxFindMonoClass((const char *) OBFUSCATE("EngineWrapper"), "",
                                   (const char *) OBFUSCATE("ThemisSDKManager"));
     if (!klass) return false;
+    bool any = false;
+
     void *m = FindMethodInHierarchy(klass, (const char *) OBFUSCATE("SetSwitch"), 1);
     bool isStatic = false;
-    if (!RxMonoMethodFlags(m, &isStatic) || !isStatic) return false;
-    if (!RxInvokeVoidBool(m, nullptr, false)) return false;
-    SMPlatform::SetBreadcrumbLight("ab:rx:themis-off");
-    return true;
+    if (RxMonoMethodFlags(m, &isStatic) && isStatic && RxInvokeVoidBool(m, nullptr, false)) {
+        any = true;
+    }
+
+    void *autoQuit = FindMethodInHierarchy(
+            klass, (const char *) OBFUSCATE("U3d_ConfigAutoQuitApplication"), 1);
+    bool autoQuitStatic = false;
+    if (RxMonoMethodFlags(autoQuit, &autoQuitStatic) && autoQuitStatic
+        && RxInvokeVoidBool(autoQuit, nullptr, false)) {
+        any = true;
+    }
+
+    if (any) SMPlatform::SetBreadcrumbLight("ab:rx:themis-off");
+    return any;
 }
 
 // ---- 动作 2：关掉 Logan 日志总开关（原生管道，日志落盘+上传的总闸）----
@@ -469,12 +490,19 @@ bool RxApplyLoganOff() {
     void *klass = RxFindMonoClass((const char *) OBFUSCATE("EngineWrapper"), "",
                                   (const char *) OBFUSCATE("LoganManager"));
     if (!klass) return false;
+    bool any = false;
+
     void *m = FindMethodInHierarchy(klass, (const char *) OBFUSCATE("set_open"), 1);
     bool isStatic = false;
-    if (!RxMonoMethodFlags(m, &isStatic)) return false;
-    if (!isStatic || !RxInvokeVoidBool(m, nullptr, false)) return false;
-    SMPlatform::SetBreadcrumbLight("ab:rx:logan-off");
-    return true;
+    if (RxMonoMethodFlags(m, &isStatic) && isStatic && RxInvokeVoidBool(m, nullptr, false)) {
+        any = true;
+    }
+    // 兜底：直接写静态字段 open（安卓 v1.7.5 同样两条都做）
+    SetStaticBool("", "LoganManager", "open", false);
+    any = any || (FindClassByName("", "LoganManager") != nullptr);
+
+    if (any) SMPlatform::SetBreadcrumbLight("ab:rx:logan-off");
+    return any;
 }
 
 // ---- 动作 3：关掉输入行为反作弊（采集 + #INPUTANTICHEAT 上报）----
@@ -647,6 +675,92 @@ void ApplyRuntimeActionsLocked(bool forceAll) {
     }
 }
 
+// ===========================================================================
+//  越狱构建专用：把安卓 v1.7.5 的"方法体 -> RET / false"目标用 Dobby 挂掉
+// ---------------------------------------------------------------------------
+//  侧载 iOS 上 __TEXT 受代码签名保护，Dobby 被 Includes/Dobby/dobby.h 换成了
+//  失败桩，所以这段只在 -DSM_ALLOW_DOBBY_HOOK=1 时编译；侧载靠上面的数据面
+//  动作（Themis 开关 / Logan / InputCheat / 反作弊阈值）兜底。
+// ===========================================================================
+#if defined(SM_ALLOW_DOBBY_HOOK)
+
+void HookRetVoid() {}
+bool HookRetFalse() { return false; }
+
+struct RetHook {
+    const char *ns;
+    const char *cls;
+    const char *method;
+    int argcMin;
+    int argcMax;
+    bool retFalse;
+    bool done;
+};
+
+RetHook g_retHooks[] = {
+        // ThemisManager：把玩家/场景/坐标喂给 native Themis 的桥
+        {"", "ThemisManager", "SetPlayerState", 1, 1, false, false},
+        {"", "ThemisManager", "UpdatePlayerPos", 1, 1, false, false},
+        {"", "ThemisManager", "SetCurScene", 1, 1, false, false},
+        {"", "ThemisManager", "AddTime", 1, 1, false, false},
+        {"", "ThemisManager", "SetCurLevel", 2, 2, false, false},
+        {"", "ThemisManager", "AddCallback", 4, 4, false, false},
+        {"", "ThemisManager", "BackPlayerIdleState", 0, 0, false, false},
+        {"", "ThemisManager", "BackScene", 0, 0, false, false},
+        // ThemisSDKManager：上报 / 输入数据桥
+        {"", "ThemisSDKManager", "ReportException", 3, 3, false, false},
+        {"", "ThemisSDKManager", "ReportLogError", 3, 3, false, false},
+        {"", "ThemisSDKManager", "ReportCustomException", 4, 4, false, false},
+        {"", "ThemisSDKManager", "ReportCustomExceptionEx", 6, 6, false, false},
+        {"", "ThemisSDKManager", "InputData", 6, 6, false, false},
+        // Logan：日志落盘 / 上传
+        {"", "LoganManager", "UploadLogs", 0, 2, false, false},
+        {"", "LoganManager", "FlushLogs", 0, 0, false, false},
+        {"XDTBaseService.Services.Logan", "LoganUploadService", "TryUploadLog", 0, 2, false, false},
+        // 举报 / 证据截图上传
+        {"XDTDataAndProtocol.ProtocolService.Report", "ReportProtocolManager", "Report", 1, 2, false, false},
+        {"XDTGUI.Module.Upload", "UploadSystem", "UploadCheat", 3, 5, false, false},
+        // 输入行为反作弊 / 性能埋点
+        {"XDTLevelAndEntity.BaseSystem.InputCheatManager", "InputCheatManager", "get_Enable", 0, 0, true, false},
+        {"XDKWPerf", "XDKWPerfManager", "CheckCondition", 0, 0, true, false},
+        {"XDKWPerf", "XDKWPerfManager", "InitPlayer", 1, 1, true, false},
+        {"XDKWPerf", "XDKWPerfManager", "KwBegin", 1, 1, true, false},
+};
+
+int g_retHooksApplied = 0;
+
+void ApplyReturnHooksLocked() {
+    if (!_monoCompileMethod) return;
+    for (RetHook &h : g_retHooks) {
+        if (h.done) continue;
+        void *klass = FindClassByName(h.ns, h.cls);
+        if (!klass) continue;
+        void *method = nullptr;
+        for (int argc = h.argcMin; argc <= h.argcMax && !method; ++argc) {
+            method = FindMethodEx(klass, h.method, argc);
+        }
+        if (!method) continue;
+        void *code = _monoCompileMethod(method);
+        if (!code) continue;
+        void *replace = h.retFalse ? reinterpret_cast<void *>(&HookRetFalse)
+                                   : reinterpret_cast<void *>(&HookRetVoid);
+        if (DobbyHook(code, replace, nullptr) == RS_SUCCESS) {
+            h.done = true;
+            ++g_retHooksApplied;
+            LOGI(OBFUSCATE("[AntiBan] hooked %s.%s -> %s"), h.cls, h.method,
+                 h.retFalse ? "false" : "ret");
+        }
+    }
+}
+
+#else
+
+void ApplyReturnHooksLocked() {
+    // 侧载构建：无 inline hook。数据面动作已经覆盖 Themis/Logan/InputCheat/阈值。
+}
+
+#endif
+
 }
 
 // ============================================================================
@@ -673,7 +787,14 @@ int SMAntiBanInstall() {
 // 渲染线程每秒调用：程序集是懒加载的，启动时没命中的补丁要等 image 上线再打。
 void SMAntiBanTick() {
     static std::atomic<long long> lastMs{0};
-    if (!g_listsReady || !g_armed) return;
+    if (!g_listsReady) return;
+
+    // v1.7.5 对齐：安卓端 "反作弊模式默认开启，进世界后自动执行"。
+    // iOS 不能启动就写（会卡资源加载），所以等本地玩家可解析（=已进世界）再 arm。
+    if (!g_armed) {
+        if (!IsGameWorldReadyNative()) return;
+        SMAntiBanArm();
+    }
 
     const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch())

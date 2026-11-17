@@ -1253,6 +1253,15 @@ void DrawMenu() {
             }
 
             ImGui::Spacing();
+            if (ImGui::Checkbox(Tr("Use Universal Ingredient (46999) when a slot is empty",
+                                   u8"食材不足时用万能食材(46999)补满槽位"),
+                                &g_autoCookUseUniversalIngredient)) {
+                ActiveUI::ShowToast(g_autoCookUseUniversalIngredient
+                                            ? u8"万能食材补槽已开启"
+                                            : u8"万能食材补槽已关闭",
+                                    1.4f);
+            }
+            ImGui::Spacing();
             if (ImGui::Checkbox(Tr("START/STOP FAILED COOKING", u8"取消/开始失败烹饪"), &g_isFailedCookActive)) {
                 if (g_isFailedCookActive) {
                     std::thread([]() {

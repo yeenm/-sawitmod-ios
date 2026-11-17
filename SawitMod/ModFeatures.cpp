@@ -51,6 +51,13 @@ static void *AndroidMonoArrayNew(void *domain, void *byteKlass, size_t count);
 static int CountBackpackItemTotalByStaticId(int targetStaticId);
 static void *GetLocalPlayerInstance();
 
+// 万能食材（46999）做饭用：定义在文件后段，这里先声明给 RefreshCookingRecipeSlots 用。
+static uint32_t FindBackpackItemNetId(int targetStaticId);
+static uint32_t FindUniversalIngredientNetId();
+static bool TryFillCookSlotWithUniversalIngredient(void *cookingSysInst, void *cookingSysClass,
+                                                   int slotIndex, void *slotObj, void *slotKlass,
+                                                   void *fFilled, void *fNetId);
+
 // ---------------------------------------------------------------------------
 //  传送阶段结果（供上层区分"区域没就绪被放弃" / "invoke 失败" / "落地确认超时"）。
 //  只存阶段码，不存任何 mono 对象指针 —— 对象用完即弃，绝不跨帧保存。
@@ -4228,11 +4235,31 @@ static bool RefreshCookingRecipeSlots(int recipeId) {
 
         uint8_t filled = 0;
         _monoFieldGetValue(slotObj, fFilled, &filled);
-        if (!filled) return false;
+        if (!filled) {
+            // 万能食材补槽（PC「Use Universal Ingredient」/ 安卓 v1.7.5 同款）：
+            // 食材不足时用 staticId=46999 把槽位填满，而不是直接判失败。
+            if (!g_autoCookUseUniversalIngredient) return false;
+            if (!TryFillCookSlotWithUniversalIngredient(inst, k, i, slotObj, slotKlass,
+                                                        fFilled, fNetId)) {
+                return false;
+            }
+            filled = 0;
+            _monoFieldGetValue(slotObj, fFilled, &filled);
+            if (!filled) return false;
+        }
 
         uint32_t netId = 0;
         _monoFieldGetValue(slotObj, fNetId, &netId);
-        if (netId == 0) return false;
+        if (netId == 0) {
+            if (!g_autoCookUseUniversalIngredient) return false;
+            if (!TryFillCookSlotWithUniversalIngredient(inst, k, i, slotObj, slotKlass,
+                                                        fFilled, fNetId)) {
+                return false;
+            }
+            netId = 0;
+            _monoFieldGetValue(slotObj, fNetId, &netId);
+            if (netId == 0) return false;
+        }
     }
 
     return true;
@@ -7682,7 +7709,12 @@ void RefreshCurrentToolDurability() {
     });
 }
 
-static uint32_t FindBackpackItemNetId(int targetStaticId) {
+// 万能食材 staticId（PC「Use Universal Ingredient」/ 安卓 v1.7.5 同值）
+static constexpr int kUniversalIngredientStaticId = 46999;
+
+// 从指定容器的背包列表里找 staticId 匹配、netId 非 0 的条目。
+// storageType：1=背包，0/2/3=仓库等其它容器（安卓 v1.7.5 同样按 1/0/2/3 轮询）。
+static uint32_t FindBackpackItemNetIdInStorage(int targetStaticId, int storageType) {
     void *sysImg = _monoImageLoaded(OBFUSCATE("XDTGameSystem"));
     if (!sysImg) return 0;
     void *sysKlass = _monoClassFromName(sysImg, OBFUSCATE("XDTGameSystem.GameplaySystem.BackPack"),
@@ -7695,8 +7727,8 @@ static uint32_t FindBackpackItemNetId(int targetStaticId) {
 
     void *m_GetAllItem = FindMethodInHierarchy(sysKlass, OBFUSCATE("GetAllItem"), 1);
     if (!m_GetAllItem) return 0;
-    int storageType = 1;
-    void *argsGetAll[1] = {&storageType};
+    int storage = storageType;
+    void *argsGetAll[1] = {&storage};
     void *listObj = _monoRuntimeInvoke(m_GetAllItem, sysInst, argsGetAll, nullptr);
     if (!listObj) return 0;
 
@@ -7715,15 +7747,99 @@ static uint32_t FindBackpackItemNetId(int targetStaticId) {
                                            OBFUSCATE("BackpackItem"));
     uint32_t align = 0;
     int structSize = _monoClassValueSize(bpItemKlass, &align);
+    if (structSize <= 0) return 0;
     uintptr_t arrayDataStart = (uintptr_t) itemsArray + OFF_ARR_DATA;
 
     for (int i = 0; i < size; i++) {
-        uintptr_t structAddr = arrayDataStart + (i * structSize);
+        uintptr_t structAddr = arrayDataStart + ((uintptr_t) i * (uintptr_t) structSize);
         uint32_t netId = *(uint32_t *) (structAddr + OFF_BP_NETID);
         int staticId = *(int *) (structAddr + OFF_BP_STATICID);
-        if (staticId == targetStaticId && netId != 0) return netId;
+        int count = *(int *) (structAddr + OFF_BP_COUNT);
+        if (staticId == targetStaticId && netId != 0 && count > 0) return netId;
     }
     return 0;
+}
+
+static uint32_t FindBackpackItemNetId(int targetStaticId) {
+    if (targetStaticId <= 0) return 0;
+    const int kTypes[] = {1, 0, 2, 3};
+    for (int t : kTypes) {
+        uint32_t netId = FindBackpackItemNetIdInStorage(targetStaticId, t);
+        if (netId != 0) return netId;
+    }
+    return 0;
+}
+
+// 万能食材 netId（背包里没解锁/没货时返回 0）
+static uint32_t FindUniversalIngredientNetId() {
+    return FindBackpackItemNetId(kUniversalIngredientStaticId);
+}
+
+// 用一个万能食材填满指定槽位：优先调 CookingSystem.FillMaterialInSlot 系列
+// （slotIndex/netId/staticId 三个整型参数），失败再直接写槽位字段。
+// 与安卓 v1.7.5 保持一致：不碰值类型 List，不按对象指针乱读。
+static bool TryFillCookSlotWithUniversalIngredient(void *cookingSysInst, void *cookingSysClass,
+                                                   int slotIndex, void *slotObj, void *slotKlass,
+                                                   void *fFilled, void *fNetId) {
+    if (!cookingSysInst || !cookingSysClass) return false;
+    const uint32_t netId = FindUniversalIngredientNetId();
+    if (netId == 0) {
+        static bool noBagLogged = false;
+        if (!noBagLogged) {
+            noBagLogged = true;
+            LOGI(OBFUSCATE("[AutoCook] universal: 背包里没找到 46999（确认万能食材在背包且未锁定）"));
+        }
+        return false;
+    }
+
+    static const char *kNames[] = {
+            "FillMaterialInSlot", "FillMaterialToSlot", "FillSlotMaterial", "SetSlotMaterial",
+            "AddMaterialToSlot", "FillMaterial", "AddMaterial", "SetMaterial", "UseMaterial"};
+    void *mFill = nullptr;
+    const char *usedName = nullptr;
+    for (const char *name : kNames) {
+        void *m = MonoApi::FindMethodBySignature(cookingSysClass, name,
+                                                 (const char *) OBFUSCATE("iii"));
+        if (m) {
+            mFill = m;
+            usedName = name;
+            break;
+        }
+    }
+    if (mFill) {
+        int slotArg = slotIndex;
+        int netIdArg = (int) netId;
+        int staticIdArg = kUniversalIngredientStaticId;
+        void *args[3] = {&slotArg, &netIdArg, &staticIdArg};
+        void *exc = nullptr;
+        _monoRuntimeInvoke(mFill, cookingSysInst, args, &exc);
+        uint8_t filled = 0;
+        if (fFilled) _monoFieldGetValue(slotObj, fFilled, &filled);
+        LOGI(OBFUSCATE("[AutoCook] universal: %s(iii) slot=%d netId=%u exc=%d filled=%d"),
+             usedName, slotIndex, netId, exc ? 1 : 0, filled ? 1 : 0);
+        if (!exc && filled) return true;
+    }
+
+    // 兜底：直接写槽位字段（部分版本没有公开 FillMaterialInSlot）
+    if (fFilled && fNetId && _monoFieldSetValue) {
+        uint8_t one = 1;
+        _monoFieldSetValue(slotObj, fFilled, &one);
+        uint32_t value = netId;
+        _monoFieldSetValue(slotObj, fNetId, &value);
+        static const char *kStaticFields[] = {"filledMaterialStaticId", "materialStaticId",
+                                              "filledStaticId", "itemStaticId", "staticId"};
+        for (const char *name : kStaticFields) {
+            void *field = slotKlass ? FindFieldInHierarchy(slotKlass, name) : nullptr;
+            if (field) {
+                int sid = kUniversalIngredientStaticId;
+                _monoFieldSetValue(slotObj, field, &sid);
+                break;
+            }
+        }
+        LOGI(OBFUSCATE("[AutoCook] universal: slot fields set netId=%u"), netId);
+        return true;
+    }
+    return false;
 }
 
 static int CountBackpackItemTotalByStaticId(int targetStaticId) {
