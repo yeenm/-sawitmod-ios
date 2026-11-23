@@ -44,6 +44,9 @@ void ExecChefAction(std::string methodName, uint32_t netId, uint64_t targetId);
 int GetCookerStatusNative(CookerTarget cooker);
 void AutoCookRoutine(CookerTarget cooker, int recipeId); // legacy fallback
 void AutoCookBatchRoutine(int recipeId);
+// 立即用万能食材(staticId=46999)补满当前配方的空槽位。
+// 返回补上的槽数；0 = 没有空槽或背包里没有 46999；<0 = 接口未就绪/失败。
+int UseUniversalIngredientNowNative(int recipeId);
 void FailedCookRoutine();
 void HelperCookRoutine();
 void ProcessBirdWatchingNative();

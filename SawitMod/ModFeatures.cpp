@@ -4265,6 +4265,78 @@ static bool RefreshCookingRecipeSlots(int recipeId) {
     return true;
 }
 
+// ============================================================================
+//  菜单独立按钮：立即用万能食材(46999)补满当前配方槽位
+// ----------------------------------------------------------------------------
+//  与安卓 v1.7.5 的 "Use Universal Ingredient" 对应，但做成一次性动作：
+//  取当前选中食谱 -> InitRecipe -> 遍历 materialSlots -> 空槽用 46999 fill。
+//  返回补上的槽数；0 = 没有空槽 / 背包没有万能食材；<0 = 接口未就绪。
+// ============================================================================
+int UseUniversalIngredientNowNative(int recipeId) {
+    if (recipeId <= 0) return -1;
+    int filledCount = -1;
+    RunOnUnityThreadSync([&]() {
+        _monoThreadAttach(_monoGetRootDomain());
+        void *img = _monoImageLoaded(CookN("n_imgGameSys").c_str());
+        if (!img) return;
+        void *klass = _monoClassFromName(img, CookN("n_nsCooking").c_str(),
+                                         CookN("n_clsCookingSys").c_str());
+        if (!klass) return;
+        void *getInst = FindMethodInHierarchy(klass, CookN("n_getInstance2").c_str(), 0);
+        if (!getInst) getInst = FindMethodInHierarchy(klass, CookN("n_getInstance").c_str(), 0);
+        void *inst = getInst ? _monoRuntimeInvoke(getInst, nullptr, nullptr, nullptr) : nullptr;
+        if (!inst) return;
+        void *init = FindMethodInHierarchy(klass, CookN("n_initRecipe").c_str(), 1);
+        if (!init) return;
+
+        uint32_t rid = (uint32_t) recipeId;
+        void *initArgs[] = {&rid};
+        void *exc = nullptr;
+        void *recipeDetail = _monoRuntimeInvoke(init, inst, initArgs, &exc);
+        if (exc || !recipeDetail) return;
+
+        void *detailKlass = _monoObjectGetClass(recipeDetail);
+        void *fSlots = detailKlass ? FindFieldInHierarchy(detailKlass, OBFUSCATE("materialSlots"))
+                                   : nullptr;
+        if (!fSlots) return;
+        void *slotsArr = nullptr;
+        _monoFieldGetValue(recipeDetail, fSlots, &slotsArr);
+        if (!slotsArr) return;
+
+        const int slotCount = *(int *) ((uint8_t *) slotsArr + OFF_ARR_COUNT);
+        if (slotCount <= 0) return;
+
+        uint8_t *slotData = (uint8_t *) slotsArr + OFF_ARR_DATA;
+        void *slotKlass = nullptr;
+        void *fFilled = nullptr;
+        void *fNetId = nullptr;
+        int filled = 0;
+        for (int i = 0; i < slotCount; ++i) {
+            void *slotObj = *(void **) (slotData + (size_t) i * sizeof(void *));
+            if (!slotObj) continue;
+            if (!slotKlass) {
+                slotKlass = _monoObjectGetClass(slotObj);
+                fFilled = FindFieldInHierarchy(slotKlass, OBFUSCATE("filled"));
+                fNetId = FindFieldInHierarchy(slotKlass, OBFUSCATE("filledMaterialNetId"));
+                if (!fFilled || !fNetId) return;
+            }
+            uint8_t isFilled = 0;
+            _monoFieldGetValue(slotObj, fFilled, &isFilled);
+            if (isFilled) continue;
+            if (TryFillCookSlotWithUniversalIngredient(inst, klass, i, slotObj, slotKlass,
+                                                       fFilled, fNetId)) {
+                uint8_t nowFilled = 0;
+                _monoFieldGetValue(slotObj, fFilled, &nowFilled);
+                if (nowFilled) ++filled;
+            }
+        }
+        filledCount = filled;
+        LOGI(OBFUSCATE("[AutoCook] universal button: recipe=%d filled=%d/%d"),
+             recipeId, filled, slotCount);
+    });
+    return filledCount;
+}
+
 // Membaca status seluruh kompor dalam satu pekerjaan Unity thread dengan caching refleksi.
 // -1 berarti pembacaan gagal dan tidak boleh dianggap Idle.
 // Jika dangerPending diberikan oleh Auto Cook, status Danger langsung ditangani

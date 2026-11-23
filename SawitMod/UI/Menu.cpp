@@ -1253,14 +1253,34 @@ void DrawMenu() {
             }
 
             ImGui::Spacing();
-            if (ImGui::Checkbox(Tr("Use Universal Ingredient (46999) when a slot is empty",
-                                   u8"食材不足时用万能食材(46999)补满槽位"),
+            if (ImGui::Button(Tr("Use Universal Ingredient Now", u8"使用万能食材补满当前锅"),
+                              ImVec2(-1.0f, ActiveUI::S(44)))) {
+                const int recipeId = (g_selectedRecipeIdx >= 0 &&
+                                      g_selectedRecipeIdx < (int) g_availableRecipes.size())
+                        ? g_availableRecipes[g_selectedRecipeIdx].staticId : 0;
+                if (recipeId <= 0) {
+                    ActiveUI::ShowToast(u8"请先选择食谱", 1.6f);
+                } else {
+                    const int filled = UseUniversalIngredientNowNative(recipeId);
+                    if (filled > 0) {
+                        char buf[96];
+                        snprintf(buf, sizeof(buf), u8"已用万能食材补满 %d 个槽", filled);
+                        ActiveUI::ShowToast(buf, 1.8f);
+                    } else if (filled == 0) {
+                        ActiveUI::ShowToast(u8"没有空槽，或背包里没有万能食材(46999)", 2.2f);
+                    } else {
+                        ActiveUI::ShowToast(u8"补槽失败：烹饪接口未就绪", 2.0f);
+                    }
+                }
+            }
+            if (ImGui::Checkbox(Tr("Use Universal Ingredient in Auto Cook", u8"自动烹饪时使用万能食材"),
                                 &g_autoCookUseUniversalIngredient)) {
                 ActiveUI::ShowToast(g_autoCookUseUniversalIngredient
-                                            ? u8"万能食材补槽已开启"
-                                            : u8"万能食材补槽已关闭",
+                                            ? u8"自动补槽已开启"
+                                            : u8"自动补槽已关闭",
                                     1.4f);
             }
+            ImGui::TextDisabled("%s", u8"每补一个空槽消耗 1 个万能食材（ID 46999）。");
             ImGui::Spacing();
             if (ImGui::Checkbox(Tr("START/STOP FAILED COOKING", u8"取消/开始失败烹饪"), &g_isFailedCookActive)) {
                 if (g_isFailedCookActive) {
