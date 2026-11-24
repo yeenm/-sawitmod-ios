@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 //  OverlayWindow.mm — 悬浮菜单窗口 + 独立 GL 渲染循环 + 触摸转发
 // ----------------------------------------------------------------------------
 //  与 Android 版的对应关系：
@@ -169,6 +169,11 @@ static void SMCreateFramebuffer(UIView *view) {
 
     g_RealScreenWidth.store((float)g_width);
     g_RealScreenHeight.store((float)g_height);
+    // ESP（雷达 / 同行绘制）的投影都以 glWidth/glHeight 作为「显示像素」基准。
+    // iOS 侧这两个全局以前从未赋值（恒为 0），会让投影坐标一律算成 (0,0)；
+    // 这里跟着 framebuffer 尺寸刷新（菜单与 ESP 用的是同一个显示尺寸）。
+    glWidth = (int) g_width;
+    glHeight = (int) g_height;
     NSLog(@"[SawitMod] GL drawable %dx%d", g_width, g_height);
 }
 

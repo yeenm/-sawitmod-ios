@@ -35,6 +35,8 @@
 void DrawMenu();
 // Core/FramePump.cpp
 void RenderESPOverlay();
+// PeerEsp.cpp（同行绘制：金色方框 + 称谓/距离 + 屏外箭头）
+void PeerEspRenderOverlay();
 
 namespace {
 
@@ -96,6 +98,8 @@ void ApplyScale(float scale) {
 void Draw() {
     DrawMenu();
     RenderESPOverlay();
+    // 同行绘制：独立开关、独立绘制列表（关掉时这里直接返回，行为与改动前一致）
+    PeerEspRenderOverlay();
 
     // ---- 授权水印：取卡密后 5 位，左下角，不接收输入 ----
     // 与 Android 版 RenderImGuiFrame 里的水印逻辑一致（同一位置/同一透明度）。

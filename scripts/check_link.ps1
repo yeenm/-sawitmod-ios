@@ -37,12 +37,14 @@ $sources = @(
     "SawitMod\IL2CPP\MonoHot.cpp",
     "SawitMod\ModUtils.cpp",
     "SawitMod\ModFeatures.cpp",
+    "SawitMod\PeerEsp.cpp",
     "SawitMod\NetAuth.cpp",
     "SawitMod\PayloadVM.cpp",
     "SawitMod\LocalCatalog.cpp",
     "SawitMod\ClientControlAgent.cpp",
     "SawitMod\Weiyan.cpp",
     "SawitMod\EmoteUnlock.cpp",
+    "SawitMod\BubbleFeatures.cpp",
     "SawitMod\FriendInteractUnlock.cpp",
     "SawitMod\AutoDraw.cpp",
     "SawitMod\MonoSymbolProbe.cpp",
@@ -80,10 +82,8 @@ Set-Content -Path tests\build\build.cmd -Value $cl -Encoding ASCII
 Write-Host "== 编译 + 链接（业务代码 C++ 部分）=="
 & cmd /c tests\build\build.cmd
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "
-链接/编译失败：上面的 undefined external 就是缺失的实现。" -ForegroundColor Red
+    Write-Host "链接/编译失败：上面的 undefined external 就是缺失的实现。" -ForegroundColor Red
     exit $LASTEXITCODE
 }
-Write-Host "
-OK：全部目标文件编译并链接通过。" -ForegroundColor Green
+Write-Host "OK：全部目标文件编译并链接通过。" -ForegroundColor Green
 & tests\build\link_check.exe

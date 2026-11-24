@@ -22,6 +22,7 @@
 #include "ModFeatures.h"
 #include "ModUtils.h"
 #include "MonoGameApi.h"
+#include "PeerEsp.h"
 #include "IL2CPP/MonoHot.h"
 #include "Includes/Logger.h"
 #include "Includes/obfuscate.h"
@@ -49,6 +50,8 @@ const char *kProbeKeywords[] = {
         OBFUSCATE("PlayerSocial"), OBFUSCATE("TableData"), OBFUSCATE("TableFriend"),
         OBFUSCATE("ProtocolManager"), OBFUSCATE("EventCenter"),
         OBFUSCATE("CharacterProtocol"),
+        // 同行绘制（PeerEsp）相关：netId -> shortId / 名片 Id、名片 Id 反解
+        OBFUSCATE("PlayerProtocol"), OBFUSCATE("ShortId"), OBFUSCATE("RemotePlayer"),
 };
 constexpr int kProbeKeywordCount = sizeof(kProbeKeywords) / sizeof(kProbeKeywords[0]);
 
@@ -175,6 +178,61 @@ void ProbeRequiredSymbols(Report *report) {
     }
 }
 
+// 同行绘制（PeerEsp）依赖的符号：netId -> raw shortId / 名片 Id、名片 Id 反解、
+// 实体坐标、自身 netId。这几个名字是安卓真机 dump 出来的，iOS 同版本应一致，
+// 但只有在运行时才能确认 —— 所以这里逐个报 OK/NULL + 同名重载的真实签名。
+void ProbePeerEspSymbols(Report *report) {
+    struct ClassProbe {
+        const char *nameSpace;
+        const char *className;
+    };
+    const ClassProbe classes[] = {
+            {OBFUSCATE("XDTDataAndProtocol.ProtocolService.Player"),
+             OBFUSCATE("PlayerProtocolManager")},
+            {OBFUSCATE("XDTDataAndProtocol.ProtocolService.GamePlay.Player"),
+             OBFUSCATE("PlayerProtocolManager")},
+            {OBFUSCATE("Sazabi.Login.Shared"), OBFUSCATE("ShortIdUtil")},
+            {OBFUSCATE("XDTLevelAndEntity.Core.World"), OBFUSCATE("Entity")},
+            {OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"), OBFUSCATE("Entities")},
+            {OBFUSCATE("XDTLevelAndEntity.BaseSystem.EntitiesManager"), OBFUSCATE("EntityUtil")},
+            {OBFUSCATE("XDTLevelAndEntity.Gameplay.Component.Player"),
+             OBFUSCATE("BasePlayerComponent")},
+            {OBFUSCATE("XDTLevelAndEntity.Gameplay.Component.Player"),
+             OBFUSCATE("RemotePlayerComponent")},
+    };
+
+    struct MethodProbe {
+        const char *name;
+        const char *expected;
+    };
+    const MethodProbe methodProbes[] = {
+            {"TryGetPlayerShortId", "i?"},
+            {"TryGetPlayerEncodeShortId", "i?"},
+            {"DecodeShortId", "s"},
+            {"get_position", ""},
+            {"GetAnyEntity", "i"},
+            {"GetSelfNetPlayerId", ""},
+            {"GetSelfPlayer", ""},
+    };
+
+    report->Section("同行绘制依赖符号（PeerEsp）");
+    for (const ClassProbe &probe: classes) {
+        std::string imageName;
+        void *klass = FindClass(nullptr, 0, probe.nameSpace, probe.className, &imageName, true);
+        std::string line = std::string("class ") + probe.nameSpace + "." + probe.className +
+                           " => " + (klass ? "OK" : "NULL");
+        if (klass && !imageName.empty()) line += "  [image=" + imageName + "]";
+        report->Line(line);
+        if (!klass) continue;
+        for (const MethodProbe &methodProbe: methodProbes) {
+            void *method = FindMethodBySignature(klass, methodProbe.name, methodProbe.expected);
+            report->Line(std::string("    .") + methodProbe.name + "(" + methodProbe.expected +
+                         ") => " + (method ? "OK" : "NULL") + "   候选: " +
+                         DescribeMethodsNamed(klass, methodProbe.name));
+        }
+    }
+}
+
 // 把某个镜像里"关键字命中"的类展开成 命名空间.类名 + 方法 + 字段。
 void DumpImage(const std::string &imageName, Report *report) {
     void *image = LoadedImage(imageName.c_str());
@@ -287,6 +345,13 @@ void RunMonoSymbolProbeNative() {
             for (const std::string &name: images) report.Line("  " + name);
 
             ProbeRequiredSymbols(&report);
+            ProbePeerEspSymbols(&report);
+
+            // 同行绘制运行时状态：符号是否真的解析到、自身名片 Id/shortId、
+            // 名单同步次数与失败次数（菜单里点「立即同步」之后这里最直观）。
+            PeerEspPrime();
+            report.Section("同行绘制运行时状态（PeerEsp）");
+            report.Block(PeerEspDiagnostics());
 
             report.Section("关键字命中的类");
             const char *gameImages[] = {

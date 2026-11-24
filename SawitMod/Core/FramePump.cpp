@@ -24,6 +24,7 @@
 
 #include "ModFeatures.h"
 #include "NetAuth.h"
+#include "PeerEsp.h"
 #include "Weiyan.h"
 #include "LocalCatalog.h"
 #include "PayloadVM.h"
@@ -220,6 +221,10 @@ void SMRunUnityFramePump() {
         // Bird diproses setelah GameApp_Update asli selesai agar tidak melakukan
         // Clear/GetComponents pada collection PhotoMode di tengah update game.
         if (traceFrame) STARTUP_TRACE("F08 bird-watching deferred until post-update");
+        // 同行绘制（服务端同行名单 + 只画同行）：名单同步在后台线程、实体扫描与
+        // 投影在本线程（Unity 主线程）里节流跑。与下面的雷达 ESP 完全独立，
+        // 关闭时不做任何 mono 调用。
+        PeerEspFrameTick();
         if (g_radarEnabled) {
             void *camera = GetMainCameraNative();
             if (camera) {

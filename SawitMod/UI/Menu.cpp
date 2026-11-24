@@ -39,6 +39,7 @@
 #include "LocalCatalog.h"
 #include "NetAuth.h"
 #include "PayloadVM.h"
+#include "PeerEsp.h"          // 同行绘制（服务端名单 -> 金色方框）
 #include "Version.h"
 
 #include "Core/ShopTranslate.h"
@@ -2440,6 +2441,28 @@ void DrawMenu() {
             ImGui::TextDisabled("%s", Tr(
                     "That switch needs an inline hook (jailbreak build). On sideload our own spawns already use the player position.",
                     u8"该开关需要 inline hook（越狱构建）；侧载下本模组生成的气泡本来就在玩家位置。"));
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+// --- 同行绘制（服务端同行名单；与下面的雷达 ESP 完全独立）---
+            ActiveUI::Section("P", Tr("DRAW PEERS", u8"绘制同行"));
+            ImGui::Spacing();
+            {
+                bool drawPeer = PeerEspDrawEnabled();
+                if (ImGui::Checkbox(Tr("Draw Peers (gold box)", u8"绘制同行（金色方框）"),
+                                    &drawPeer)) {
+                    PeerEspSetDrawEnabled(drawPeer);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(Tr("Sync Now", u8"立即同步"), ImVec2(0, 0))) {
+                    PeerEspSyncNow();
+                }
+            }
+            ImGui::TextWrapped("%s", PeerEspStatusLine().c_str());
+            ImGui::TextDisabled("%s", Tr(
+                    "Only players on the shared peer list get the gold box + name/distance; off-screen peers get an edge arrow. Works without the radar ESP above.",
+                    u8"只有命中共用同行名单的玩家才画金色方框 + 称谓/距离；屏外/背后给贴边箭头。不依赖上面的雷达 ESP。"));
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
