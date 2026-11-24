@@ -242,6 +242,7 @@ std::atomic<long long> g_lastLocalReadMs{0};
 // 菜单状态行（后台线程写，渲染线程读）
 std::mutex g_noteMutex;
 std::string g_syncNote = u8"未同步";
+std::string g_deviceNote;   // 本次同步用的设备码来源（weiyan/hwid + 长度），诊断用
 
 // 自身身份（名片 Id + raw shortId + 自己的卡等级标签）
 std::mutex g_selfMutex;
@@ -294,6 +295,11 @@ void SetSyncNote(const std::string &note) {
 std::string GetSyncNote() {
     std::lock_guard<std::mutex> lock(g_noteMutex);
     return g_syncNote;
+}
+
+std::string GetDeviceNote() {
+    std::lock_guard<std::mutex> lock(g_noteMutex);
+    return g_deviceNote;
 }
 
 // ---------------------------------------------------------------------------
@@ -954,7 +960,25 @@ bool StartSyncNow(bool force) {
     // 只有它也空的时候才退回菜单输入框，避免用户改了输入框导致 session 对不上。
     std::string license = Weiyan::CurrentCard();
     if (license.empty()) license = std::string(license_input);
-    const std::string hwid = GetHWIDNative();
+
+    // ⚠️ 设备码必须用「微验登录时上行的那一个」：面板的会话 (/api/?id=kmlogon) 是按
+    //    (卡密, markcode) 建的，markcode = Weiyan::DeviceCode()（HWID 前 16 位短码 /
+    //    weiyan_imei_override.txt）。用 GetHWIDNative() 的完整 UUID 去查会话永远查不到，
+    //    /api/peer/* 就会回 {"code":"NO_SESSION"}（这正是 iOS 版实测踩到的坑）。
+    std::string hwid = Weiyan::DeviceCode();
+    const char *hwidSrc = "weiyan";
+    if (hwid.empty()) {
+        hwid = GetHWIDNative();
+        hwidSrc = "hwid";
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_noteMutex);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s:%s(len=%zu)", hwidSrc,
+                 hwid.empty() ? "-" : hwid.substr(0, 8).c_str(), hwid.size());
+        g_deviceNote = buf;
+    }
+
     std::string uid = SelfUid();
     std::string shortStr = SelfShortStr();
     if (shortStr.empty()) {
@@ -1605,7 +1629,7 @@ std::string PeerEspDiagnostics() {
              "  DecodeShortId=%s  GetComponent(base player)=%d\n"
              "  selfNetId=%u  selfUid=%s  selfShortId=%lld\n"
              "  peers=%d  syncOk=%d  syncFails=%d  players=%d  hits=%d\n"
-             "  note=%s",
+             "  hwid=%s  note=%s",
              g_api.ready ? 1 : 0,
              g_api.playerProtoKlass ? ClassFullName(g_api.playerProtoKlass).c_str() : "NULL",
              g_api.m_TryPlayerShortId ? "OK" : "MISS",
@@ -1620,6 +1644,7 @@ std::string PeerEspDiagnostics() {
              g_syncFails.load(std::memory_order_relaxed),
              g_statPlayers.load(std::memory_order_relaxed),
              g_statPeers.load(std::memory_order_relaxed),
+             GetDeviceNote().empty() ? "-" : GetDeviceNote().c_str(),
              GetSyncNote().c_str());
     out += buf;
     return out;
