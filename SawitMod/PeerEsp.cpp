@@ -1357,7 +1357,9 @@ void ProjectCandidates() {
 bool PeerEspDrawEnabled() { return g_drawEnabled.load(std::memory_order_relaxed); }
 
 void PeerEspSetDrawEnabled(bool enabled) {
-    g_drawEnabled.store(enabled, std::memory_order_relaxed);
+    // 幂等：菜单每帧都会调一次 true（同行绘制固定开启、不提供关闭入口），
+    // 只有状态真的变化才动作，否则会每帧强制同步一次。
+    if (g_drawEnabled.exchange(enabled, std::memory_order_acq_rel) == enabled) return;
     if (!enabled) {
         ClearCandidatesAndDraw();
     } else {
